@@ -1,0 +1,23 @@
+# 构建输出
+bin/
+obj/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Visual Studio
+.vs/
+
+# ReSharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+
+# JetBrains Rider
+.idea/
+
+# 密码本（如果包含敏感信息）
+# passwords.txt
+
+# 日志文件
+*.log
