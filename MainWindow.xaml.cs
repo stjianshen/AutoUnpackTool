@@ -1680,7 +1680,7 @@ namespace AutoUnpackTool
         private string GetOutputDirectory(string archivePath)
         {
             string archiveDir = Path.GetDirectoryName(archivePath) ?? string.Empty;
-            string archiveNameWithoutExt = Path.GetFileNameWithoutExtension(archivePath);
+            string archiveNameWithoutExt = GetArchiveFolderName(archivePath);
 
             switch (_settings.OutputMode)
             {
@@ -1708,6 +1708,59 @@ namespace AutoUnpackTool
                 default:
                     return archiveDir;
             }
+        }
+
+        /// <summary>
+        /// 获取压缩包的文件夹名称（智能去掉分卷后缀和压缩格式后缀）
+        /// 例如: ba360.7z.001 -> ba360
+        ///       test.rar -> test
+        ///       document.zip -> document
+        /// </summary>
+        private string GetArchiveFolderName(string archivePath)
+        {
+            string fileName = Path.GetFileName(archivePath);
+            string fileNameWithoutExt = Path.GetFileNameWithoutExtension(archivePath);
+            
+            // 1. 处理 7z 分卷格式：xxx.7z.001 -> xxx
+            var match7z = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.7z\.\d{3,}$");
+            if (match7z.Success)
+            {
+                return match7z.Groups[1].Value;
+            }
+            
+            // 2. 处理 RAR 分卷格式：xxx.part1.rar -> xxx
+            var matchRarPart = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.part\d+\.rar$");
+            if (matchRarPart.Success)
+            {
+                return matchRarPart.Groups[1].Value;
+            }
+            
+            // 3. 处理 ZIP 分卷格式：xxx.z01 -> xxx
+            var matchZip = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.z\d{2,}$");
+            if (matchZip.Success)
+            {
+                return matchZip.Groups[1].Value;
+            }
+            
+            // 4. 处理 RAR 老式分卷：xxx.r00 -> xxx
+            var matchRarOld = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.r\d{2,}$");
+            if (matchRarOld.Success)
+            {
+                return matchRarOld.Groups[1].Value;
+            }
+            
+            // 5. 处理通用数字分卷：xxx.001 -> xxx
+            var matchGeneric = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.\d{3,}$");
+            if (matchGeneric.Success)
+            {
+                return matchGeneric.Groups[1].Value;
+            }
+            
+            // 6. 普通压缩包：去掉一层扩展名
+            // xxx.7z -> xxx
+            // xxx.rar -> xxx
+            // xxx.zip -> xxx
+            return fileNameWithoutExt;
         }
 
         /// <summary>
