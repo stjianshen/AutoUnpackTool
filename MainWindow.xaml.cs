@@ -17,10 +17,23 @@ namespace AutoUnpackTool
         private ObservableCollection<FileItem> _fileList = new ObservableCollection<FileItem>();
         private AppSettings _settings;
         private PasswordMap _passwordMap = new PasswordMap(); // 密码映射表
+        
+        // 双队列架构：待处理队列（测试密码）和待解压队列（已测试密码）
+        private ConcurrentQueue<FileItem> _pendingQueue = new();     // 待处理队列
+        private ConcurrentQueue<FileItem> _extractQueue = new();     // 待解压队列
+        
+        // 队列状态监控 - 用于唤醒休眠的线程
+        private ManualResetEventSlim _pendingQueueSignal = new(false);   // 待处理队列有数据信号
+        private ManualResetEventSlim _extractQueueSignal = new(false);   // 待解压队列有数据信号
+        
         private CancellationTokenSource? _testCancellationTokenSource;
         private CancellationTokenSource? _extractCancellationTokenSource;
         private bool _isTesting = false;
         private bool _isExtracting = false;
+        
+        // 任务完成信号
+        private TaskCompletionSource<bool> _testCompletionSource = new();
+        private TaskCompletionSource<bool> _extractCompletionSource = new();
 
         public MainWindow()
         {
@@ -153,30 +166,26 @@ namespace AutoUnpackTool
                 {
                     AppendLog($"已添加 {addedCount} 个压缩文件到列表", ConsoleColor.Blue);
                     
-                    // 自动开始密码测试和解压流程
-                    AppendLog("自动开始密码测试...", ConsoleColor.Cyan);
-                    
-                    // 在UI线程上启动异步任务，避免跨线程访问问题
-                    Dispatcher.InvokeAsync(async () =>
+                    // 将新文件添加到待处理队列
+                    foreach (var file in files)
                     {
-                        try
+                        if (File.Exists(file) && IsArchiveFile(file))
                         {
-                            // 先执行密码测试
-                            await StartPasswordTestProcess();
-                            
-                            // 如果是自动模式且测试成功，自动开始解压
-                            if (_settings.ExtractMode == ExtractMode.Auto && _passwordMap.Count > 0)
+                            var fileItem = _fileList.FirstOrDefault(f => f.FilePath == file);
+                            if (fileItem != null)
                             {
-                                AppendLog("自动模式：密码测试完成，开始解压...", ConsoleColor.Cyan);
-                                await Task.Delay(500); // 稍微延迟让用户看到测试结果
-                                await StartExtractProcess();
+                                _pendingQueue.Enqueue(fileItem);
                             }
                         }
-                        catch (Exception ex)
-                        {
-                            AppendLog($"自动处理流程出错: {ex.Message}", ConsoleColor.Red);
-                        }
-                    });
+                    }
+                    
+                    AppendLog("自动开始处理流程...", ConsoleColor.Cyan);
+                    
+                    // 启动双队列处理流程
+                    StartDualQueueProcessing();
+                    
+                    // 唤醒测试线程（如果已经在运行）
+                    WakeupTestThread();
                 }
                 else
                 {
@@ -266,7 +275,8 @@ namespace AutoUnpackTool
                 return;
             }
 
-            await StartExtractProcess();
+            // 启动双队列处理流程
+            StartDualQueueProcessing();
         }
 
         /// <summary>
@@ -274,166 +284,20 @@ namespace AutoUnpackTool
         /// </summary>
         private async void StartPasswordTestOnly()
         {
-            try
+            // 将文件添加到待处理队列
+            foreach (var fileItem in _fileList)
             {
-                BtnStartExtract.IsEnabled = false;
-                TxtStatusTestThread.Text = "测试线程: 工作中";
-
-                // 获取所有密码（包含一次性密码和永久密码）
-                var passwords = _settings.GetAllPasswords();
-                AppendLog($"加载密码本: 共 {passwords.Count} 个密码（一次性: {_settings.OneTimePasswords.Count}, 永久: {passwords.Count - _settings.OneTimePasswords.Count}）", ConsoleColor.Cyan);
-                
-                // 详细日志：列出所有密码
-                if (passwords.Count == 0)
+                if (!_pendingQueue.Contains(fileItem))
                 {
-                    AppendLog("警告：密码本为空，请先在\"软件设置\"中导入密码本！", ConsoleColor.Red);
-                }
-                else
-                {
-                    AppendLog($"永久密码数量: {_settings.PermanentPasswords.Count}", ConsoleColor.Cyan);
-                    AppendLog($"密码来源: {(_settings.PermanentPasswords.Count > 0 ? "配置文件" : "外部文件")}", ConsoleColor.Cyan);
-                }
-
-                // 创建解压器
-                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
-
-                foreach (var fileItem in _fileList.ToList())
-                {
-                    try
-                    {
-                        Dispatcher.Invoke(() =>
-                        {
-                            fileItem.Status = "正在测试密码...";
-                        });
-
-                        AppendLog($"\n========== 开始测试: {fileItem.FileName} ==========", ConsoleColor.White);
-
-                        string? foundPassword = null;
-
-                        // 第一步：先尝试无密码解压
-                        Dispatcher.Invoke(() =>
-                        {
-                            TxtStatusCurrentPassword.Text = "测试中的密码: (无密码)";
-                            fileItem.Status = "测试: 无密码";
-                        });
-                        
-                        AppendLog("  测试: 无密码解压...", ConsoleColor.Cyan);
-                        // StartPasswordTestOnly 方法中的第一处调用，通常也建议加上 Token，但用户只问了第2处。
-                        // 为了保持一致性，这里暂时不动，只动第2处。
-                        bool noPasswordSuccess = await extractor.TestPasswordAsync(fileItem.FilePath, "");
-                        
-                        if (noPasswordSuccess)
-                        {
-                            foundPassword = null; // 无密码
-                            AppendLog("  ✓ 无密码解压成功！", ConsoleColor.Green);
-                            Dispatcher.Invoke(() =>
-                            {
-                                fileItem.FoundPassword = null;
-                                fileItem.Status = "无密码";
-                            });
-                            
-                            // 无密码成功，跳过密码本测试
-                            Dispatcher.Invoke(() =>
-                            {
-                                TxtStatusCurrentPassword.Text = "测试中的密码: 无";
-                            });
-                            AppendLog($"[{fileItem.FileName}] 测试结果: 无密码压缩包", ConsoleColor.Green);
-                            
-                            // 关键修复：将无密码状态添加到映射表
-                            _passwordMap.Add(fileItem.FilePath, null);
-                            
-                            await Task.Delay(100);
-                            continue; // 继续下一个文件
-                        }
-                        else
-                        {
-                            AppendLog("  ✗ 无密码解压失败，开始测试密码本...", ConsoleColor.Gray);
-                        }
-
-                        // 第二步：测试密码本中的所有密码
-                        foreach (var password in passwords)
-                        {
-                            Dispatcher.Invoke(() =>
-                            {
-                                TxtStatusCurrentPassword.Text = $"测试中的密码: {password}";
-                                fileItem.Status = $"测试密码: {password}";
-                            });
-
-                            bool isValid = await extractor.TestPasswordAsync(fileItem.FilePath, password, cancellationToken: _testCancellationTokenSource?.Token ?? CancellationToken.None);
-
-                            if (isValid)
-                            {
-                                foundPassword = password;
-                                AppendLog($"  ✓ 找到正确密码: {password}", ConsoleColor.Green);
-                                
-                                // 记录密码使用次数
-                                _settings.RecordPasswordUsage(password);
-                                break; // 找到正确密码，停止测试
-                            }
-
-                            await Task.Delay(50); // 避免过于频繁
-                        }
-
-                        // 关键修复：将测试结果添加到密码映射表
-                        _passwordMap.Add(fileItem.FilePath, foundPassword);
-
-                        Dispatcher.Invoke(() =>
-                        {
-                            TxtStatusCurrentPassword.Text = "测试中的密码: 无";
-                            
-                            if (foundPassword != null)
-                            {
-                                fileItem.FoundPassword = foundPassword;
-                                fileItem.Status = $"密码正确: {foundPassword}";
-                                AppendLog($"[{fileItem.FileName}] 测试结果: 找到正确密码 '{foundPassword}'", ConsoleColor.Green);
-                            }
-                            else
-                            {
-                                fileItem.Status = "密码错误/未找到";
-                                AppendLog($"[{fileItem.FileName}] 测试结果: 所有密码均不正确", ConsoleColor.Red);
-                            }
-                        });
-
-                        await Task.Delay(100);
-                    }
-                    catch (Exception ex)
-                    {
-                        Dispatcher.Invoke(() =>
-                        {
-                            fileItem.Status = $"异常: {ex.Message}";
-                        });
-                        AppendLog($"[{fileItem.FileName}] 测试异常: {ex.Message}", ConsoleColor.Red);
-                    }
-                }
-
-                // 保存密码使用记录
-                _settings.SavePasswordsToFile();
-
-                BtnStartExtract.IsEnabled = true;
-                TxtStatusTestThread.Text = "测试线程: 空闲";
-                AppendLog("\n========== 所有文件密码测试完成 ==========", ConsoleColor.Green);
-                
-                // 自动模式下自动开始解压
-                if (_settings.ExtractMode == ExtractMode.Auto && _passwordMap.Count > 0)
-                {
-                    AppendLog("自动模式: 3秒后开始解压...", ConsoleColor.Cyan);
-                    await Task.Delay(3000);
-                    
-                    // 重新启用解压按钮并触发解压
-                    // 注意：StartExtractProcess 内部会再次检查状态并更新 UI
-                    await StartExtractProcess();
+                    _pendingQueue.Enqueue(fileItem);
                 }
             }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    BtnStartExtract.IsEnabled = true;
-                    TxtStatusTestThread.Text = "测试线程: 空闲";
-                    MessageBox.Show($"密码测试过程出错：\n{ex.Message}\n\n{ex.StackTrace}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
-                AppendLog($"\n密码测试过程出错: {ex.Message}", ConsoleColor.Red);
-            }
+            
+            // 启动双队列处理流程（只会运行测试线程）
+            StartDualQueueProcessing();
+            
+            // 唤醒测试线程
+            WakeupTestThread();
         }
 
         /// <summary>
@@ -500,6 +364,372 @@ namespace AutoUnpackTool
         #region 核心流程
 
         /// <summary>
+        /// 启动双队列处理流程：测试线程 + 解压线程
+        /// </summary>
+        private void StartDualQueueProcessing()
+        {
+            if (_isTesting || _isExtracting)
+            {
+                AppendLog("处理流程已在运行中...", ConsoleColor.Yellow);
+                return;
+            }
+
+            // 重置完成信号
+            _testCompletionSource = new TaskCompletionSource<bool>();
+            _extractCompletionSource = new TaskCompletionSource<bool>();
+            
+            // 重置队列信号
+            _pendingQueueSignal.Reset();
+            _extractQueueSignal.Reset();
+
+            // 启动测试线程
+            StartTestThread();
+            
+            // 启动解压线程
+            StartExtractThread();
+            
+            // 监听完成事件
+            MonitorProcessingComplete();
+        }
+
+        /// <summary>
+        /// 唤醒测试线程（当有待处理文件加入队列时调用）
+        /// </summary>
+        private void WakeupTestThread()
+        {
+            _pendingQueueSignal.Set();
+            AppendLog("[系统] 已唤醒测试线程", ConsoleColor.Gray);
+        }
+
+        /// <summary>
+        /// 唤醒解压线程（当有待解压文件加入队列时调用）
+        /// </summary>
+        private void WakeupExtractThread()
+        {
+            _extractQueueSignal.Set();
+            AppendLog("[系统] 已唤醒解压线程", ConsoleColor.Gray);
+        }
+
+        /// <summary>
+        /// 启动测试线程：从待处理队列取文件，测试密码后放入待解压队列
+        /// </summary>
+        private async void StartTestThread()
+        {
+            if (_isTesting)
+                return;
+
+            _isTesting = true;
+            _testCancellationTokenSource = new CancellationTokenSource();
+            var token = _testCancellationTokenSource.Token;
+
+            try
+            {
+                UpdateUiState();
+                AppendLog($"\n========== 测试线程启动 ==========", ConsoleColor.Cyan);
+
+                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
+                var passwords = _settings.GetAllPasswords();
+
+                AppendLog($"加载密码本: 共 {passwords.Count} 个密码", ConsoleColor.Cyan);
+
+                while (!token.IsCancellationRequested)
+                {
+                    if (_pendingQueue.TryDequeue(out var fileItem))
+                    {
+                        try
+                        {
+                            await ProcessPendingFile(fileItem, extractor, passwords, token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            Dispatcher.Invoke(() => fileItem.Status = $"测试异常: {ex.Message}");
+                            AppendLog($"[{fileItem.FileName}] 测试异常: {ex.Message}", ConsoleColor.Red);
+                        }
+                    }
+                    else
+                    {
+                        // 队列为空，等待信号或超时
+                        AppendLog("[测试线程] 队列为空，等待新任务...", ConsoleColor.Gray);
+                        
+                        // 等待信号（最多等待30秒）或取消请求
+                        bool signaled = false;
+                        try
+                        {
+                            signaled = await Task.Run(() => 
+                                _pendingQueueSignal.Wait(TimeSpan.FromSeconds(30), token), token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        
+                        if (!signaled)
+                        {
+                            // 超时或取消，再次检查是否真的为空
+                            if (_pendingQueue.IsEmpty)
+                            {
+                                AppendLog("[测试线程] 超时且队列为空，测试线程完成", ConsoleColor.Gray);
+                                break;
+                            }
+                        }
+                        
+                        // 重置信号，准备下一次等待
+                        _pendingQueueSignal.Reset();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                AppendLog("\n测试线程已取消", ConsoleColor.Yellow);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"\n测试线程出错: {ex.Message}", ConsoleColor.Red);
+            }
+            finally
+            {
+                _isTesting = false;
+                _testCancellationTokenSource?.Dispose();
+                _testCancellationTokenSource = null;
+                UpdateUiState();
+                _testCompletionSource.TrySetResult(true);
+            }
+        }
+
+        /// <summary>
+        /// 处理待处理文件：判断是否压缩包，测试密码，然后加入待解压队列
+        /// </summary>
+        private async Task ProcessPendingFile(FileItem fileItem, SevenZipExtractor extractor, List<string> passwords, CancellationToken token)
+        {
+            Dispatcher.Invoke(() => fileItem.Status = "正在测试密码...");
+            AppendLog($"\n[测试] {fileItem.FileName}", ConsoleColor.White);
+
+            // 步骤1：判断是否是压缩文件
+            if (!IsArchiveFile(fileItem.FilePath))
+            {
+                Dispatcher.Invoke(() => fileItem.Status = "非压缩文件，跳过");
+                AppendLog($"[{fileItem.FileName}] 非压缩文件，跳过", ConsoleColor.Gray);
+                
+                // 检查父项完成
+                if (fileItem.Parent != null)
+                {
+                    UpdateParentStatusWhenChildrenComplete(fileItem.Parent);
+                }
+                return;
+            }
+
+            string? foundPassword = null;
+
+            // 步骤2：尝试无密码
+            Dispatcher.Invoke(() =>
+            {
+                TxtStatusCurrentPassword.Text = "测试中的密码: (无密码)";
+                fileItem.Status = "测试: 无密码";
+            });
+
+            AppendLog("  测试: 无密码...", ConsoleColor.Cyan);
+            bool noPasswordSuccess = await extractor.TestPasswordAsync(fileItem.FilePath, "", cancellationToken: token);
+
+            if (noPasswordSuccess)
+            {
+                foundPassword = null;
+                AppendLog("  ✓ 无密码测试成功", ConsoleColor.Green);
+            }
+            else
+            {
+                // 步骤3：测试密码本
+                AppendLog("  ✗ 无密码失败，测试密码本...", ConsoleColor.Gray);
+                
+                foreach (var password in passwords)
+                {
+                    if (token.IsCancellationRequested)
+                        break;
+
+                    Dispatcher.Invoke(() =>
+                    {
+                        TxtStatusCurrentPassword.Text = $"测试中的密码: {password}";
+                        fileItem.Status = $"测试: {password}";
+                    });
+
+                    bool isValid = await extractor.TestPasswordAsync(fileItem.FilePath, password, cancellationToken: token);
+
+                    if (isValid)
+                    {
+                        foundPassword = password;
+                        _settings.RecordPasswordUsage(password);
+                        AppendLog($"  ✓ 找到正确密码: {password}", ConsoleColor.Green);
+                        break;
+                    }
+
+                    await Task.Delay(50, token);
+                }
+            }
+
+            // 记录到密码映射表
+            _passwordMap.Add(fileItem.FilePath, foundPassword);
+
+            // 更新UI
+            Dispatcher.Invoke(() =>
+            {
+                fileItem.FoundPassword = foundPassword;
+                TxtStatusCurrentPassword.Text = "测试中的密码: 无";
+                
+                if (foundPassword != null)
+                {
+                    fileItem.Status = $"密码正确: {foundPassword}";
+                }
+                else
+                {
+                    fileItem.Status = "无密码";
+                }
+            });
+
+            AppendLog($"[{fileItem.FileName}] 测试结果: {foundPassword ?? "无密码"}", 
+                foundPassword != null ? ConsoleColor.Green : ConsoleColor.Cyan);
+
+            // 步骤4：将文件加入待解压队列
+            _extractQueue.Enqueue(fileItem);
+            AppendLog($"[{fileItem.FileName}] 已加入待解压队列", ConsoleColor.Gray);
+            
+            // 唤醒解压线程
+            WakeupExtractThread();
+
+            await Task.Delay(100, token);
+        }
+
+        /// <summary>
+        /// 启动解压线程：从待解压队列取文件，解压后扫描新文件加入待处理队列
+        /// </summary>
+        private async void StartExtractThread()
+        {
+            if (_isExtracting)
+                return;
+
+            _isExtracting = true;
+            _extractCancellationTokenSource = new CancellationTokenSource();
+            var token = _extractCancellationTokenSource.Token;
+
+            try
+            {
+                UpdateUiState();
+                AppendLog($"\n========== 解压线程启动 ==========", ConsoleColor.Cyan);
+                AppendLog($"并发线程数: {_settings.ThreadCount}", ConsoleColor.Cyan);
+
+                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
+                var tasks = new List<Task>();
+
+                // 创建多个并发任务
+                for (int i = 0; i < _settings.ThreadCount; i++)
+                {
+                    int taskId = i + 1;
+                    var task = Task.Run(async () =>
+                    {
+                        AppendLog($"[解压线程 {taskId}] 启动", ConsoleColor.Gray);
+
+                        while (!token.IsCancellationRequested)
+                        {
+                            if (_extractQueue.TryDequeue(out var fileItem))
+                            {
+                                // 尝试获取文件锁，防止竞争
+                                if (!fileItem.TryLock())
+                                {
+                                    // 已被其他线程处理，重新入队
+                                    _extractQueue.Enqueue(fileItem);
+                                    await Task.Delay(100, token);
+                                    continue;
+                                }
+
+                                try
+                                {
+                                    await ProcessExtractFile(fileItem, extractor, taskId, token);
+                                }
+                                finally
+                                {
+                                    fileItem.ReleaseLock();
+                                }
+                            }
+                            else
+                            {
+                                // 队列为空，等待信号或超时
+                                AppendLog($"[解压线程 {taskId}] 队列为空，等待新任务...", ConsoleColor.Gray);
+                                
+                                // 等待信号（最多等待30秒）或取消请求
+                                bool signaled = false;
+                                try
+                                {
+                                    signaled = await Task.Run(() => 
+                                        _extractQueueSignal.Wait(TimeSpan.FromSeconds(30), token), token);
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    break;
+                                }
+                                
+                                if (!signaled)
+                                {
+                                    // 超时或取消，再次检查是否真的为空
+                                    if (_extractQueue.IsEmpty)
+                                    {
+                                        AppendLog($"[解压线程 {taskId}] 超时且队列为空，解压线程完成", ConsoleColor.Gray);
+                                        break;
+                                    }
+                                }
+                                
+                                // 重置信号，准备下一次等待
+                                _extractQueueSignal.Reset();
+                            }
+                        }
+
+                        AppendLog($"[解压线程 {taskId}] 完成", ConsoleColor.Gray);
+                    }, token);
+
+                    tasks.Add(task);
+                }
+
+                // 等待所有线程完成
+                await Task.WhenAll(tasks);
+
+                AppendLog($"\n========== 解压线程完成 ==========", ConsoleColor.Green);
+            }
+            catch (OperationCanceledException)
+            {
+                AppendLog("\n解压线程已取消", ConsoleColor.Yellow);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"\n解压线程出错: {ex.Message}", ConsoleColor.Red);
+            }
+            finally
+            {
+                _isExtracting = false;
+                _extractCancellationTokenSource?.Dispose();
+                _extractCancellationTokenSource = null;
+                UpdateUiState();
+                _extractCompletionSource.TrySetResult(true);
+            }
+        }
+
+        /// <summary>
+        /// 监控处理流程完成
+        /// </summary>
+        private async void MonitorProcessingComplete()
+        {
+            try
+            {
+                await Task.WhenAll(_testCompletionSource.Task, _extractCompletionSource.Task);
+                AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"监控流程出错: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
         /// 递归收集树形结构中的所有 FileItem（包括子项）
         /// </summary>
         private List<FileItem> CollectAllFileItems(ObservableCollection<FileItem> items)
@@ -545,10 +775,6 @@ namespace AutoUnpackTool
                             AppendLog($"[{fileItem.FileName}] 无子压缩包，已从待处理列表移除", ConsoleColor.Gray);
                         }
                     });
-                    
-                    // 如果没有子项且是顶级文件，检查是否还有待处理的文件
-                    // 如果有，触发新一轮的解压
-                    CheckAndTriggerNextRoundExtract();
                 }
             }
         }
@@ -556,336 +782,7 @@ namespace AutoUnpackTool
         /// <summary>
         /// 检查是否还有待处理的文件，如果有则触发新一轮解压
         /// </summary>
-        private async void CheckAndTriggerNextRoundExtract()
-        {
-            // 等待当前解压流程完全结束
-            await Task.Delay(500);
-            
-            // 收集树形结构中所有待处理的文件
-            var pendingFiles = CollectAllFileItems(_fileList).Where(f => 
-                !f.Status.Contains("解压成功") && 
-                !f.Status.Contains("跳过") && 
-                !f.Status.Contains("异常") &&
-                _passwordMap.TryGetValue(f.FilePath, out var pwd)
-            ).ToList();
-            
-            if (pendingFiles.Count > 0 && !_isExtracting)
-            {
-                AppendLog($"发现 {pendingFiles.Count} 个待解压文件（包括子压缩包），开始新一轮解压...", ConsoleColor.Cyan);
-                await StartExtractProcess(extractOnlyNewFiles: true);
-            }
-        }
 
-        /// <summary>
-        /// 阶段1：密码测试流程
-        /// </summary>
-        /// <param name="testOnlyNewFiles">如果为true，则只测试尚未有密码记录的文件（增量测试）</param>
-        private async Task StartPasswordTestProcess(bool testOnlyNewFiles = false)
-        {
-            if (_isTesting)
-            {
-                AppendLog("密码测试正在进行中...", ConsoleColor.Yellow);
-                return;
-            }
-
-            _isTesting = true;
-            _testCancellationTokenSource = new CancellationTokenSource();
-            var token = _testCancellationTokenSource.Token;
-
-            try
-            {
-                // 更新UI状态
-                UpdateUiState();
-                
-                // 获取所有密码
-                var passwords = _settings.GetAllPasswords();
-                AppendLog($"\n========== 开始密码测试 ==========", ConsoleColor.Cyan);
-                AppendLog($"加载密码本: 共 {passwords.Count} 个密码（一次性: {_settings.OneTimePasswords.Count}, 永久: {passwords.Count - _settings.OneTimePasswords.Count}）", ConsoleColor.Cyan);
-
-                if (passwords.Count == 0)
-                {
-                    AppendLog("警告：密码本为空！", ConsoleColor.Red);
-                }
-
-                // 如果不是只测试新文件，清空之前的密码映射
-                if (!testOnlyNewFiles)
-                {
-                    _passwordMap = new PasswordMap();
-                }
-
-                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
-
-                // 确定要测试的文件列表（包括所有子项）
-                List<FileItem> filesToTest;
-                if (testOnlyNewFiles)
-                {
-                    // 收集树形结构中所有尚未有密码记录的文件
-                    filesToTest = CollectAllFileItems(_fileList)
-                        .Where(f => !_passwordMap.ContainsKey(f.FilePath))
-                        .ToList();
-                    AppendLog($"增量测试：发现 {filesToTest.Count} 个新文件待测试", ConsoleColor.Cyan);
-                }
-                else
-                {
-                    // 测试所有文件（包括子项）
-                    filesToTest = CollectAllFileItems(_fileList);
-                }
-
-                // 如果没有文件需要测试，直接返回
-                if (!filesToTest.Any())
-                {
-                    AppendLog("没有需要测试的新文件。", ConsoleColor.Cyan);
-                    return;
-                }
-
-                // 遍历所有文件进行测试
-                foreach (var fileItem in filesToTest)
-                {
-                    if (token.IsCancellationRequested)
-                        break;
-
-                    try
-                    {
-                        Dispatcher.Invoke(() => fileItem.Status = "正在测试密码...");
-                        AppendLog($"\n[测试] {fileItem.FileName}", ConsoleColor.White);
-
-                        string? foundPassword = null;
-
-                        // 步骤1：尝试无密码
-                        Dispatcher.Invoke(() =>
-                        {
-                            TxtStatusCurrentPassword.Text = "测试中的密码: (无密码)";
-                            fileItem.Status = "测试: 无密码";
-                        });
-
-                        AppendLog("  测试: 无密码...", ConsoleColor.Cyan);
-                        bool noPasswordSuccess = await extractor.TestPasswordAsync(fileItem.FilePath, "", cancellationToken: token);
-
-                        if (noPasswordSuccess)
-                        {
-                            foundPassword = null;
-                            AppendLog("  ✓ 无密码测试成功", ConsoleColor.Green);
-                        }
-                        else
-                        {
-                            // 步骤2：测试密码本
-                            AppendLog("  ✗ 无密码失败，测试密码本...", ConsoleColor.Gray);
-                            
-                            foreach (var password in passwords)
-                            {
-                                if (token.IsCancellationRequested)
-                                    break;
-
-                                Dispatcher.Invoke(() =>
-                                {
-                                    TxtStatusCurrentPassword.Text = $"测试中的密码: {password}";
-                                    fileItem.Status = $"测试: {password}";
-                                });
-
-                                bool isValid = await extractor.TestPasswordAsync(fileItem.FilePath, password, cancellationToken: token);
-
-                                if (isValid)
-                                {
-                                    foundPassword = password;
-                                    _settings.RecordPasswordUsage(password);
-                                    AppendLog($"  ✓ 找到正确密码: {password}", ConsoleColor.Green);
-                                    break;
-                                }
-
-                                await Task.Delay(50, token);
-                            }
-                        }
-
-                        // 记录到密码映射表
-                        _passwordMap.Add(fileItem.FilePath, foundPassword);
-
-                        // 更新UI
-                        Dispatcher.Invoke(() =>
-                        {
-                            fileItem.FoundPassword = foundPassword;
-                            TxtStatusCurrentPassword.Text = "测试中的密码: 无";
-                            
-                            if (foundPassword != null)
-                            {
-                                fileItem.Status = $"密码正确: {foundPassword}";
-                            }
-                            else
-                            {
-                                fileItem.Status = "无密码";
-                            }
-                        });
-
-                        AppendLog($"[{fileItem.FileName}] 测试结果: {foundPassword ?? "无密码"}", 
-                            foundPassword != null ? ConsoleColor.Green : ConsoleColor.Cyan);
-
-                        await Task.Delay(100, token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        Dispatcher.Invoke(() => fileItem.Status = $"测试异常: {ex.Message}");
-                        AppendLog($"[{fileItem.FileName}] 测试异常: {ex.Message}", ConsoleColor.Red);
-                    }
-                }
-
-                // 保存密码使用记录
-                _settings.SavePasswordsToFile();
-
-                AppendLog($"\n========== 密码测试完成 ==========", ConsoleColor.Green);
-                
-                // 只统计本次测试的文件
-                int successCount = filesToTest.Count(f => _passwordMap.TryGetValue(f.FilePath, out var pwd) && pwd != null);
-                AppendLog($"本次测试 {filesToTest.Count} 个文件，找到 {successCount} 个有效密码", ConsoleColor.Cyan);
-
-                // 自动模式下自动开始解压
-                // 只有当本次测试找到了至少一个有效密码时，才触发自动解压
-                if (_settings.ExtractMode == ExtractMode.Auto && successCount > 0)
-                {
-                    AppendLog("自动模式：3秒后开始解压...", ConsoleColor.Cyan);
-                    await Task.Delay(3000, token);
-                    
-                    if (!token.IsCancellationRequested)
-                    {
-                        await StartExtractProcess(testOnlyNewFiles);
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                AppendLog("\n密码测试已取消", ConsoleColor.Yellow);
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"\n密码测试出错: {ex.Message}", ConsoleColor.Red);
-            }
-            finally
-            {
-                _isTesting = false;
-                _testCancellationTokenSource?.Dispose();
-                _testCancellationTokenSource = null;
-                UpdateUiState();
-            }
-        }
-
-        /// <summary>
-        /// 阶段2：解压流程（支持多线程并发）
-        /// </summary>
-        private async Task StartExtractProcess(bool extractOnlyNewFiles = false)
-        {
-            if (_isExtracting)
-            {
-                AppendLog("解压正在进行中...", ConsoleColor.Yellow);
-                return;
-            }
-
-            // 确定要解压的文件列表（包括所有子项）
-            List<FileItem> filesToExtract;
-            if (extractOnlyNewFiles)
-            {
-                // 收集树形结构中所有新增的文件（尚未解压过的）
-                filesToExtract = CollectAllFileItems(_fileList).Where(f => 
-                {
-                    // 检查是否已有解压成功状态
-                    return !f.Status.Contains("解压成功") && 
-                           !f.Status.Contains("跳过") && 
-                           !f.Status.Contains("异常") &&
-                           _passwordMap.TryGetValue(f.FilePath, out var pwd);
-                }).ToList();
-            }
-            else
-            {
-                // 解压所有有密码的文件（包括子项）
-                filesToExtract = CollectAllFileItems(_fileList).Where(f => _passwordMap.TryGetValue(f.FilePath, out var pwd)).ToList();
-            }
-
-            if (filesToExtract.Count == 0)
-            {
-                AppendLog("没有可解压的文件（请先进行密码测试）", ConsoleColor.Yellow);
-                return;
-            }
-
-            _isExtracting = true;
-            _extractCancellationTokenSource = new CancellationTokenSource();
-            var token = _extractCancellationTokenSource.Token;
-
-            try
-            {
-                UpdateUiState();
-                
-                AppendLog($"\n========== 开始解压 ==========", ConsoleColor.Cyan);
-                AppendLog($"并发线程数: {_settings.ThreadCount}", ConsoleColor.Cyan);
-                AppendLog($"待解压文件数: {filesToExtract.Count}", ConsoleColor.Cyan);
-
-                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
-                var fileQueue = new ConcurrentQueue<FileItem>(filesToExtract);
-                var tasks = new List<Task>();
-
-                // 创建多个并发任务
-                for (int i = 0; i < _settings.ThreadCount; i++)
-                {
-                    int taskId = i + 1;
-                    var task = Task.Run(async () =>
-                    {
-                        AppendLog($"[解压线程 {taskId}] 启动", ConsoleColor.Gray);
-
-                        while (!token.IsCancellationRequested && !fileQueue.IsEmpty)
-                        {
-                            if (fileQueue.TryDequeue(out var fileItem))
-                            {
-                                // 尝试获取文件锁，防止竞争
-                                if (!fileItem.TryLock())
-                                {
-                                    // 已被其他线程处理，重新入队
-                                    fileQueue.Enqueue(fileItem);
-                                    await Task.Delay(100, token);
-                                    continue;
-                                }
-
-                                try
-                                {
-                                    await ProcessExtractFile(fileItem, extractor, taskId, token);
-                                }
-                                finally
-                                {
-                                    fileItem.ReleaseLock();
-                                }
-                            }
-                            else
-                            {
-                                await Task.Delay(100, token);
-                            }
-                        }
-
-                        AppendLog($"[解压线程 {taskId}] 完成", ConsoleColor.Gray);
-                    }, token);
-
-                    tasks.Add(task);
-                }
-
-                // 等待所有线程完成
-                await Task.WhenAll(tasks);
-
-                AppendLog($"\n========== 解压完成 ==========", ConsoleColor.Green);
-            }
-            catch (OperationCanceledException)
-            {
-                AppendLog("\n解压已取消", ConsoleColor.Yellow);
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"\n解压出错: {ex.Message}", ConsoleColor.Red);
-            }
-            finally
-            {
-                _isExtracting = false;
-                _extractCancellationTokenSource?.Dispose();
-                _extractCancellationTokenSource = null;
-                UpdateUiState();
-            }
-        }
 
         /// <summary>
         /// 处理单个文件的解压
@@ -950,11 +847,11 @@ namespace AutoUnpackTool
                     AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已从密码映射表清除", ConsoleColor.Gray);
 
                     // 检查解压后的文件是否包含新的压缩文件
-                    // 这会添加子项到 fileItem.Children，并异步触发密码测试和子项解压
+                    // 这会添加子项到 fileItem.Children，并将新文件加入待处理队列
                     await ScanExtractedFilesForArchives(outputDir, taskId, fileItem);
                     
                     // 注意：不在这里直接调用 CheckAndMarkParentComplete
-                    // 因为 ScanExtractedFilesForArchives 内部会异步触发子项的密码测试和解压流程
+                    // 因为 ScanExtractedFilesForArchives 会将新文件加入待处理队列
                     // 父项的完成状态应该由子项完成时通过 UpdateParentStatusWhenChildrenComplete 来更新
                     
                     // 如果没有子项，说明解压流程真正完成了
@@ -965,7 +862,7 @@ namespace AutoUnpackTool
                     // 如果有子项，等待子项处理完成后会自动通过 UpdateParentStatusWhenChildrenComplete 更新父项状态
                     else
                     {
-                        AppendLog($"[{fileItem.FileName}] 已添加 {fileItem.Children.Count} 个子压缩包，等待子项递归处理...", ConsoleColor.Cyan);
+                        AppendLog($"[{fileItem.FileName}] 已添加 {fileItem.Children.Count} 个子压缩包到待处理队列，等待递归处理...", ConsoleColor.Cyan);
                     }
                 }
                 else
@@ -1018,11 +915,10 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 扫描解压后的文件，检测是否包含新的压缩文件并添加到测试列表
+        /// 扫描解压后的文件，检测是否包含新的压缩文件并添加到列表
+        /// 注意：此方法只负责扫描和添加文件，不测试密码，不启动解压
+        /// 密码测试和解压由 CheckAndTriggerNextRoundExtractAsync 统一处理
         /// </summary>
-        /// <param name="outputDir">输出目录</param>
-        /// <param name="taskId">线程ID</param>
-        /// <param name="parentFileItem">父级文件项（如果是从压缩包中解压出来的）</param>
         private async Task ScanExtractedFilesForArchives(string outputDir, int taskId, FileItem? parentFileItem = null)
         {
             try
@@ -1037,19 +933,17 @@ namespace AutoUnpackTool
 
                 // 递归查找输出目录中解压出来的新压缩文件
                 var newArchiveFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories)
-                    .Where(f => IsArchiveFile(f) && !IsMultiVolumeArchive(f)) // 排除分卷文件（已在上面处理）
+                    .Where(f => IsArchiveFile(f) && !IsMultiVolumeArchive(f))
                     .ToList();
 
-                // 合并两种文件
                 var allArchiveFiles = newArchiveFiles.Distinct().ToList();
 
                 AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allArchiveFiles.Count} 个候选压缩文件", ConsoleColor.Magenta);
 
                 if (allArchiveFiles.Count == 0)
                 {
-                    AppendLog($"[线程 {taskId}] 未发现新的压缩文件，解压流程完成", ConsoleColor.Gray);
+                    AppendLog($"[线程 {taskId}] 未发现新的压缩文件", ConsoleColor.Gray);
                     
-                    // 如果没有子压缩包，直接标记父项为完成
                     if (parentFileItem != null)
                     {
                         AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，更新父项状态: {parentFileItem.FileName}", ConsoleColor.Magenta);
@@ -1061,10 +955,9 @@ namespace AutoUnpackTool
                 AppendLog($"[线程 {taskId}] 发现 {allArchiveFiles.Count} 个新的压缩文件", ConsoleColor.Cyan);
 
                 int addedCount = 0;
-                int retryCount = 0; // 记录重试的文件数
                 foreach (var archiveFile in allArchiveFiles)
                 {
-                    // 检查是否已在列表中（包括子项）
+                    // 检查是否已在列表中
                     FileItem? existingItem = null;
                     Dispatcher.Invoke(() =>
                     {
@@ -1073,52 +966,30 @@ namespace AutoUnpackTool
 
                     if (existingItem != null)
                     {
-                        // 文件已存在，检查是否需要重试
-                        bool needsRetry = existingItem.Status.Contains("解压失败") || 
-                                         existingItem.Status.Contains("异常") ||
-                                         existingItem.Status == "等待处理";
-                        
-                        if (needsRetry)
-                        {
-                            AppendLog($"[线程 {taskId}] [DEBUG] 文件已存在但需要重试: {Path.GetFileName(archiveFile)} (状态: {existingItem.Status})", ConsoleColor.Magenta);
-                            
-                            // 重置状态为等待处理
-                            Dispatcher.Invoke(() =>
-                            {
-                                existingItem.Status = "等待处理";
-                            });
-                            
-                            retryCount++;
-                        }
-                        else
-                        {
-                            AppendLog($"[线程 {taskId}] [DEBUG] 文件已存在且状态正常，跳过: {Path.GetFileName(archiveFile)} (状态: {existingItem.Status})", ConsoleColor.Magenta);
-                        }
+                        AppendLog($"[线程 {taskId}] [DEBUG] 文件已存在，跳过: {Path.GetFileName(archiveFile)}", ConsoleColor.Magenta);
                         continue;
                     }
 
-                    // 普通压缩文件
+                    // 创建新的文件项
                     var fileInfo = new FileInfo(archiveFile);
                     var fileItem = new FileItem
                     {
                         FileName = fileInfo.Name,
                         FilePath = archiveFile,
-                        Status = "等待处理",
+                        Status = "等待处理",  // 统一初始状态
                         FileSize = fileInfo.Length,
-                        Parent = parentFileItem // 记录父级
+                        Parent = parentFileItem
                     };
 
                     Dispatcher.Invoke(() =>
                     {
                         if (parentFileItem != null)
                         {
-                            // 作为子项添加
                             parentFileItem.Children.Add(fileItem);
                             AppendLog($"[线程 {taskId}] {parentFileItem.FileName} 的子压缩包: {fileItem.FileName}", ConsoleColor.Gray);
                         }
                         else
                         {
-                            // 作为顶级项添加
                             _fileList.Add(fileItem);
                         }
                     });
@@ -1127,67 +998,31 @@ namespace AutoUnpackTool
                     AppendLog($"[线程 {taskId}] 添加新压缩文件: {fileItem.FileName}", ConsoleColor.Green);
                 }
 
-                if (addedCount > 0 || retryCount > 0)
+                if (addedCount > 0)
                 {
-                    AppendLog($"[线程 {taskId}] 共添加 {addedCount} 个新压缩文件，重试 {retryCount} 个失败文件", ConsoleColor.Cyan);
-                    AppendLog($"[线程 {taskId}] [DEBUG] 添加完成，等待500ms确保UI更新...", ConsoleColor.Magenta);
+                    AppendLog($"[线程 {taskId}] 共添加 {addedCount} 个新压缩文件到待处理队列", ConsoleColor.Cyan);
                     
-                    // 延迟一下确保UI更新完成
-                    await Task.Delay(500);
-                    
-                    // 复用主流程：测试密码 → 自动解压（如果是自动模式）
-                    AppendLog($"[线程 {taskId}] 开始测试新文件的密码...", ConsoleColor.Cyan);
-                    AppendLog($"[线程 {taskId}] [DEBUG] 准备启动密码测试流程", ConsoleColor.Magenta);
-                    
-                    // 直接await异步方法，而不是使用Dispatcher.InvokeAsync
-                    // 这样可以确保等待密码测试和解压流程完全完成
-                    try
+                    // 将新文件加入待处理队列
+                    Dispatcher.Invoke(() =>
                     {
-                        // 在UI线程上执行密码测试（只测试新文件）
-                        await Dispatcher.Invoke(async () =>
+                        var children = parentFileItem?.Children ?? new ObservableCollection<FileItem>();
+                        foreach (var child in children)
                         {
-                            AppendLog($"[线程 {taskId}] [DEBUG] 在UI线程上开始密码测试", ConsoleColor.Magenta);
-                            await StartPasswordTestProcess(testOnlyNewFiles: true);
-                            AppendLog($"[线程 {taskId}] [DEBUG] 密码测试完成", ConsoleColor.Magenta);
-                            
-                            // 密码测试完成后，检查是否有待解压的文件
-                            var pendingFiles = CollectAllFileItems(_fileList).Where(f => 
-                                !f.Status.Contains("解压成功") && 
-                                !f.Status.Contains("跳过") && 
-                                !f.Status.Contains("异常") &&
-                                _passwordMap.TryGetValue(f.FilePath, out var pwd)
-                            ).ToList();
-                            
-                            AppendLog($"[线程 {taskId}] [DEBUG] 找到 {pendingFiles.Count} 个待解压文件", ConsoleColor.Magenta);
-                            
-                            if (pendingFiles.Count > 0 && !_isExtracting)
+                            if (child.Status == "等待处理")
                             {
-                                AppendLog($"[线程 {taskId}] 发现 {pendingFiles.Count} 个待解压的子压缩包，开始解压...", ConsoleColor.Cyan);
-                                AppendLog($"[线程 {taskId}] [DEBUG] 准备启动解压流程", ConsoleColor.Magenta);
-                                await StartExtractProcess(extractOnlyNewFiles: true);
-                                AppendLog($"[线程 {taskId}] [DEBUG] 解压流程完成", ConsoleColor.Magenta);
+                                _pendingQueue.Enqueue(child);
+                                AppendLog($"[线程 {taskId}] {child.FileName} 已加入待处理队列", ConsoleColor.Gray);
                             }
-                            else
-                            {
-                                AppendLog($"[线程 {taskId}] [DEBUG] 没有待解压文件或正在解压中", ConsoleColor.Magenta);
-                            }
-                        });
-                        
-                        AppendLog($"[线程 {taskId}] [DEBUG] Dispatcher.Invoke 返回，子项处理完成", ConsoleColor.Magenta);
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendLog($"[线程 {taskId}] 处理新文件失败: {ex.Message}", ConsoleColor.Red);
-                        AppendLog($"[线程 {taskId}] [DEBUG] 异常堆栈: {ex.StackTrace}", ConsoleColor.Magenta);
-                    }
+                        }
+                    });
                     
-                    AppendLog($"[线程 {taskId}] 子项处理流程已完成", ConsoleColor.Gray);
+                    // 唤醒测试线程
+                    WakeupTestThread();
                 }
             }
             catch (Exception ex)
             {
                 AppendLog($"[线程 {taskId}] 扫描解压文件失败: {ex.Message}", ConsoleColor.Red);
-                AppendLog($"[线程 {taskId}] [DEBUG] 异常堆栈: {ex.StackTrace}", ConsoleColor.Magenta);
             }
         }
 
@@ -1319,15 +1154,8 @@ namespace AutoUnpackTool
             if (_isTesting || _isExtracting)
                 return;
 
-            // 检查密码映射表中是否有待解压的文件
-            var filesWithPassword = _fileList.Where(f => _passwordMap.TryGetValue(f.FilePath, out var pwd)).ToList();
-            
-            if (filesWithPassword.Count > 0)
-            {
-                AppendLog("自动模式：发现待解压文件，开始解压...", ConsoleColor.Cyan);
-                await Task.Delay(500); // 短暂延迟让用户看到状态变化
-                await StartExtractProcess();
-            }
+            // 启动双队列处理流程
+            StartDualQueueProcessing();
         }
 
         #endregion
