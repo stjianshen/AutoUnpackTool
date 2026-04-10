@@ -514,10 +514,10 @@ namespace AutoUnpackTool
                 Dispatcher.Invoke(() => fileItem.Status = "非压缩文件，跳过");
                 AppendLog($"[{fileItem.FileName}] 非压缩文件，跳过", ConsoleColor.Gray);
                 
-                // 检查父项完成
+                // 检查父项完成（传入子节点）
                 if (fileItem.Parent != null)
                 {
-                    UpdateParentStatusWhenChildrenComplete(fileItem.Parent);
+                    UpdateParentStatusWhenChildrenComplete(fileItem);
                 }
                 return;
             }
@@ -795,10 +795,10 @@ namespace AutoUnpackTool
                 Dispatcher.Invoke(() => fileItem.Status = "跳过: 未找到密码");
                 AppendLog($"[线程 {taskId}] 跳过 {fileItem.FileName}: 未找到密码", ConsoleColor.Yellow);
                 
-                // 如果没有密码，检查父项是否可以完成
+                // 如果没有密码，检查父项是否可以完成（传入子节点）
                 if (fileItem.Parent != null)
                 {
-                    UpdateParentStatusWhenChildrenComplete(fileItem.Parent);
+                    UpdateParentStatusWhenChildrenComplete(fileItem);
                 }
                 else
                 {
@@ -870,10 +870,10 @@ namespace AutoUnpackTool
                     Dispatcher.Invoke(() => fileItem.Status = $"解压失败: {result.Message}");
                     AppendLog($"[线程 {taskId}] {fileItem.FileName}: 解压失败 - {result.Message}", ConsoleColor.Red);
                     
-                    // 解压失败时也需要检查父项状态
+                    // 解压失败时也需要检查父项状态（传入子节点）
                     if (fileItem.Parent != null)
                     {
-                        UpdateParentStatusWhenChildrenComplete(fileItem.Parent);
+                        UpdateParentStatusWhenChildrenComplete(fileItem);
                     }
                     else
                     {
@@ -886,10 +886,10 @@ namespace AutoUnpackTool
                 Dispatcher.Invoke(() => fileItem.Status = "已取消");
                 AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已取消", ConsoleColor.Yellow);
                 
-                // 取消时也需要检查父项状态
+                // 取消时也需要检查父项状态（传入子节点）
                 if (fileItem.Parent != null)
                 {
-                    UpdateParentStatusWhenChildrenComplete(fileItem.Parent);
+                    UpdateParentStatusWhenChildrenComplete(fileItem);
                 }
                 else
                 {
@@ -902,10 +902,10 @@ namespace AutoUnpackTool
                 Dispatcher.Invoke(() => fileItem.Status = $"异常: {ex.Message}");
                 AppendLog($"[线程 {taskId}] {fileItem.FileName}: 异常 - {ex.Message}", ConsoleColor.Red);
                 
-                // 异常时也需要检查父项状态
+                // 异常时也需要检查父项状态（传入子节点）
                 if (fileItem.Parent != null)
                 {
-                    UpdateParentStatusWhenChildrenComplete(fileItem.Parent);
+                    UpdateParentStatusWhenChildrenComplete(fileItem);
                 }
                 else
                 {
@@ -1002,6 +1002,13 @@ namespace AutoUnpackTool
                 {
                     AppendLog($"[线程 {taskId}] 共添加 {addedCount} 个新压缩文件到待处理队列", ConsoleColor.Cyan);
                     
+                    // 设置父节点的预期子节点数量
+                    if (parentFileItem != null)
+                    {
+                        parentFileItem.SetExpectedChildrenCount(addedCount);
+                        AppendLog($"[线程 {taskId}] {parentFileItem.FileName} 设置了预期子节点数: {addedCount}", ConsoleColor.Gray);
+                    }
+                    
                     // 将新文件加入待处理队列
                     Dispatcher.Invoke(() =>
                     {
@@ -1018,6 +1025,15 @@ namespace AutoUnpackTool
                     
                     // 唤醒测试线程
                     WakeupTestThread();
+                }
+                else
+                {
+                    // 没有添加新文件，检查父项是否可以完成
+                    if (parentFileItem != null)
+                    {
+                        AppendLog($"[线程 {taskId}] 没有新文件，更新父项状态: {parentFileItem.FileName}", ConsoleColor.Gray);
+                        UpdateParentStatusWhenChildrenComplete(parentFileItem);
+                    }
                 }
             }
             catch (Exception ex)
@@ -1072,28 +1088,21 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 当子项全部完成时，更新父项状态
+        /// 当子项全部完成时，更新父项状态（反向传播机制）
         /// </summary>
-        private void UpdateParentStatusWhenChildrenComplete(FileItem parentItem)
+        private void UpdateParentStatusWhenChildrenComplete(FileItem childItem)
         {
-            // 检查是否所有子项都已完成
-            bool allChildrenComplete = true;
-            foreach (var child in parentItem.Children)
-            {
-                if (!child.Status.Contains("解压成功") && 
-                    !child.Status.Contains("无密码") &&
-                    !child.Status.Contains("跳过") &&
-                    !child.Status.Contains("异常") &&
-                    !child.Status.Contains("已取消") &&
-                    !child.Status.Contains("失败"))
-                {
-                    allChildrenComplete = false;
-                    break;
-                }
-            }
+            var parentItem = childItem.Parent;
+            if (parentItem == null)
+                return;  // 没有父节点，不需要上报
 
-            // 如果所有子项都完成，更新父项状态
-            if (allChildrenComplete)
+            // 标记父节点的一个子节点完成
+            bool allCompleted = parentItem.MarkChildComplete();
+            
+            AppendLog($"[{parentItem.FileName}] 子节点完成进度: {parentItem.GetProgressInfo()}", ConsoleColor.Gray);
+
+            // 如果所有子节点都已完成，更新父节点状态并继续向上上报
+            if (allCompleted)
             {
                 // 保留原有的密码信息，更新状态为完成
                 var passwordInfo = parentItem.FoundPassword != null 
@@ -1105,16 +1114,31 @@ namespace AutoUnpackTool
                     parentItem.Status = $"解压成功{passwordInfo} [包含 {parentItem.Children.Count} 个子压缩包]";
                 });
                 
-                AppendLog($"[{parentItem.FileName}] 所有子压缩包处理完成，父压缩包标记为完成", ConsoleColor.Green);
+                AppendLog($"[{parentItem.FileName}] ✓ 所有子压缩包处理完成，父压缩包标记为完成", ConsoleColor.Green);
                 
                 // 从密码映射表中移除
                 _passwordMap.Remove(parentItem.FilePath);
                 
-                // 递归处理父级的父级
+                // 递归处理：向上一级上报
                 if (parentItem.Parent != null)
                 {
-                    UpdateParentStatusWhenChildrenComplete(parentItem.Parent);
+                    AppendLog($"[{parentItem.FileName}] 向上一级上报完成状态...", ConsoleColor.Cyan);
+                    UpdateParentStatusWhenChildrenComplete(parentItem);
                 }
+                else
+                {
+                    // 到达顶级，整个树形结构处理完成
+                    AppendLog($"[{parentItem.FileName}] ✓ 已到达顶级，整个树形结构处理完成", ConsoleColor.Green);
+                }
+            }
+            else
+            {
+                // 还有子节点未完成，更新状态显示进度
+                Dispatcher.Invoke(() =>
+                {
+                    parentItem.Status = $"等待子节点完成 ({parentItem.GetProgressInfo()})";
+                });
+                AppendLog($"[{parentItem.FileName}] 还有子节点未完成，当前状态: {parentItem.Status}", ConsoleColor.Gray);
             }
         }
 
@@ -1874,19 +1898,124 @@ namespace AutoUnpackTool
         #endregion
     }
 
-    public class FileItem
+    public class FileItem : System.ComponentModel.INotifyPropertyChanged
     {
-        public string FileName { get; set; } = string.Empty;
-        public string FilePath { get; set; } = string.Empty;
-        public string Status { get; set; } = string.Empty;
-        public long FileSize { get; set; }
-        public string? FoundPassword { get; set; }
+        private string _fileName = string.Empty;
+        private string _filePath = string.Empty;
+        private string _status = string.Empty;
+        private long _fileSize = 0;
+        private string? _foundPassword = null;
+        
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+        
+        protected virtual void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(propertyName));
+        }
+        
+        public string FileName 
+        { 
+            get => _fileName; 
+            set 
+            { 
+                _fileName = value; 
+                OnPropertyChanged(nameof(FileName));
+            } 
+        }
+        
+        public string FilePath 
+        { 
+            get => _filePath; 
+            set 
+            { 
+                _filePath = value; 
+                OnPropertyChanged(nameof(FilePath));
+            } 
+        }
+        
+        public string Status 
+        { 
+            get => _status; 
+            set 
+            { 
+                _status = value; 
+                OnPropertyChanged(nameof(Status));
+            } 
+        }
+        
+        public long FileSize 
+        { 
+            get => _fileSize; 
+            set 
+            { 
+                _fileSize = value; 
+                OnPropertyChanged(nameof(FileSize));
+            } 
+        }
+        
+        public string? FoundPassword 
+        { 
+            get => _foundPassword; 
+            set 
+            { 
+                _foundPassword = value; 
+                OnPropertyChanged(nameof(FoundPassword));
+            } 
+        }
+        
         public ArchiveVolumeInfo? VolumeInfo { get; set; }
         
         // 新增：父子关系支持
         public ObservableCollection<FileItem> Children { get; set; } = new ObservableCollection<FileItem>();
         public FileItem? Parent { get; set; }
         public bool IsParent => Children.Count > 0;
+        
+        // 新增：子节点完成状态跟踪（用于反向传播）
+        private int _expectedChildrenCount = 0;      // 预期的子节点总数
+        private int _completedChildrenCount = 0;     // 已完成的子节点数
+        private bool _isMarkedComplete = false;      // 是否已标记为完成（防止重复上报）
+        
+        /// <summary>
+        /// 设置预期的子节点数量（在扫描完解压目录后调用）
+        /// </summary>
+        public void SetExpectedChildrenCount(int count)
+        {
+            _expectedChildrenCount = count;
+            _completedChildrenCount = 0;
+            _isMarkedComplete = false;
+        }
+        
+        /// <summary>
+        /// 标记一个子节点完成，并返回是否所有子节点都已完成
+        /// </summary>
+        public bool MarkChildComplete()
+        {
+            lock (_lockObject)
+            {
+                if (_isMarkedComplete)
+                    return false;  // 已经标记完成，不再处理
+                    
+                _completedChildrenCount++;
+                
+                // 检查是否所有子节点都已完成
+                bool allCompleted = _completedChildrenCount >= _expectedChildrenCount && _expectedChildrenCount > 0;
+                
+                if (allCompleted)
+                {
+                    _isMarkedComplete = true;
+                }
+                
+                return allCompleted;
+            }
+        }
+        
+        /// <summary>
+        /// 获取完成进度信息
+        /// </summary>
+        public string GetProgressInfo()
+        {
+            return $"{_completedChildrenCount}/{_expectedChildrenCount}";
+        }
         
         // 用于线程安全的状态标记
         private readonly object _lockObject = new object();
