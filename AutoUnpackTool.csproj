@@ -12,8 +12,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 7-Zip 库引用（用于实际解压功能） -->
-    <!-- <PackageReference Include="SevenZipSharp.Interop" Version="19.0.0" /> -->
+    <!-- 代码页编码器支持（用于 GBK 等编码） -->
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="9.0.1" />
   </ItemGroup>
 
 </Project>

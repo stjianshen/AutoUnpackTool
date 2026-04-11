@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 
@@ -8,6 +9,9 @@ namespace AutoUnpackTool
     {
         protected override void OnStartup(StartupEventArgs e)
         {
+            // 注册代码页编码提供程序（支持 GBK 等编码）
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            
             // 注册全局异常处理
             DispatcherUnhandledException += App_DispatcherUnhandledException;
             AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;

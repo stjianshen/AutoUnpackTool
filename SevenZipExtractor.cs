@@ -40,8 +40,8 @@ namespace AutoUnpackTool
                         RedirectStandardError = true,
                         UseShellExecute = false,
                         CreateNoWindow = true,
-                        StandardOutputEncoding = System.Text.Encoding.UTF8,
-                        StandardErrorEncoding = System.Text.Encoding.UTF8
+                        StandardOutputEncoding = System.Text.Encoding.GetEncoding("gbk"),
+                        StandardErrorEncoding = System.Text.Encoding.GetEncoding("gbk")
                     };
 
                     using var process = new Process { StartInfo = startInfo };
@@ -142,8 +142,8 @@ namespace AutoUnpackTool
                     // 只有在重定向输出时才能设置编码
                     if (!showCliWindow)
                     {
-                        startInfo.StandardOutputEncoding = System.Text.Encoding.UTF8;
-                        startInfo.StandardErrorEncoding = System.Text.Encoding.UTF8;
+                        startInfo.StandardOutputEncoding = System.Text.Encoding.GetEncoding("gbk");
+                        startInfo.StandardErrorEncoding = System.Text.Encoding.GetEncoding("gbk");
                     }
 
                     using var process = new Process { StartInfo = startInfo };
