@@ -9,11 +9,15 @@
     <AssemblyName>AutoUnpackTool</AssemblyName>
     <ApplicationIcon />
     <StartupObject>AutoUnpackTool.App</StartupObject>
+    <!-- 抑制 NU1510 警告，因为 System.Text.Encoding.CodePages 是必需的 -->
+    <NoWarn>$(NoWarn);NU1510</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- 代码页编码器支持（用于 GBK 等编码） -->
-    <PackageReference Include="System.Text.Encoding.CodePages" Version="9.0.1" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.5" />
+    <!-- Microsoft.VisualBasic 用于移动到回收站功能 -->
+    <PackageReference Include="Microsoft.VisualBasic" Version="10.3.0" />
   </ItemGroup>
 
 </Project>

@@ -767,6 +767,10 @@ namespace AutoUnpackTool
                 // 没有子项，如果是顶级文件，从列表移除
                 if (fileItem.Parent == null)
                 {
+                    // 处理原文件（移动到回收站/删除等）
+                    // 由于这个方法被多处调用，且都是同步调用，我们使用 fire-and-forget 模式
+                    _ = HandleOriginalFileAsync(fileItem.FilePath);
+                    
                     Dispatcher.Invoke(() =>
                     {
                         if (_fileList.Contains(fileItem))
@@ -776,6 +780,24 @@ namespace AutoUnpackTool
                         }
                     });
                 }
+            }
+        }
+
+        /// <summary>
+        /// 异步处理原文件（fire-and-forget 模式）
+        /// </summary>
+        private async Task HandleOriginalFileAsync(string filePath)
+        {
+            try
+            {
+                if (_settings.FileAfterExtract != FileAction.Keep)
+                {
+                    await HandleOriginalFile(filePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"处理原文件时出错: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -835,11 +857,8 @@ namespace AutoUnpackTool
                     });
                     AppendLog($"[线程 {taskId}] {fileItem.FileName}: 解压成功", ConsoleColor.Green);
 
-                    // 处理原文件
-                    if (_settings.FileAfterExtract != FileAction.Keep)
-                    {
-                        await HandleOriginalFile(fileItem.FilePath);
-                    }
+                    // 不在这里立即处理原文件，而是延迟到所有子项完成后处理
+                    // 原文件处理逻辑移到了 UpdateParentStatusWhenChildrenComplete 和 CheckAndMarkParentComplete 中
 
                     // 从密码映射表中移除已完成处理的文件记录
                     string filePath = fileItem.FilePath;
@@ -850,20 +869,16 @@ namespace AutoUnpackTool
                     // 这会添加子项到 fileItem.Children，并将新文件加入待处理队列
                     await ScanExtractedFilesForArchives(outputDir, taskId, fileItem);
                     
-                    // 注意：不在这里直接调用 CheckAndMarkParentComplete
-                    // 因为 ScanExtractedFilesForArchives 会将新文件加入待处理队列
-                    // 父项的完成状态应该由子项完成时通过 UpdateParentStatusWhenChildrenComplete 来更新
+                    // 注意：原文件处理逻辑已经移到了 ScanExtractedFilesForArchives 和 UpdateParentStatusWhenChildrenComplete 中
+                    // - 叶子节点（无子项）：ScanExtractedFilesForArchives 中处理
+                    // - 父节点（有子项）：UpdateParentStatusWhenChildrenComplete 中所有子项完成后处理
                     
-                    // 如果没有子项，说明解压流程真正完成了
-                    if (fileItem.Children.Count == 0)
-                    {
-                        CheckAndMarkParentComplete(fileItem);
-                    }
                     // 如果有子项，等待子项处理完成后会自动通过 UpdateParentStatusWhenChildrenComplete 更新父项状态
-                    else
+                    if (fileItem.Children.Count > 0)
                     {
                         AppendLog($"[{fileItem.FileName}] 已添加 {fileItem.Children.Count} 个子压缩包到待处理队列，等待递归处理...", ConsoleColor.Cyan);
                     }
+                    // 叶子节点已在 ScanExtractedFilesForArchives 中处理完成
                 }
                 else
                 {
@@ -946,7 +961,13 @@ namespace AutoUnpackTool
                     
                     if (parentFileItem != null)
                     {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，更新父项状态: {parentFileItem.FileName}", ConsoleColor.Magenta);
+                        AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {parentFileItem.FileName}", ConsoleColor.Magenta);
+                        
+                        // 当前节点（叶子节点）：先处理自身原文件
+                        AppendLog($"[{parentFileItem.FileName}] 叶子节点解压完成，处理原文件...", ConsoleColor.Cyan);
+                        _ = HandleOriginalFileAsync(parentFileItem.FilePath);
+                        
+                        // 然后向父节点传播完成状态
                         UpdateParentStatusWhenChildrenComplete(parentFileItem);
                     }
                     return;
@@ -1118,6 +1139,10 @@ namespace AutoUnpackTool
                 
                 // 从密码映射表中移除
                 _passwordMap.Remove(parentItem.FilePath);
+                
+                // 处理原文件（移动到回收站/删除等）
+                // 由于这个方法是同步调用，使用 fire-and-forget 模式
+                _ = HandleOriginalFileAsync(parentItem.FilePath);
                 
                 // 递归处理：向上一级上报
                 if (parentItem.Parent != null)
@@ -1668,7 +1693,16 @@ namespace AutoUnpackTool
             try
             {
                 // 获取文件项以检查是否为分卷压缩包
-                var fileItem = _fileList.FirstOrDefault(f => f.FilePath == filePath);
+                FileItem? fileItem = null;
+                Dispatcher.Invoke(() =>
+                {
+                    fileItem = _fileList.FirstOrDefault(f => f.FilePath == filePath);
+                    if (fileItem == null)
+                    {
+                        // 尝试在子项中查找
+                        fileItem = FindFileItemInTree(filePath);
+                    }
+                });
                 
                 switch (_settings.FileAfterExtract)
                 {
@@ -1682,11 +1716,13 @@ namespace AutoUnpackTool
                         else
                         {
                             // 普通文件：移动到回收站
-                            // 需要添加 Microsoft.VisualBasic.FileIO 引用
-                            // Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(filePath, 
-                            //     Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                            //     Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                            AppendLog($"  跳过移动到回收站（需要添加 Microsoft.VisualBasic 引用）", ConsoleColor.Yellow);
+                            await Task.Run(() =>
+                            {
+                                Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(filePath, 
+                                    Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                                    Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                            });
+                            AppendLog($"  原文件已移动到回收站: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
                         }
                         break;
 
@@ -1738,17 +1774,21 @@ namespace AutoUnpackTool
         {
             AppendLog($"  准备移动 {volumeInfo.VolumeCount} 个分卷到回收站...", ConsoleColor.Cyan);
             
+            int movedCount = 0;
             foreach (var volumePath in volumeInfo.AllVolumePaths)
             {
                 try
                 {
                     if (File.Exists(volumePath))
                     {
-                        // 需要添加 Microsoft.VisualBasic.FileIO 引用
-                        // Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(volumePath, 
-                        //     Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                        //     Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                        AppendLog($"  跳过移动到回收站: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                        await Task.Run(() =>
+                        {
+                            Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(volumePath, 
+                                Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                                Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                        });
+                        AppendLog($"  已移动分卷到回收站: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                        movedCount++;
                     }
                 }
                 catch (Exception ex)
@@ -1757,7 +1797,7 @@ namespace AutoUnpackTool
                 }
             }
             
-            AppendLog($"  分卷压缩包已处理（移动到回收站）", ConsoleColor.Green);
+            AppendLog($"  分卷压缩包已处理（已移动 {movedCount}/{volumeInfo.VolumeCount} 个分卷到回收站）", ConsoleColor.Green);
         }
 
         /// <summary>

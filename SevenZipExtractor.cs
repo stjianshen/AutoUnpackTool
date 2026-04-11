@@ -87,7 +87,7 @@ namespace AutoUnpackTool
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"测试密码失败: {ex.Message}");
+                    onOutput?.Invoke($"测试密码失败: {ex.Message}");
                     return false;
                 }
             }, cancellationToken);
@@ -197,16 +197,19 @@ namespace AutoUnpackTool
                     if (!exited && !process.HasExited)
                     {
                         process.Kill();
+                        onProgress?.Invoke("解压被取消或超时");
                         return (false, "解压被取消或超时");
                     }
 
                     if (process.ExitCode == 0)
                     {
+                        onProgress?.Invoke("解压成功");
                         return (true, "解压成功");
                     }
                     else
                     {
                         string errorMsg = string.IsNullOrEmpty(error) ? output : error;
+                        onProgress?.Invoke($"解压失败 (退出码: {process.ExitCode})");
                         return (false, $"解压失败 (退出码: {process.ExitCode})\n{errorMsg}");
                     }
                 }
