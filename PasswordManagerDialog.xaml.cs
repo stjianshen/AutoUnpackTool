@@ -190,78 +190,146 @@ namespace AutoUnpackTool
 
             if (dialog.ShowDialog() == true)
             {
-                TxtPasswordFilePath.Text = dialog.FileName;
+                string filePath = dialog.FileName;
+                TxtPasswordFilePath.Text = filePath;
+                
+                // 自动加载密码到当前列表（一次性使用，去重）
+                LoadPasswordsFromFileToUI(filePath);
             }
         }
 
-        private void BtnLoadFile_Click(object sender, RoutedEventArgs e)
+        /// <summary>
+        /// 从文件加载密码到UI列表（一次性使用，不与配置文件合并）
+        /// </summary>
+        private void LoadPasswordsFromFileToUI(string filePath)
         {
-            string filePath = TxtPasswordFilePath.Text;
-            if (string.IsNullOrEmpty(filePath) || filePath == "未设置（使用默认密码）")
+            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
             {
-                MessageBox.Show("请先选择密码本文件！", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            if (!File.Exists(filePath))
-            {
-                MessageBox.Show("文件不存在！", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
             try
             {
-                _settings.PasswordFilePath = filePath;
-                LoadPasswords();
-                _isDirty = true;
-                MessageBox.Show("密码本加载成功！", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
+                string[] lines = File.ReadAllLines(filePath);
+                int loadedCount = 0;
+                int skippedCount = 0;
+
+                foreach (string line in lines)
+                {
+                    string trimmed = line.Trim();
+                    if (string.IsNullOrEmpty(trimmed))
+                        continue;
+
+                    // 解析密码（支持TAB分隔格式）
+                    string password = trimmed;
+                    string[] parts = trimmed.Split(new[] { "\t\t" }, StringSplitOptions.None);
+                    if (parts.Length >= 1)
+                    {
+                        password = parts[0].Trim();
+                    }
+
+                    if (string.IsNullOrEmpty(password))
+                        continue;
+
+                    // 去重：检查是否已存在于当前UI列表
+                    if (_passwordList.Any(p => p.Password == password))
+                    {
+                        skippedCount++;
+                        continue;
+                    }
+
+                    // 添加到UI列表（永久类型，但不保存到配置，仅本次会话使用）
+                    _passwordList.Add(new PasswordItem
+                    {
+                        Index = _passwordList.Count + 1,
+                        Password = password,
+                        UsageCount = 0,
+                        Type = "临时",
+                        LastUsedTime = DateTime.MinValue
+                    });
+                    loadedCount++;
+                }
+
+                if (loadedCount > 0)
+                {
+                    _isDirty = true;
+                    Console.WriteLine($"从文件加载 {loadedCount} 个密码，跳过重复 {skippedCount} 个");
+                }
             }
             catch (Exception ex)
             {
+                Console.WriteLine($"加载密码文件失败: {ex.Message}");
                 MessageBox.Show($"加载失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
         /// <summary>
-        /// 从密码本文件导入到配置文件（JSON）
+        /// 从密码本文件导入到配置文件（JSON）- 将当前UI列表的密码写入配置
         /// </summary>
         private void BtnImportPassword_Click(object sender, RoutedEventArgs e)
         {
-            string filePath = TxtPasswordFilePath.Text;
-            if (string.IsNullOrEmpty(filePath) || filePath == "未设置（使用默认密码）")
+            if (_passwordList.Count == 0)
             {
-                MessageBox.Show("请先选择密码本文件！", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            if (!File.Exists(filePath))
-            {
-                MessageBox.Show("文件不存在！", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show("当前密码列表为空，请先添加或加载密码！", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
             try
             {
-                // 导入密码，获取详细结果信息
-                string resultMessage = _settings.ImportPasswordsFromOldFormat(filePath);
-                
-                // 更新密码本文件路径
-                _settings.PasswordFilePath = filePath;
-                
-                // 显示导入结果
-                MessageBox.Show(resultMessage, "导入完成", MessageBoxButton.OK, MessageBoxImage.Information);
-                
+                int importedCount = 0;
+                int skippedCount = 0;
+
+                // 遍历当前UI列表中的所有密码（除一次性密码外）
+                foreach (var item in _passwordList)
+                {
+                    // 跳过一次性密码（它们不会导入到配置）
+                    if (item.Type == "一次性")
+                    {
+                        continue;
+                    }
+
+                    // 如果密码不存在于配置文件，添加它
+                    if (!_settings.PermanentPasswords.Any(p => p.Password == item.Password))
+                    {
+                        _settings.PermanentPasswords.Add(new PasswordEntry
+                        {
+                            Password = item.Password,
+                            UsageCount = item.UsageCount,
+                            LastUsedTime = item.LastUsedTime
+                        });
+                        importedCount++;
+                    }
+                    else
+                    {
+                        // 如果已存在，更新使用信息
+                        var existing = _settings.PermanentPasswords.First(p => p.Password == item.Password);
+                        existing.UsageCount = Math.Max(existing.UsageCount, item.UsageCount);
+                        if (item.LastUsedTime > existing.LastUsedTime)
+                        {
+                            existing.LastUsedTime = item.LastUsedTime;
+                        }
+                        skippedCount++;
+                    }
+                }
+
+                // 保存到配置文件
+                _settings.Save();
+
                 // 重新加载密码列表以更新UI
                 LoadPasswords();
                 _isDirty = true;
-                
-                Console.WriteLine("密码导入完成，配置文件已更新");
+
+                string message = importedCount > 0
+                    ? $"导入成功！\n\n新增密码: {importedCount} 个\n更新密码: {skippedCount} 个\n配置文件中总密码数: {_settings.PermanentPasswords.Count} 个\n\n密码已永久保存到配置文件，下次启动自动加载。"
+                    : $"导入完成！\n\n所有密码都已存在于配置文件中。";
+
+                MessageBox.Show(message, "导入完成", MessageBoxButton.OK, MessageBoxImage.Information);
+                Console.WriteLine($"密码导入完成，配置文件已更新。新增: {importedCount}, 更新: {skippedCount}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"导入失败: {ex.Message}");
-                Console.WriteLine($"异常堆栈: {ex.StackTrace}");
-                MessageBox.Show($"导入失败：{ex.Message}\n\n请查看控制台输出获取详细信息。", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show($"导入失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
