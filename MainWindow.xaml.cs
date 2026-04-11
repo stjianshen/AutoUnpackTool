@@ -1213,6 +1213,10 @@ namespace AutoUnpackTool
 
         /// <summary>
         /// 判断文件是否为压缩文件（基于扩展名 + 文件头特征）
+        /// 流程：
+        /// 1. 先检查扩展名是否在排除列表中，如果是则直接返回 false
+        /// 2. 再检查扩展名是否在包含列表中，如果是则用魔术数验证
+        /// 3. 如果扩展名不在包含列表中，直接用魔术数检测
         /// </summary>
         /// <param name="filePath">文件路径</param>
         /// <returns>是否为压缩文件</returns>
@@ -1224,15 +1228,69 @@ namespace AutoUnpackTool
             if (!File.Exists(filePath))
                 return false;
 
-            // 方法1：先检查扩展名（快速判断）
-            if (IsArchiveFileByExtension(filePath))
-                return true;
+            string extension = Path.GetExtension(filePath).ToLowerInvariant();
+            
+            // 步骤1：获取排除的扩展名列表
+            var excludedExtensions = _settings.GetExcludedExtensions();
+            
+            // 如果在排除列表中，直接返回 false，结束解压流程
+            if (excludedExtensions.Contains(extension))
+            {
+                AppendLog($"  [跳过] {Path.GetFileName(filePath)}: 扩展名在排除列表中", ConsoleColor.Gray);
+                return false;
+            }
 
-            // 方法2：如果扩展名不匹配，检查文件头特征（魔数）
-            if (IsArchiveFileByMagicNumber(filePath))
-                return true;
-
-            return false;
+            // 步骤2：获取需要检测的压缩文件扩展名列表
+            var archiveExtensions = _settings.GetArchiveExtensions();
+            
+            // 如果扩展名在包含列表中，用魔术数验证是否真的是压缩文件
+            bool extensionMatched = false;
+            string fileName = Path.GetFileName(filePath).ToLowerInvariant();
+            foreach (var ext in archiveExtensions)
+            {
+                if (fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase) || extension == ext)
+                {
+                    extensionMatched = true;
+                    break;
+                }
+            }
+            
+            // 检查分卷压缩包格式
+            if (!extensionMatched && IsMultiVolumeArchive(filePath))
+            {
+                extensionMatched = true;
+            }
+            
+            if (extensionMatched)
+            {
+                // 扩展名匹配，用魔术数验证
+                AppendLog($"  [检测] {Path.GetFileName(filePath)}: 扩展名匹配，进行魔术数验证...", ConsoleColor.Gray);
+                if (IsArchiveFileByMagicNumber(filePath))
+                {
+                    AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数验证通过，是压缩文件", ConsoleColor.Green);
+                    return true;
+                }
+                else
+                {
+                    AppendLog($"  [拒绝] {Path.GetFileName(filePath)}: 魔术数验证失败，不是压缩文件", ConsoleColor.Yellow);
+                    return false;
+                }
+            }
+            else
+            {
+                // 扩展名不匹配，直接用魔术数检测
+                AppendLog($"  [检测] {Path.GetFileName(filePath)}: 扩展名不匹配，尝试魔术数检测...", ConsoleColor.Gray);
+                if (IsArchiveFileByMagicNumber(filePath))
+                {
+                    AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数检测通过，是压缩文件", ConsoleColor.Green);
+                    return true;
+                }
+                else
+                {
+                    AppendLog($"  [拒绝] {Path.GetFileName(filePath)}: 魔术数检测失败，不是压缩文件", ConsoleColor.Yellow);
+                    return false;
+                }
+            }
         }
 
         /// <summary>
@@ -1242,24 +1300,19 @@ namespace AutoUnpackTool
         {
             string extension = Path.GetExtension(filePath).ToLowerInvariant();
             
-            // 支持的压缩格式扩展名
-            var archiveExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            // 获取排除的扩展名列表
+            var excludedExtensions = _settings.GetExcludedExtensions();
+            
+            // 先检查是否在排除列表中（优先级最高）
+            if (excludedExtensions.Contains(extension))
             {
-                // 常见压缩格式
-                ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-                // ZSTD 压缩
-                ".zst", ".zstd",
-                // 复合格式（如 .tar.gz, .tar.bz2, .tar.xz, .tar.zst）
-                ".tgz", ".tbz2", ".tbz", ".txz", ".tlz",
-                // 其他压缩格式
-                ".cab", ".iso", ".wim", ".arj", ".lzh",
-                ".cpio", ".rpm", ".deb",
-                // 双层扩展名处理（如 .tar.zst）
-                ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.zstd",
-                ".tar.lz", ".tar.lzma", ".tar.lzo"
-            };
-
-            // 先检查完整扩展名（处理 .tar.zst 这类复合扩展名）
+                return false;
+            }
+            
+            // 获取需要检测的压缩文件扩展名列表
+            var archiveExtensions = _settings.GetArchiveExtensions();
+            
+            // 检查完整扩展名（处理 .tar.zst 这类复合扩展名）
             string fileName = Path.GetFileName(filePath).ToLowerInvariant();
             foreach (var ext in archiveExtensions)
             {

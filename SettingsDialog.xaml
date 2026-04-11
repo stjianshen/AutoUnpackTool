@@ -73,8 +73,8 @@
             <RadioButton x:Name="RdoOutputToSpecificDir" Content="输出到指定目录" GroupName="OutputMode" Margin="0,0,0,5" Checked="OutputMode_Checked"/>
             <RadioButton x:Name="RdoOutputToArchiveDir" Content="输出到压缩文件所在目录" GroupName="OutputMode" Margin="0,0,0,5" Checked="OutputMode_Checked"/>
             <RadioButton x:Name="RdoOutputToArchiveFolder" Content="输出到压缩文件同名文件夹" GroupName="OutputMode" Checked="OutputMode_Checked"/>
-            
-            <!-- 输出目录选择（仅在"输出到指定目录"模式下显示） -->
+                    
+            <!-- 输出目录选择（仅在“输出到指定目录”模式下显示） -->
             <StackPanel x:Name="PnlOutputDir" Margin="20,5,0,0" Visibility="Collapsed">
                 <StackPanel Orientation="Horizontal">
                     <TextBox x:Name="TxtOutputDir" Width="420" Height="30" VerticalContentAlignment="Center" Margin="0,0,10,0"/>
@@ -82,12 +82,22 @@
                 </StackPanel>
             </StackPanel>
         </StackPanel>
+        
+        <!-- 压缩文件扩展名设置 -->
+        <StackPanel Grid.Row="7" Margin="0,0,0,15">
+            <TextBlock Text="压缩文件扩展名检测:" FontWeight="Bold" Margin="0,0,0,5"/>
+            <TextBlock Text="需要检测的扩展名（逗号分隔）:" FontSize="11" Margin="0,0,0,3"/>
+            <TextBox x:Name="TxtArchiveExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,10"/>
+            <TextBlock Text="需要排除的扩展名（逗号分隔，优先级高于包含列表）:" FontSize="11" Margin="0,0,0,3"/>
+            <TextBox x:Name="TxtExcludedExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,5"/>
+            <TextBlock Text="提示：符合扩展名的文件会用魔术数验证是否为压缩文件；排除列表中的文件直接跳过" FontSize="11" Foreground="Gray"/>
+        </StackPanel>
 
         <!-- 分隔线 -->
-        <Separator Grid.Row="7" Margin="0,10,0,10"/>
+        <Separator Grid.Row="8" Margin="0,10,0,10"/>
 
         <!-- 说明信息 -->
-        <TextBlock Grid.Row="8" TextWrapping="Wrap" Foreground="Gray" FontSize="11">
+        <TextBlock Grid.Row="9" TextWrapping="Wrap" Foreground="Gray" FontSize="11">
             <Run Text="• 所有配置（包括密码本）都保存在一个JSON文件中"/>
             <LineBreak/>
             <Run Text="• 7z.exe 是 7-Zip 的命令行版本，需要从 7-Zip 官网下载"/>
@@ -96,7 +106,7 @@
         </TextBlock>
 
         <!-- 按钮区域 -->
-        <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+        <StackPanel Grid.Row="10" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
             <Button x:Name="BtnSave" Content="💾 保存配置" Width="120" Height="35" Click="BtnSave_Click" Margin="0,0,10,0" FontWeight="Bold"/>
             <Button x:Name="BtnCancel" Content="取消" Width="100" Height="35" Click="BtnCancel_Click"/>
         </StackPanel>

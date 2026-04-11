@@ -79,6 +79,10 @@ namespace AutoUnpackTool
                     RdoAutoExtract.IsChecked = true;
                     break;
             }
+            
+            // 加载扩展名设置
+            TxtArchiveExtensions.Text = Settings.ArchiveExtensions;
+            TxtExcludedExtensions.Text = Settings.ExcludedExtensions;
         }
 
         private void BtnBrowse7z_Click(object sender, RoutedEventArgs e)
@@ -201,6 +205,10 @@ namespace AutoUnpackTool
 
                 // 保存CLI窗口设置
                 Settings.ShowCliWindow = ChkShowCliWindow.IsChecked == true;
+                
+                // 保存扩展名设置
+                Settings.ArchiveExtensions = TxtArchiveExtensions.Text.Trim();
+                Settings.ExcludedExtensions = TxtExcludedExtensions.Text.Trim();
 
                 // 保存到文件
                 Settings.Save();

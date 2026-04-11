@@ -138,6 +138,16 @@ namespace AutoUnpackTool
         /// 是否启用分卷压缩包自动检测
         /// </summary>
         public bool EnableMultiVolumeDetection { get; set; } = true;
+        
+        /// <summary>
+        /// 需要检测的压缩文件扩展名列表（逗号分隔）
+        /// </summary>
+        public string ArchiveExtensions { get; set; } = ".zip,.rar,.7z,.tar,.gz,.bz2,.xz,.zst,.zstd,.tgz,.tbz2,.tbz,.txz,.cab,.iso,.wim,.arj,.lzh,.cpio,.rpm,.deb";
+        
+        /// <summary>
+        /// 需要排除的文件扩展名列表（逗号分隔，优先级高于包含列表）
+        /// </summary>
+        public string ExcludedExtensions { get; set; } = ".exe,.dll,.msi,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.pdf,.jpg,.jpeg,.png,.gif,.bmp,.mp3,.mp4,.avi,.mkv";
 
         // 永久密码（按使用次数排序）
         public List<PasswordEntry> PermanentPasswords { get; set; } = new List<PasswordEntry>();
@@ -569,6 +579,44 @@ namespace AutoUnpackTool
             {
                 Console.WriteLine($"保存密码本失败: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// 获取需要检测的压缩文件扩展名列表
+        /// </summary>
+        public HashSet<string> GetArchiveExtensions()
+        {
+            var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(ArchiveExtensions))
+            {
+                foreach (var ext in ArchiveExtensions.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string trimmed = ext.Trim().ToLowerInvariant();
+                    if (!trimmed.StartsWith("."))
+                        trimmed = "." + trimmed;
+                    extensions.Add(trimmed);
+                }
+            }
+            return extensions;
+        }
+        
+        /// <summary>
+        /// 获取需要排除的文件扩展名列表
+        /// </summary>
+        public HashSet<string> GetExcludedExtensions()
+        {
+            var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(ExcludedExtensions))
+            {
+                foreach (var ext in ExcludedExtensions.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string trimmed = ext.Trim().ToLowerInvariant();
+                    if (!trimmed.StartsWith("."))
+                        trimmed = "." + trimmed;
+                    extensions.Add(trimmed);
+                }
+            }
+            return extensions;
         }
 
         [Obsolete("使用 LoadPasswordsFromFile 代替")]
