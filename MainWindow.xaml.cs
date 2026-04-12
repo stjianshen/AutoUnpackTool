@@ -28,12 +28,19 @@ namespace AutoUnpackTool
         
         private CancellationTokenSource? _testCancellationTokenSource;
         private CancellationTokenSource? _extractCancellationTokenSource;
+        private CancellationTokenSource? _globalCancellationTokenSource; // 全局取消令牌，用于清空时终止所有操作
         private bool _isTesting = false;
         private bool _isExtracting = false;
         
         // 任务完成信号
         private TaskCompletionSource<bool> _testCompletionSource = new();
         private TaskCompletionSource<bool> _extractCompletionSource = new();
+        
+        // 记录需要智能路径处理的目录（去重），Key=rootDir, Value=extractedFolder
+        private Dictionary<string, string> _pendingSmartPathDirs = new();
+        
+        // 记录所有顶级 FileItem
+        private List<FileItem> _topLevelItems = new();
 
         public MainWindow()
         {
@@ -331,10 +338,104 @@ namespace AutoUnpackTool
 
         private void BtnClear_Click(object sender, RoutedEventArgs e)
         {
+            // 1. 取消所有正在运行的操作
+            CancelAllOperations();
+            
+            // 2. 等待一小段时间让线程退出
+            Task.Delay(500).Wait();
+            
+            // 3. Kill掉所有7z进程
+            KillSevenZipProcesses();
+            
+            // 4. 清空UI和数据
             _fileList.Clear();
-            _passwordMap = new PasswordMap(); // 清空密码映射
+            _passwordMap = new PasswordMap();
+            _pendingQueue = new ConcurrentQueue<FileItem>();
+            _extractQueue = new ConcurrentQueue<FileItem>();
+            _pendingSmartPathDirs.Clear();
+            _topLevelItems.Clear();
             TxtLog.Clear();
-            AppendLog("已清空内容", ConsoleColor.Gray);
+            
+            // 5. 重置状态
+            _isTesting = false;
+            _isExtracting = false;
+            
+            // 6. 重置信号
+            _pendingQueueSignal.Reset();
+            _extractQueueSignal.Reset();
+            
+            // 7. 重置完成信号
+            _testCompletionSource = new TaskCompletionSource<bool>();
+            _extractCompletionSource = new TaskCompletionSource<bool>();
+            
+            AppendLog("已清空内容，程序已重置到初始状态", ConsoleColor.Gray);
+            
+            // 8. 更新UI状态
+            UpdateUiState();
+        }
+        
+        /// <summary>
+        /// 取消所有正在运行的操作
+        /// </summary>
+        private void CancelAllOperations()
+        {
+            // 取消全局操作
+            _globalCancellationTokenSource?.Cancel();
+            _globalCancellationTokenSource?.Dispose();
+            _globalCancellationTokenSource = new CancellationTokenSource();
+            
+            // 取消测试线程
+            if (_testCancellationTokenSource != null && !_testCancellationTokenSource.IsCancellationRequested)
+            {
+                AppendLog("正在取消测试操作...", ConsoleColor.Yellow);
+                _testCancellationTokenSource.Cancel();
+            }
+            
+            // 取消解压线程
+            if (_extractCancellationTokenSource != null && !_extractCancellationTokenSource.IsCancellationRequested)
+            {
+                AppendLog("正在取消解压操作...", ConsoleColor.Yellow);
+                _extractCancellationTokenSource.Cancel();
+            }
+        }
+        
+        /// <summary>
+        /// Kill掉所有7z进程
+        /// </summary>
+        private void KillSevenZipProcesses()
+        {
+            try
+            {
+                var processes = System.Diagnostics.Process.GetProcessesByName("7z");
+                if (processes.Length > 0)
+                {
+                    AppendLog($"发现 {processes.Length} 个7z进程，正在终止...", ConsoleColor.Yellow);
+                    foreach (var process in processes)
+                    {
+                        try
+                        {
+                            if (!process.HasExited)
+                            {
+                                process.Kill();
+                                process.WaitForExit(1000); // 等待1秒让进程退出
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            AppendLog($"终止7z进程失败: {ex.Message}", ConsoleColor.Red);
+                        }
+                        finally
+                        {
+                            process.Dispose();
+                        }
+                    }
+                    AppendLog("所有7z进程已终止", ConsoleColor.Green);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"查找7z进程失败: {ex.Message}", ConsoleColor.Red);
+            }
         }
 
         /// <summary>
@@ -397,6 +498,19 @@ namespace AutoUnpackTool
         /// </summary>
         private void WakeupTestThread()
         {
+            // 如果测试线程不在运行中，需要重新启动它
+            if (!_isTesting)
+            {
+                AppendLog("[系统] 测试线程未运行，重新启动...", ConsoleColor.Gray);
+                
+                // 重置完成信号
+                _testCompletionSource = new TaskCompletionSource<bool>();
+                
+                // 启动测试线程
+                StartTestThread();
+            }
+            
+            // 设置信号唤醒正在等待的测试线程（如果有的话）
             _pendingQueueSignal.Set();
             AppendLog("[系统] 已唤醒测试线程", ConsoleColor.Gray);
         }
@@ -406,6 +520,19 @@ namespace AutoUnpackTool
         /// </summary>
         private void WakeupExtractThread()
         {
+            // 如果解压线程不在运行中，需要重新启动它
+            if (!_isExtracting)
+            {
+                AppendLog("[系统] 解压线程未运行，重新启动...", ConsoleColor.Gray);
+                
+                // 重置完成信号（让 MonitorProcessingComplete 能等待新的解压线程）
+                _extractCompletionSource = new TaskCompletionSource<bool>();
+                
+                // 重新启动解压线程
+                StartExtractThread();
+            }
+            
+            // 设置信号唤醒正在等待的解压线程（如果有的话）
             _extractQueueSignal.Set();
             AppendLog("[系统] 已唤醒解压线程", ConsoleColor.Gray);
         }
@@ -497,6 +624,22 @@ namespace AutoUnpackTool
                 _testCancellationTokenSource = null;
                 UpdateUiState();
                 _testCompletionSource.TrySetResult(true);
+                
+                // 测试线程完成后，检查待解压队列是否有内容
+                // 如果有且解压线程不在运行，需要启动解压线程
+                if (!_extractQueue.IsEmpty && !_isExtracting)
+                {
+                    AppendLog("[测试线程] 检测到有待解压文件，但解压线程未运行，重新启动...", ConsoleColor.Cyan);
+                    
+                    // 重置完成信号
+                    _extractCompletionSource = new TaskCompletionSource<bool>();
+                    
+                    // 启动解压线程
+                    StartExtractThread();
+                    
+                    // 设置信号
+                    _extractQueueSignal.Set();
+                }
             }
         }
 
@@ -714,14 +857,106 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 监控处理流程完成
+        /// 监控处理流程完成（支持线程重启）
         /// </summary>
         private async void MonitorProcessingComplete()
         {
             try
             {
-                await Task.WhenAll(_testCompletionSource.Task, _extractCompletionSource.Task);
-                AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
+                int emptyCheckCount = 0;
+                const int maxEmptyChecks = 3; // 连续检测到空状态的次数阈值
+                
+                while (true)
+                {
+                    // 检查全局取消令牌
+                    if (_globalCancellationTokenSource?.Token.IsCancellationRequested == true)
+                    {
+                        AppendLog("[监控] 检测到全局取消请求，退出监控", ConsoleColor.Gray);
+                        break;
+                    }
+                    
+                    // 获取当前的完成信号 Task
+                    var testTask = _testCompletionSource.Task;
+                    var extractTask = _extractCompletionSource.Task;
+                    
+                    // 等待完成（带超时）
+                    var completedTask = await Task.WhenAny(
+                        Task.WhenAll(testTask, extractTask),
+                        Task.Delay(5000) // 5秒超时
+                    );
+                    
+                    // 如果是因为超时而非任务完成
+                    if (completedTask != testTask && completedTask != extractTask)
+                    {
+                        // 检查是否应该退出
+                        if (!_isTesting && !_isExtracting && _extractQueue.IsEmpty && _pendingQueue.IsEmpty)
+                        {
+                            emptyCheckCount++;
+                            if (emptyCheckCount >= maxEmptyChecks)
+                            {
+                                AppendLog("[监控] 连续检测到空状态，退出监控", ConsoleColor.Gray);
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            emptyCheckCount = 0;
+                        }
+                        continue;
+                    }
+                    
+                    // 任务完成，重置计数器
+                    emptyCheckCount = 0;
+                    
+                    // 等待完成后，检查是否还有线程在运行
+                    if (!_isTesting && !_isExtracting)
+                    {
+                        // 两个线程都不在运行，但需要再等待一小段时间
+                        // 确保不会有新的任务被加入队列（比如测试线程刚完成并唤醒解压线程）
+                        await Task.Delay(1000);
+                        
+                        // 再次检查线程状态和队列状态
+                        if (!_isTesting && !_isExtracting && _extractQueue.IsEmpty && _pendingQueue.IsEmpty)
+                        {
+                            // 所有线程都完成了，且队列都为空，真正退出循环
+                            AppendLog("[监控] 所有任务完成且队列为空，退出监控", ConsoleColor.Gray);
+                            break;
+                        }
+                    }
+                    
+                    // 还有线程在运行或队列不为空，继续循环等待
+                    if (_isTesting || _isExtracting)
+                    {
+                        AppendLog("[监控] 检测到线程仍在运行，继续等待...", ConsoleColor.Gray);
+                    }
+                    else if (!_extractQueue.IsEmpty || !_pendingQueue.IsEmpty)
+                    {
+                        AppendLog($"[监控] 检测到队列仍有任务（待处理:{_pendingQueue.Count}, 待解压:{_extractQueue.Count}），继续等待...", ConsoleColor.Gray);
+                    }
+                }
+                
+                // 只有在没有被取消的情况下才执行智能路径处理
+                if (_globalCancellationTokenSource?.Token.IsCancellationRequested != true)
+                {
+                    AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
+                    
+                    // 执行智能路径处理（在所有任务完成后统一处理）
+                    if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _pendingSmartPathDirs.Count > 0)
+                    {
+                        AppendLog($"\n开始执行智能路径处理... (共 {_pendingSmartPathDirs.Count} 个目录)", ConsoleColor.Cyan);
+                        
+                        foreach (var kvp in _pendingSmartPathDirs)
+                        {
+                            string rootDir = kvp.Key;
+                            string extractedFolder = kvp.Value;
+                            
+                            await Task.Run(() => ProcessSmartPath(rootDir, extractedFolder));
+                        }
+                        
+                        _pendingSmartPathDirs.Clear();
+                        AppendLog($"\n✓ 智能路径处理全部完成", ConsoleColor.Green);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1144,6 +1379,22 @@ namespace AutoUnpackTool
                 // 由于这个方法是同步调用，使用 fire-and-forget 模式
                 _ = HandleOriginalFileAsync(parentItem.FilePath);
                 
+                // 智能路径处理：记录目录映射，等所有顶级节点完成后再统一处理
+                if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder)
+                {
+                    string extractedFolder = GetOutputDirectory(parentItem.FilePath);
+                    // rootDir 应该是压缩包所在的目录（不是解压输出目录）
+                    string rootDir = Path.GetDirectoryName(parentItem.FilePath) ?? string.Empty;
+                    
+                    if (!string.IsNullOrEmpty(rootDir))
+                    {
+                        // 使用规范化路径作为 Key
+                        string normalizedRootDir = Path.GetFullPath(rootDir);
+                        _pendingSmartPathDirs[normalizedRootDir] = extractedFolder;
+                        AppendLog($"[{parentItem.FileName}] 已记录智能路径处理: rootDir={normalizedRootDir}, extractedFolder={extractedFolder}", ConsoleColor.Gray);
+                    }
+                }
+                
                 // 递归处理：向上一级上报
                 if (parentItem.Parent != null)
                 {
@@ -1172,22 +1423,25 @@ namespace AutoUnpackTool
         /// </summary>
         private void UpdateUiState()
         {
-            // 自动模式下，开始解压按钮应该禁用（因为会自动触发）
-            bool isAutoMode = _settings.ExtractMode == ExtractMode.Auto;
-            
-            // 如果正在测试或解压，禁用开始解压按钮
-            // 如果是自动模式，也禁用开始解压按钮
-            if (_isTesting || _isExtracting || isAutoMode)
+            Dispatcher.Invoke(() =>
             {
-                BtnStartExtract.IsEnabled = false;
-            }
-            else
-            {
-                BtnStartExtract.IsEnabled = true;
-            }
+                // 自动模式下，开始解压按钮应该禁用（因为会自动触发）
+                bool isAutoMode = _settings.ExtractMode == ExtractMode.Auto;
+                
+                // 如果正在测试或解压，禁用开始解压按钮
+                // 如果是自动模式，也禁用开始解压按钮
+                if (_isTesting || _isExtracting || isAutoMode)
+                {
+                    BtnStartExtract.IsEnabled = false;
+                }
+                else
+                {
+                    BtnStartExtract.IsEnabled = true;
+                }
 
-            TxtStatusTestThread.Text = $"测试线程: {(_isTesting ? "工作中" : "空闲")}";
-            TxtStatusExtractThread.Text = $"解压线程: {(_isExtracting ? "工作中" : "空闲")}";
+                TxtStatusTestThread.Text = $"测试线程: {(_isTesting ? "工作中" : "空闲")}";
+                TxtStatusExtractThread.Text = $"解压线程: {(_isExtracting ? "工作中" : "空闲")}";
+            });
         }
 
         /// <summary>
@@ -1210,6 +1464,159 @@ namespace AutoUnpackTool
         #endregion
 
         #region 辅助方法
+
+        /// <summary>
+        /// 智能路径处理：扁平化多层嵌套文件夹
+        /// 执行时机：顶级压缩包完全处理完成后
+        /// </summary>
+        /// <param name="rootDir">真正的顶级输出目录（用户选择的目录）</param>
+        /// <param name="extractedFolder">7z 实际解压到的目录</param>
+        private void ProcessSmartPath(string rootDir, string extractedFolder)
+        {
+            // 等待一下确保文件操作完成
+            Thread.Sleep(500);
+            
+            AppendLog($"[智能路径] 开始处理", ConsoleColor.Cyan);
+            AppendLog($"[智能路径]   顶级输出目录: {rootDir}", ConsoleColor.Gray);
+            AppendLog($"[智能路径]   7z解压目录: {extractedFolder}", ConsoleColor.Gray);
+            
+            if (!Directory.Exists(rootDir)) 
+            {
+                AppendLog($"[智能路径] 目录不存在，跳过处理", ConsoleColor.Yellow);
+                return;
+            }
+
+            try
+            {
+                // 从 7z 解压目录开始，寻找只包含一个子文件夹的路径
+                string currentDir = extractedFolder;
+                int depth = 0;
+                
+                while (true)
+                {
+                    var subDirs = Directory.GetDirectories(currentDir);
+                    var files = Directory.GetFiles(currentDir);
+                    
+                    AppendLog($"[智能路径] 层级 {depth}: {Path.GetFileName(currentDir)} - 子文件夹数: {subDirs.Length}, 文件数: {files.Length}", ConsoleColor.Gray);
+
+                    // 如果当前目录包含文件，或者包含多个子文件夹，则停止深入
+                    if (files.Length > 0 || subDirs.Length != 1)
+                    {
+                        AppendLog($"[智能路径] 停止深入: 文件数={files.Length}, 子文件夹数={subDirs.Length}", ConsoleColor.Gray);
+                        break;
+                    }
+
+                    // 只有一个子文件夹，继续深入
+                    currentDir = subDirs[0];
+                    depth++;
+                }
+
+                // 如果 currentDir 不是 extractedFolder，说明找到了深层嵌套的文件夹
+                if (currentDir != extractedFolder && depth > 0)
+                {
+                    string deepestFolderName = Path.GetFileName(currentDir);
+                    AppendLog($"[智能路径] 找到深层文件夹: {deepestFolderName} (深度: {depth})", ConsoleColor.Cyan);
+                    
+                    // 判断是否需要处理：有日文 或 名称较长
+                    bool hasJapanese = System.Text.RegularExpressions.Regex.IsMatch(deepestFolderName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+                    bool isLongName = deepestFolderName.Length > 10;
+                    
+                    AppendLog($"[智能路径] 判断结果: 日文={hasJapanese}, 长名称={isLongName} (长度: {deepestFolderName.Length})", ConsoleColor.Gray);
+
+                    if (hasJapanese || isLongName)
+                    {
+                        // 步骤1：生成临时名称（带 GUID 前缀）
+                        string tempName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{deepestFolderName}";
+                        string tempPath = Path.Combine(rootDir, tempName);
+                        
+                        AppendLog($"[智能路径] 步骤1: 移动深层文件夹到顶级目录", ConsoleColor.Cyan);
+                        
+                        // 步骤2：移动深层文件夹到顶级目录（带临时前缀）
+                        Directory.Move(currentDir, tempPath);
+                        AppendLog($"[智能路径]   已移动: {deepestFolderName} -> {tempName}", ConsoleColor.Green);
+                        
+                        // 步骤3：从下往上删除空的中间文件夹
+                        AppendLog($"[智能路径] 步骤2: 删除空文件夹", ConsoleColor.Cyan);
+                        
+                        string? deleteDir = Path.GetDirectoryName(currentDir);
+                        while (deleteDir != null && deleteDir != rootDir && Directory.Exists(deleteDir))
+                        {
+                            if (Directory.GetFiles(deleteDir).Length == 0 && Directory.GetDirectories(deleteDir).Length == 0)
+                            {
+                                string dirName = Path.GetFileName(deleteDir);
+                                Directory.Delete(deleteDir);
+                                AppendLog($"[智能路径]   已删除: {dirName}", ConsoleColor.Gray);
+                                deleteDir = Path.GetDirectoryName(deleteDir);
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                        
+                        // 步骤4：重命名，去掉 GUID 前缀
+                        string finalPath = Path.Combine(rootDir, deepestFolderName);
+                        AppendLog($"[智能路径] 步骤3: 重命名（去掉临时前缀）", ConsoleColor.Cyan);
+                        
+                        try
+                        {
+                            // 如果目标已存在，先删除
+                            if (Directory.Exists(finalPath))
+                            {
+                                Directory.Delete(finalPath, true);
+                                AppendLog($"[智能路径]   已删除已存在的: {deepestFolderName}", ConsoleColor.Gray);
+                            }
+                            
+                            Directory.Move(tempPath, finalPath);
+                            AppendLog($"[智能路径]   已重命名: {tempName} -> {deepestFolderName}", ConsoleColor.Green);
+                            AppendLog($"[智能路径] ✓ 智能路径处理完成", ConsoleColor.Green);
+                        }
+                        catch (Exception renameEx)
+                        {
+                            AppendLog($"[智能路径] ⚠ 重命名失败: {renameEx.Message}", ConsoleColor.Yellow);
+                            AppendLog($"[智能路径]   保留临时名称: {tempName}", ConsoleColor.Yellow);
+                        }
+                    }
+                    else
+                    {
+                        AppendLog($"[智能路径] 不符合处理条件，跳过", ConsoleColor.Gray);
+                    }
+                }
+                else
+                {
+                    AppendLog($"[智能路径] 未找到深层嵌套文件夹（深度: {depth}）", ConsoleColor.Gray);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[智能路径] 处理失败: {ex.Message}", ConsoleColor.Red);
+                AppendLog($"[智能路径] 堆栈: {ex.StackTrace}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
+        /// 递归清理空目录
+        /// </summary>
+        private void CleanEmptyDirectories(string path)
+        {
+            try
+            {
+                foreach (string dir in Directory.GetDirectories(path))
+                {
+                    CleanEmptyDirectories(dir);
+                }
+
+                if (Directory.GetFiles(path).Length == 0 && Directory.GetDirectories(path).Length == 0)
+                {
+                    Directory.Delete(path);
+                    AppendLog($"[智能路径] 已删除空目录: {Path.GetFileName(path)}", ConsoleColor.Gray);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[智能路径] 清理空目录失败: {ex.Message}", ConsoleColor.Red);
+            }
+        }
 
         /// <summary>
         /// 判断文件是否为压缩文件（基于扩展名 + 文件头特征）

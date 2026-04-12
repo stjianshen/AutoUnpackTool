@@ -140,6 +140,11 @@ namespace AutoUnpackTool
         public bool EnableMultiVolumeDetection { get; set; } = true;
         
         /// <summary>
+        /// 是否启用智能路径处理（解压后自动扁平化多层嵌套文件夹）
+        /// </summary>
+        public bool EnableSmartPathProcessing { get; set; } = false;
+        
+        /// <summary>
         /// 需要检测的压缩文件扩展名列表（逗号分隔）
         /// </summary>
         public string ArchiveExtensions { get; set; } = ".zip,.rar,.7z,.tar,.gz,.bz2,.xz,.zst,.zstd,.tgz,.tbz2,.tbz,.txz,.cab,.iso,.wim,.arj,.lzh,.cpio,.rpm,.deb";

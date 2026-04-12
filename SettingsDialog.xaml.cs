@@ -37,6 +37,7 @@ namespace AutoUnpackTool
             SliderThreads.Value = Settings.ThreadCount;
             TxtThreadsCount.Text = Settings.ThreadCount.ToString();
             ChkShowCliWindow.IsChecked = Settings.ShowCliWindow;
+            ChkSmartPathProcessing.IsChecked = Settings.EnableSmartPathProcessing;
 
             // 设置文件处理方式
             switch (Settings.FileAfterExtract)
@@ -205,6 +206,9 @@ namespace AutoUnpackTool
 
                 // 保存CLI窗口设置
                 Settings.ShowCliWindow = ChkShowCliWindow.IsChecked == true;
+                
+                // 保存智能路径处理设置
+                Settings.EnableSmartPathProcessing = ChkSmartPathProcessing.IsChecked == true;
                 
                 // 保存扩展名设置
                 Settings.ArchiveExtensions = TxtArchiveExtensions.Text.Trim();
