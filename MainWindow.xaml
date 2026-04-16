@@ -4,7 +4,8 @@
         Title="自动解压工具 V1.0" Height="650" Width="1100"
         AllowDrop="True"
         Drop="Window_Drop"
-        DragOver="Window_DragOver">
+        DragOver="Window_DragOver"
+        Closing="Window_Closing">
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -94,6 +95,13 @@
             </StatusBarItem>
             <StatusBarItem>
                 <TextBlock x:Name="TxtStatusExtractThread" Text="解压线程: 空闲" Margin="0,0,20,0"/>
+            </StatusBarItem>
+            <StatusBarItem>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="解压进度:" Margin="0,0,5,0"/>
+                    <ProgressBar x:Name="ProgressExtract" Width="200" Height="18" Minimum="0" Maximum="100" Value="0" Margin="0,0,10,0"/>
+                    <TextBlock x:Name="TxtExtractProgress" Text="0%" Margin="0,0,20,0" Width="35"/>
+                </StackPanel>
             </StatusBarItem>
             <StatusBarItem HorizontalAlignment="Right">
                 <TextBlock x:Name="TxtStatusCurrentPassword" Text="测试中的密码: 无"/>

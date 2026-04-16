@@ -13,6 +13,7 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
             <!-- 配置文件路径 -->
@@ -77,6 +78,15 @@
                     <StackPanel Margin="0,0,0,15">
                         <CheckBox x:Name="ChkSmartPathProcessing" Content="启用智能路径处理（自动扁平化多层嵌套文件夹）" VerticalAlignment="Center"/>
                         <TextBlock Text="提示：解压后如果存在多层嵌套且内容单一，会自动将深层文件夹移动到顶层并清理空目录" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
+                        
+                        <!-- 智能路径处理模式 -->
+                        <StackPanel x:Name="PnlSmartPathMode" Margin="20,10,0,0" Visibility="Collapsed">
+                            <TextBlock Text="处理模式:" FontWeight="Bold" Margin="0,0,0,5"/>
+                            <RadioButton x:Name="RdoSmartPathConcatenate" Content="拼接文件夹名字" GroupName="SmartPathMode" Margin="0,0,0,5"/>
+                            <RadioButton x:Name="RdoSmartPathSmartSelect" Content="智能选择（优先选择长的、有日文的）" GroupName="SmartPathMode" IsChecked="True"/>
+                            <TextBlock Text="• 拼接模式：将所有层级文件夹名用下划线连接" FontSize="10" Foreground="Gray" Margin="0,3,0,0"/>
+                            <TextBlock Text="• 智能选择：根据文件夹名长度和是否包含日文自动选择最合适的名称" FontSize="10" Foreground="Gray" Margin="0,2,0,0"/>
+                        </StackPanel>
                     </StackPanel>
 
                     <!-- 解压输出模式 -->
@@ -109,11 +119,23 @@
                 </StackPanel>
             </Expander>
 
+            <!-- 黑名单文件设置 - 可折叠 -->
+            <Expander Grid.Row="5" Header="🚫 黑名单文件设置" IsExpanded="False" Margin="0,0,0,15">
+                <StackPanel Margin="10,10,0,0">
+                    <TextBlock Text="黑名单文件模式（逗号分隔，支持通配符 * 和 ?）:" FontWeight="Bold" Margin="0,0,0,5"/>
+                    <TextBox x:Name="TxtBlacklistFiles" Height="80" TextWrapping="Wrap" 
+                             AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,5"/>
+                    <TextBlock Text="示例: *.tmp, C:\Temp\*, *temp*" FontSize="11" Foreground="Gray"/>
+                    <TextBlock Text="⚠️ 警告：匹配的文件将被永久删除（不经过回收站，不可恢复）" 
+                               FontSize="11" Foreground="Red" Margin="0,5,0,0"/>
+                </StackPanel>
+            </Expander>
+
             <!-- 分隔线 -->
-            <Separator Grid.Row="5" Margin="0,10,0,10"/>
+            <Separator Grid.Row="6" Margin="0,10,0,10"/>
 
             <!-- 说明信息 -->
-            <TextBlock Grid.Row="5" TextWrapping="Wrap" Foreground="Gray" FontSize="11" Margin="0,0,0,10">
+            <TextBlock Grid.Row="6" TextWrapping="Wrap" Foreground="Gray" FontSize="11" Margin="0,0,0,10">
                 <Run Text="• 所有配置（包括密码本）都保存在一个JSON文件中"/>
                 <LineBreak/>
                 <Run Text="• 7z.exe 是 7-Zip 的命令行版本，需要从 7-Zip 官网下载"/>
@@ -122,7 +144,7 @@
             </TextBlock>
 
             <!-- 按钮区域 -->
-            <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,50,0,0">
+            <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,50,0,0">
                 <Button x:Name="BtnSave" Content="💾 保存配置" Width="120" Height="35" Click="BtnSave_Click" Margin="0,0,10,0" FontWeight="Bold"/>
                 <Button x:Name="BtnCancel" Content="取消" Width="100" Height="35" Click="BtnCancel_Click"/>
             </StackPanel>

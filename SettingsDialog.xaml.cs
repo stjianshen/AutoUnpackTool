@@ -28,6 +28,17 @@ namespace AutoUnpackTool
             {
                 TxtThreadsCount.Text = ((int)e.NewValue).ToString();
             };
+            
+            // 智能路径处理复选框变化事件
+            ChkSmartPathProcessing.Checked += (s, e) =>
+            {
+                PnlSmartPathMode.Visibility = Visibility.Visible;
+            };
+            
+            ChkSmartPathProcessing.Unchecked += (s, e) =>
+            {
+                PnlSmartPathMode.Visibility = Visibility.Collapsed;
+            };
         }
 
         private void LoadSettings()
@@ -38,6 +49,20 @@ namespace AutoUnpackTool
             TxtThreadsCount.Text = Settings.ThreadCount.ToString();
             ChkShowCliWindow.IsChecked = Settings.ShowCliWindow;
             ChkSmartPathProcessing.IsChecked = Settings.EnableSmartPathProcessing;
+            
+            // 根据智能路径处理是否启用来显示/隐藏模式选择
+            PnlSmartPathMode.Visibility = Settings.EnableSmartPathProcessing ? Visibility.Visible : Visibility.Collapsed;
+            
+            // 加载智能路径处理模式
+            switch (Settings.SmartPathProcessingMode)
+            {
+                case SmartPathMode.Concatenate:
+                    RdoSmartPathConcatenate.IsChecked = true;
+                    break;
+                case SmartPathMode.SmartSelect:
+                    RdoSmartPathSmartSelect.IsChecked = true;
+                    break;
+            }
 
             // 设置文件处理方式
             switch (Settings.FileAfterExtract)
@@ -84,6 +109,9 @@ namespace AutoUnpackTool
             // 加载扩展名设置
             TxtArchiveExtensions.Text = Settings.ArchiveExtensions;
             TxtExcludedExtensions.Text = Settings.ExcludedExtensions;
+            
+            // 加载黑名单设置
+            TxtBlacklistFiles.Text = Settings.BlacklistFiles;
         }
 
         private void BtnBrowse7z_Click(object sender, RoutedEventArgs e)
@@ -210,9 +238,18 @@ namespace AutoUnpackTool
                 // 保存智能路径处理设置
                 Settings.EnableSmartPathProcessing = ChkSmartPathProcessing.IsChecked == true;
                 
+                // 保存智能路径处理模式
+                if (RdoSmartPathConcatenate?.IsChecked == true)
+                    Settings.SmartPathProcessingMode = SmartPathMode.Concatenate;
+                else if (RdoSmartPathSmartSelect?.IsChecked == true)
+                    Settings.SmartPathProcessingMode = SmartPathMode.SmartSelect;
+                
                 // 保存扩展名设置
                 Settings.ArchiveExtensions = TxtArchiveExtensions.Text.Trim();
                 Settings.ExcludedExtensions = TxtExcludedExtensions.Text.Trim();
+                
+                // 保存黑名单设置
+                Settings.BlacklistFiles = TxtBlacklistFiles.Text.Trim();
 
                 // 保存到文件
                 Settings.Save();
