@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -35,9 +36,6 @@ namespace AutoUnpackTool
         // 任务完成信号
         private TaskCompletionSource<bool> _testCompletionSource = new();
         private TaskCompletionSource<bool> _extractCompletionSource = new();
-        
-        // 记录需要智能路径处理的目录（去重），Key=rootDir, Value=extractedFolder
-        private Dictionary<string, string> _pendingSmartPathDirs = new();
         
         // 记录所有顶级 FileItem
         private List<FileItem> _topLevelItems = new();
@@ -83,6 +81,14 @@ namespace AutoUnpackTool
             if (!string.IsNullOrEmpty(_settings.SevenZipPath))
             {
                 AppendLog($"已加载配置: 7z.exe = {_settings.SevenZipPath}", ConsoleColor.Cyan);
+                
+                // 检查是否是 NanaZip 的 WindowsApps 路径
+                if (_settings.SevenZipPath.Contains("WindowsApps") || _settings.SevenZipPath.Contains("NanaZip"))
+                {
+                    AppendLog("⚠️  警告: 检测到 NanaZip (UWP版本)", ConsoleColor.Yellow);
+                    AppendLog("   UWP应用可能有权限限制，建议使用标准 7-Zip", ConsoleColor.Yellow);
+                    AppendLog("   下载地址: https://www.7-zip.org/", ConsoleColor.Gray);
+                }
             }
             else
             {
@@ -115,57 +121,21 @@ namespace AutoUnpackTool
             {
                 string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
                 int addedCount = 0;
+                var newFileItems = new List<FileItem>();  // 记录新添加的文件
                 
-                foreach (string file in files)
+                foreach (string path in files)
                 {
-                    if (File.Exists(file))
+                    // 判断是文件还是文件夹
+                    if (File.Exists(path))
                     {
-                        // 检测是否为压缩文件
-                        if (IsArchiveFile(file))
-                        {
-                            // 如果是分卷压缩包，自动检测所有分卷
-                            if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(file))
-                            {
-                                var volumeInfo = DetectMultiVolumeArchive(file);
-                                
-                                if (volumeInfo.IsMultiVolume)
-                                {
-                                    AppendLog($"检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
-                                    
-                                    // 只添加主卷到列表
-                                    var mainFileInfo = new FileInfo(volumeInfo.MainVolumePath);
-                                    var fileItem = new FileItem
-                                    {
-                                        FileName = mainFileInfo.Name,
-                                        FilePath = volumeInfo.MainVolumePath,
-                                        Status = $"等待处理 (分卷: {volumeInfo.VolumeCount})",
-                                        FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length)
-                                    };
-                                    
-                                    // 存储分卷信息
-                                    fileItem.VolumeInfo = volumeInfo;
-                                    
-                                    if (!_fileList.Any(f => f.FilePath == volumeInfo.MainVolumePath))
-                                    {
-                                        _fileList.Add(fileItem);
-                                        addedCount++;
-                                    }
-                                }
-                                else
-                                {
-                                    // 不是真正的分卷，当作普通文件处理
-                                    AddFileToList(file, ref addedCount);
-                                }
-                            }
-                            else
-                            {
-                                AddFileToList(file, ref addedCount);
-                            }
-                        }
-                        else
-                        {
-                            AppendLog($"跳过非压缩文件: {Path.GetFileName(file)}", ConsoleColor.Yellow);
-                        }
+                        // 处理单个文件
+                        ProcessSingleFile(path, ref addedCount, newFileItems);
+                    }
+                    else if (Directory.Exists(path))
+                    {
+                        // 处理文件夹：扫描文件夹下的所有压缩文件
+                        AppendLog($"检测到文件夹: {path}", ConsoleColor.Cyan);
+                        ScanDirectoryForArchives(path, ref addedCount, newFileItems);
                     }
                 }
 
@@ -173,17 +143,11 @@ namespace AutoUnpackTool
                 {
                     AppendLog($"已添加 {addedCount} 个压缩文件到列表", ConsoleColor.Blue);
                     
-                    // 将新文件添加到待处理队列
-                    foreach (var file in files)
+                    // 将新文件添加到待处理队列（避免重复添加）
+                    foreach (var fileItem in newFileItems)
                     {
-                        if (File.Exists(file) && IsArchiveFile(file))
-                        {
-                            var fileItem = _fileList.FirstOrDefault(f => f.FilePath == file);
-                            if (fileItem != null)
-                            {
-                                _pendingQueue.Enqueue(fileItem);
-                            }
-                        }
+                        _pendingQueue.Enqueue(fileItem);
+                        AppendLog($"  [队列] {fileItem.FileName} 已加入待测试队列", ConsoleColor.Gray);
                     }
                     
                     AppendLog("自动开始处理流程...", ConsoleColor.Cyan);
@@ -204,7 +168,7 @@ namespace AutoUnpackTool
         /// <summary>
         /// 添加单个文件到列表
         /// </summary>
-        private void AddFileToList(string filePath, ref int addedCount)
+        private void AddFileToList(string filePath, ref int addedCount, List<FileItem>? newFileItems = null)
         {
             // 检查是否已存在
             if (_fileList.Any(f => f.FilePath == filePath))
@@ -220,6 +184,212 @@ namespace AutoUnpackTool
             };
             _fileList.Add(fileItem);
             addedCount++;
+            
+            // 记录新文件
+            if (newFileItems != null)
+            {
+                newFileItems.Add(fileItem);
+            }
+        }
+
+        /// <summary>
+        /// 处理单个文件（包括黑名单检查和分卷检测）
+        /// </summary>
+        private void ProcessSingleFile(string filePath, ref int addedCount, List<FileItem>? newFileItems = null)
+        {
+            // 检查黑名单
+            if (IsBlacklistedFile(filePath, out string matchedPattern))
+            {
+                DeleteBlacklistedFile(filePath, matchedPattern);
+                return;  // 跳过后续处理
+            }
+
+            // 检测是否为压缩文件
+            if (IsArchiveFile(filePath))
+            {
+                // 如果是分卷压缩包，自动检测所有分卷
+                if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(filePath))
+                {
+                    var volumeInfo = DetectMultiVolumeArchive(filePath);
+                    
+                    if (volumeInfo.IsMultiVolume)
+                    {
+                        AppendLog($"检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
+                        
+                        // 只添加主卷到列表
+                        var mainFileInfo = new FileInfo(volumeInfo.MainVolumePath);
+                        var fileItem = new FileItem
+                        {
+                            FileName = mainFileInfo.Name,
+                            FilePath = volumeInfo.MainVolumePath,
+                            Status = $"等待处理 (分卷: {volumeInfo.VolumeCount})",
+                            FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length)
+                        };
+                        
+                        // 存储分卷信息
+                        fileItem.VolumeInfo = volumeInfo;
+                        
+                        if (!_fileList.Any(f => f.FilePath == volumeInfo.MainVolumePath))
+                        {
+                            _fileList.Add(fileItem);
+                            addedCount++;
+                            
+                            // 记录新文件
+                            if (newFileItems != null)
+                            {
+                                newFileItems.Add(fileItem);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // 不是真正的分卷，当作普通文件处理
+                        AddFileToList(filePath, ref addedCount, newFileItems);
+                    }
+                }
+                else
+                {
+                    AddFileToList(filePath, ref addedCount, newFileItems);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 递归扫描文件夹中的压缩文件
+        /// </summary>
+        private void ScanDirectoryForArchives(string directoryPath, ref int addedCount, List<FileItem>? newFileItems = null)
+        {
+            try
+            {
+                // 获取文件夹中的所有文件
+                string[] files = Directory.GetFiles(directoryPath, "*.*", SearchOption.AllDirectories);
+                
+                AppendLog($"正在扫描文件夹: {directoryPath}", ConsoleColor.Gray);
+                AppendLog($"找到 {files.Length} 个文件，正在筛选压缩文件...", ConsoleColor.Gray);
+                
+                // 首先收集所有可能的压缩文件
+                var potentialArchives = new List<string>();
+                foreach (string file in files)
+                {
+                    // 检查黑名单
+                    if (IsBlacklistedFile(file, out string matchedPattern))
+                    {
+                        DeleteBlacklistedFile(file, matchedPattern);
+                        continue;
+                    }
+
+                    // 初步筛选：通过扩展名或分卷格式判断
+                    if (IsArchiveFileByExtension(file) || IsMultiVolumeArchive(file))
+                    {
+                        potentialArchives.Add(file);
+                    }
+                }
+                
+                AppendLog($"发现 {potentialArchives.Count} 个潜在压缩文件，正在进行魔术数验证...", ConsoleColor.Gray);
+                
+                // 对潜在压缩文件进行魔术数验证
+                var confirmedArchives = new List<string>();
+                foreach (string file in potentialArchives)
+                {
+                    if (IsArchiveFileByMagicNumber(file))
+                    {
+                        confirmedArchives.Add(file);
+                        AppendLog($"  [确认] {Path.GetFileName(file)}: 是压缩文件", ConsoleColor.Green);
+                    }
+                    else
+                    {
+                        AppendLog($"  [拒绝] {Path.GetFileName(file)}: 不是压缩文件", ConsoleColor.Yellow);
+                    }
+                }
+                
+                AppendLog($"确认 {confirmedArchives.Count} 个压缩文件，正在处理分卷合并...", ConsoleColor.Gray);
+                
+                // 处理分卷压缩：将同一组分卷合并为一个条目
+                var processedVolumes = new HashSet<string>(); // 已处理的分卷文件
+                
+                // 首先按目录分组，以便更好地检测分卷
+                var archivesByDirectory = confirmedArchives.GroupBy(f => Path.GetDirectoryName(f) ?? string.Empty);
+                
+                foreach (var directoryGroup in archivesByDirectory)
+                {
+                    string currentDir = directoryGroup.Key;
+                    var archivesInDir = directoryGroup.ToList();
+                    
+                    foreach (string archiveFile in archivesInDir)
+                    {
+                        // 如果这个文件已经被作为分卷的一部分处理过了，跳过
+                        if (processedVolumes.Contains(archiveFile))
+                            continue;
+                        
+                        // 检查是否为分卷压缩
+                        if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(archiveFile))
+                        {
+                            var volumeInfo = DetectMultiVolumeArchive(archiveFile);
+                            
+                            if (volumeInfo.IsMultiVolume && volumeInfo.AllVolumePaths.Count > 0)
+                            {
+                                AppendLog($"检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
+                                
+                                // 标记所有分卷为已处理
+                                foreach (var volumePath in volumeInfo.AllVolumePaths)
+                                {
+                                    processedVolumes.Add(volumePath);
+                                }
+                                
+                                // 只添加主卷到列表
+                                var mainFileInfo = new FileInfo(volumeInfo.MainVolumePath);
+                                var fileItem = new FileItem
+                                {
+                                    FileName = mainFileInfo.Name,
+                                    FilePath = volumeInfo.MainVolumePath,
+                                    Status = $"等待处理 (分卷: {volumeInfo.VolumeCount})",
+                                    FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length)
+                                };
+                                
+                                // 存储分卷信息
+                                fileItem.VolumeInfo = volumeInfo;
+                                
+                                if (!_fileList.Any(f => f.FilePath == volumeInfo.MainVolumePath))
+                                {
+                                    _fileList.Add(fileItem);
+                                    addedCount++;
+                                    AppendLog($"  已添加分卷压缩包: {mainFileInfo.Name}", ConsoleColor.Cyan);
+                                    
+                                    // 记录新文件
+                                    if (newFileItems != null)
+                                    {
+                                        newFileItems.Add(fileItem);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // 不是真正的分卷，当作普通文件处理
+                                if (!processedVolumes.Contains(archiveFile))
+                                {
+                                    AddFileToList(archiveFile, ref addedCount, newFileItems);
+                                    processedVolumes.Add(archiveFile);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 普通压缩文件
+                            if (!processedVolumes.Contains(archiveFile))
+                            {
+                                AddFileToList(archiveFile, ref addedCount);
+                                processedVolumes.Add(archiveFile);
+                            }
+                        }
+                    }
+                }
+                
+                AppendLog($"文件夹扫描完成，共添加 {addedCount} 个压缩文件", ConsoleColor.Blue);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"扫描文件夹时出错: {ex.Message}", ConsoleColor.Red);
+            }
         }
 
         #endregion
@@ -347,30 +517,32 @@ namespace AutoUnpackTool
             // 3. Kill掉所有7z进程
             KillSevenZipProcesses();
             
-            // 4. 清空UI和数据
+            // 4. Kill掉所有NanaZip进程
+            KillNanaZipProcesses();
+            
+            // 5. 清空UI和数据
             _fileList.Clear();
             _passwordMap = new PasswordMap();
             _pendingQueue = new ConcurrentQueue<FileItem>();
             _extractQueue = new ConcurrentQueue<FileItem>();
-            _pendingSmartPathDirs.Clear();
             _topLevelItems.Clear();
             TxtLog.Clear();
             
-            // 5. 重置状态
+            // 6. 重置状态
             _isTesting = false;
             _isExtracting = false;
             
-            // 6. 重置信号
+            // 7. 重置信号
             _pendingQueueSignal.Reset();
             _extractQueueSignal.Reset();
             
-            // 7. 重置完成信号
+            // 8. 重置完成信号
             _testCompletionSource = new TaskCompletionSource<bool>();
             _extractCompletionSource = new TaskCompletionSource<bool>();
             
             AppendLog("已清空内容，程序已重置到初始状态", ConsoleColor.Gray);
             
-            // 8. 更新UI状态
+            // 9. 更新UI状态
             UpdateUiState();
         }
         
@@ -457,6 +629,80 @@ namespace AutoUnpackTool
                 AppendLog("\n正在取消解压操作...", ConsoleColor.Yellow);
                 _extractCancellationTokenSource.Cancel();
                 return;
+            }
+        }
+
+        /// <summary>
+        /// 窗口关闭事件处理
+        /// </summary>
+        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            try
+            {
+                AppendLog("\n正在关闭程序...", ConsoleColor.Yellow);
+                
+                // 1. 取消所有正在运行的操作
+                CancelAllOperations();
+                
+                // 2. 等待一小段时间让线程退出
+                Task.Delay(500).Wait();
+                
+                // 3. Kill掉所有7z进程（包括 NanaZip）
+                KillSevenZipProcesses();
+                KillNanaZipProcesses();
+                
+                AppendLog("程序已关闭", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                // 即使出错也允许关闭
+                AppendLog($"关闭时发生错误: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+        
+        /// <summary>
+        /// Kill掉所有 NanaZip 进程
+        /// </summary>
+        private void KillNanaZipProcesses()
+        {
+            try
+            {
+                // NanaZip 的进程名可能不同，尝试查找
+                var processNames = new[] { "NanaZip", "NanaZipC", "NanaZip.Universal.Console", "7zG", "NanaZipG" };
+                
+                foreach (var processName in processNames)
+                {
+                    var processes = System.Diagnostics.Process.GetProcessesByName(processName);
+                    if (processes.Length > 0)
+                    {
+                        AppendLog($"发现 {processes.Length} 个 {processName} 进程，正在终止...", ConsoleColor.Yellow);
+                        foreach (var process in processes)
+                        {
+                            try
+                            {
+                                if (!process.HasExited)
+                                {
+                                    process.Kill();
+                                    process.WaitForExit(1000); // 等待1秒让进程退出
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                AppendLog($"终止 {processName} 进程失败: {ex.Message}", ConsoleColor.Red);
+                            }
+                            finally
+                            {
+                                process.Dispose();
+                            }
+                        }
+                    }
+                }
+                
+                AppendLog("所有压缩软件进程已终止", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"查找压缩软件进程失败: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -649,13 +895,11 @@ namespace AutoUnpackTool
         private async Task ProcessPendingFile(FileItem fileItem, SevenZipExtractor extractor, List<string> passwords, CancellationToken token)
         {
             Dispatcher.Invoke(() => fileItem.Status = "正在测试密码...");
-            AppendLog($"\n[测试] {fileItem.FileName}", ConsoleColor.White);
 
             // 步骤1：判断是否是压缩文件
             if (!IsArchiveFile(fileItem.FilePath))
             {
                 Dispatcher.Invoke(() => fileItem.Status = "非压缩文件，跳过");
-                AppendLog($"[{fileItem.FileName}] 非压缩文件，跳过", ConsoleColor.Gray);
                 
                 // 检查父项完成（传入子节点）
                 if (fileItem.Parent != null)
@@ -674,37 +918,42 @@ namespace AutoUnpackTool
                 fileItem.Status = "测试: 无密码";
             });
 
-            AppendLog("  测试: 无密码...", ConsoleColor.Cyan);
-            bool noPasswordSuccess = await extractor.TestPasswordAsync(fileItem.FilePath, "", cancellationToken: token);
+            bool noPasswordSuccess = await extractor.TestPasswordAsync(
+                fileItem.FilePath, 
+                "", 
+                onOutput: (msg) => { },
+                cancellationToken: token);
 
             if (noPasswordSuccess)
             {
                 foundPassword = null;
-                AppendLog("  ✓ 无密码测试成功", ConsoleColor.Green);
             }
             else
             {
                 // 步骤3：测试密码本
-                AppendLog("  ✗ 无密码失败，测试密码本...", ConsoleColor.Gray);
-                
+                int testedCount = 0;
                 foreach (var password in passwords)
                 {
                     if (token.IsCancellationRequested)
                         break;
 
+                    testedCount++;
                     Dispatcher.Invoke(() =>
                     {
                         TxtStatusCurrentPassword.Text = $"测试中的密码: {password}";
-                        fileItem.Status = $"测试: {password}";
+                        fileItem.Status = $"测试: {password} ({testedCount}/{passwords.Count})";
                     });
 
-                    bool isValid = await extractor.TestPasswordAsync(fileItem.FilePath, password, cancellationToken: token);
+                    bool isValid = await extractor.TestPasswordAsync(
+                        fileItem.FilePath, 
+                        password,
+                        onOutput: (msg) => { },
+                        cancellationToken: token);
 
                     if (isValid)
                     {
                         foundPassword = password;
                         _settings.RecordPasswordUsage(password);
-                        AppendLog($"  ✓ 找到正确密码: {password}", ConsoleColor.Green);
                         break;
                     }
 
@@ -730,9 +979,6 @@ namespace AutoUnpackTool
                     fileItem.Status = "无密码";
                 }
             });
-
-            AppendLog($"[{fileItem.FileName}] 测试结果: {foundPassword ?? "无密码"}", 
-                foundPassword != null ? ConsoleColor.Green : ConsoleColor.Cyan);
 
             // 步骤4：将文件加入待解压队列
             _extractQueue.Enqueue(fileItem);
@@ -935,27 +1181,10 @@ namespace AutoUnpackTool
                     }
                 }
                 
-                // 只有在没有被取消的情况下才执行智能路径处理
+                // 所有处理流程完成
                 if (_globalCancellationTokenSource?.Token.IsCancellationRequested != true)
                 {
                     AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
-                    
-                    // 执行智能路径处理（在所有任务完成后统一处理）
-                    if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _pendingSmartPathDirs.Count > 0)
-                    {
-                        AppendLog($"\n开始执行智能路径处理... (共 {_pendingSmartPathDirs.Count} 个目录)", ConsoleColor.Cyan);
-                        
-                        foreach (var kvp in _pendingSmartPathDirs)
-                        {
-                            string rootDir = kvp.Key;
-                            string extractedFolder = kvp.Value;
-                            
-                            await Task.Run(() => ProcessSmartPath(rootDir, extractedFolder));
-                        }
-                        
-                        _pendingSmartPathDirs.Clear();
-                        AppendLog($"\n✓ 智能路径处理全部完成", ConsoleColor.Green);
-                    }
                 }
             }
             catch (Exception ex)
@@ -1002,9 +1231,19 @@ namespace AutoUnpackTool
                 // 没有子项，如果是顶级文件，从列表移除
                 if (fileItem.Parent == null)
                 {
-                    // 处理原文件（移动到回收站/删除等）
-                    // 由于这个方法被多处调用，且都是同步调用，我们使用 fire-and-forget 模式
-                    _ = HandleOriginalFileAsync(fileItem.FilePath);
+                    // 只有解压成功时才处理原文件
+                    bool extractSuccess = fileItem.GetSelfExtractResult();
+                    
+                    if (extractSuccess)
+                    {
+                        // 处理原文件（移动到回收站/删除等）
+                        // 由于这个方法被多处调用，且都是同步调用，我们使用 fire-and-forget 模式
+                        _ = HandleOriginalFileAsync(fileItem.FilePath);
+                    }
+                    else
+                    {
+                        AppendLog($"[{fileItem.FileName}] 解压失败，保留原文件", ConsoleColor.Yellow);
+                    }
                     
                     Dispatcher.Invoke(() =>
                     {
@@ -1050,7 +1289,6 @@ namespace AutoUnpackTool
             if (!_passwordMap.TryGetValue(fileItem.FilePath, out var password))
             {
                 Dispatcher.Invoke(() => fileItem.Status = "跳过: 未找到密码");
-                AppendLog($"[线程 {taskId}] 跳过 {fileItem.FileName}: 未找到密码", ConsoleColor.Yellow);
                 
                 // 如果没有密码，检查父项是否可以完成（传入子节点）
                 if (fileItem.Parent != null)
@@ -1079,48 +1317,70 @@ namespace AutoUnpackTool
                     outputDir,
                     password,
                     onProgress: (msg) => AppendLog($"  {msg}", ConsoleColor.Gray),
+                    onPercentChanged: (percent) =>
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            ProgressExtract.Value = percent;
+                            TxtExtractProgress.Text = $"{percent}%";
+                        });
+                    },
                     showCliWindow: _settings.ShowCliWindow,
                     cancellationToken: token);
 
                 if (result.Success)
                 {
+                    // 重置进度条
                     Dispatcher.Invoke(() =>
                     {
-                        fileItem.Status = password != null
-                            ? $"解压成功 (密码: {password})"
-                            : "解压成功 (无密码)";
+                        ProgressExtract.Value = 0;
+                        TxtExtractProgress.Text = "0%";
                     });
-                    AppendLog($"[线程 {taskId}] {fileItem.FileName}: 解压成功", ConsoleColor.Green);
-
-                    // 不在这里立即处理原文件，而是延迟到所有子项完成后处理
-                    // 原文件处理逻辑移到了 UpdateParentStatusWhenChildrenComplete 和 CheckAndMarkParentComplete 中
+                    
+                    // 不在这里立即设置状态，而是根据是否有子节点来决定
+                    // 标记自身解压成功
+                    fileItem.SetSelfExtractResult(true);
 
                     // 从密码映射表中移除已完成处理的文件记录
                     string filePath = fileItem.FilePath;
                     _passwordMap.Remove(filePath);
                     AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已从密码映射表清除", ConsoleColor.Gray);
 
-                    // 检查解压后的文件是否包含新的压缩文件
+                    // 先检查解压后的文件是否包含新的压缩文件
                     // 这会添加子项到 fileItem.Children，并将新文件加入待处理队列
                     await ScanExtractedFilesForArchives(outputDir, taskId, fileItem);
                     
-                    // 注意：原文件处理逻辑已经移到了 ScanExtractedFilesForArchives 和 UpdateParentStatusWhenChildrenComplete 中
-                    // - 叶子节点（无子项）：ScanExtractedFilesForArchives 中处理
-                    // - 父节点（有子项）：UpdateParentStatusWhenChildrenComplete 中所有子项完成后处理
-                    
-                    // 如果有子项，等待子项处理完成后会自动通过 UpdateParentStatusWhenChildrenComplete 更新父项状态
+                    // 修改：根据是否有子节点来决定显示状态
                     if (fileItem.Children.Count > 0)
                     {
+                        // 有子节点，显示等待状态
+                        var passwordInfo = password != null
+                            ? $" (密码: {password})"
+                            : " (无密码)";
+                        Dispatcher.Invoke(() =>
+                        {
+                            fileItem.Status = $"等待子节点完成{passwordInfo} ({fileItem.GetProgressInfo()})";
+                        });
                         AppendLog($"[{fileItem.FileName}] 已添加 {fileItem.Children.Count} 个子压缩包到待处理队列，等待递归处理...", ConsoleColor.Cyan);
                     }
                     // 叶子节点已在 ScanExtractedFilesForArchives 中处理完成
                 }
                 else
                 {
+                    // 重置进度条
+                    Dispatcher.Invoke(() =>
+                    {
+                        ProgressExtract.Value = 0;
+                        TxtExtractProgress.Text = "0%";
+                    });
+                    
                     Dispatcher.Invoke(() => fileItem.Status = $"解压失败: {result.Message}");
                     AppendLog($"[线程 {taskId}] {fileItem.FileName}: 解压失败 - {result.Message}", ConsoleColor.Red);
                     
-                    // 解压失败时也需要检查父项状态（传入子节点）
+                    // 标记自身解压失败
+                    fileItem.SetSelfExtractResult(false);
+                    
+                    // 解压失败时不处理原文件，只检查父项状态（传入子节点）
                     if (fileItem.Parent != null)
                     {
                         UpdateParentStatusWhenChildrenComplete(fileItem);
@@ -1182,11 +1442,43 @@ namespace AutoUnpackTool
                 }
 
                 // 递归查找输出目录中解压出来的新压缩文件
-                var newArchiveFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories)
-                    .Where(f => IsArchiveFile(f) && !IsMultiVolumeArchive(f))
-                    .ToList();
-
-                var allArchiveFiles = newArchiveFiles.Distinct().ToList();
+                // 只扫描压缩包扩展名和分卷压缩格式，不扫描其他文件
+                var archiveExtensions = _settings.GetArchiveExtensions();
+                var allArchiveFiles = new List<string>();
+                
+                // 1. 扫描具有压缩文件扩展名的文件
+                foreach (var ext in archiveExtensions)
+                {
+                    // ext 可能是 ".rar", ".zip" 等格式
+                    string searchPattern = ext.StartsWith(".") ? $"*{ext}" : $"*.{ext}";
+                    try
+                    {
+                        var files = Directory.GetFiles(outputDir, searchPattern, SearchOption.AllDirectories);
+                        allArchiveFiles.AddRange(files);
+                    }
+                    catch
+                    {
+                        // 忽略访问权限等问题
+                    }
+                }
+                
+                // 2. 对所有其他文件使用魔术数检测（不依赖扩展名）
+                var allFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories);
+                foreach (var file in allFiles)
+                {
+                    // 跳过已通过扩展名匹配的文件
+                    if (allArchiveFiles.Contains(file))
+                        continue;
+                        
+                    // 使用魔术数检测是否为压缩包
+                    if (IsArchiveFile(file))
+                    {
+                        allArchiveFiles.Add(file);
+                    }
+                }
+                
+                // 去重
+                allArchiveFiles = allArchiveFiles.Distinct().ToList();
 
                 AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allArchiveFiles.Count} 个候选压缩文件", ConsoleColor.Magenta);
 
@@ -1197,6 +1489,16 @@ namespace AutoUnpackTool
                     if (parentFileItem != null)
                     {
                         AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {parentFileItem.FileName}", ConsoleColor.Magenta);
+                        
+                        // 叶子节点：设置解压成功状态
+                        var passwordInfo = parentFileItem.FoundPassword != null
+                            ? $" (密码: {parentFileItem.FoundPassword})"
+                            : " (无密码)";
+                        Dispatcher.Invoke(() =>
+                        {
+                            parentFileItem.Status = $"解压成功{passwordInfo}";
+                        });
+                        AppendLog($"[{parentFileItem.FileName}] 叶子节点解压完成: {parentFileItem.Status}", ConsoleColor.Green);
                         
                         // 当前节点（叶子节点）：先处理自身原文件
                         AppendLog($"[{parentFileItem.FileName}] 叶子节点解压完成，处理原文件...", ConsoleColor.Cyan);
@@ -1213,6 +1515,21 @@ namespace AutoUnpackTool
                 int addedCount = 0;
                 foreach (var archiveFile in allArchiveFiles)
                 {
+                    // 检查黑名单 - 如果是黑名单文件则直接删除，不加入处理队列
+                    if (IsBlacklistedFile(archiveFile, out string matchedPattern))
+                    {
+                        try
+                        {
+                            File.Delete(archiveFile);
+                            AppendLog($"[线程 {taskId}] [黑名单] 已删除: {Path.GetFileName(archiveFile)} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
+                        }
+                        catch (Exception delEx)
+                        {
+                            AppendLog($"[线程 {taskId}] [黑名单] 删除失败: {Path.GetFileName(archiveFile)} - {delEx.Message}", ConsoleColor.Red);
+                        }
+                        continue;  // 跳过后续处理，不添加到列表
+                    }
+                    
                     // 检查是否已在列表中
                     FileItem? existingItem = null;
                     Dispatcher.Invoke(() =>
@@ -1222,11 +1539,50 @@ namespace AutoUnpackTool
 
                     if (existingItem != null)
                     {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 文件已存在，跳过: {Path.GetFileName(archiveFile)}", ConsoleColor.Magenta);
+                        AppendLog($"[线程 {taskId}] [DEBUG] 文件已存在: {Path.GetFileName(archiveFile)}", ConsoleColor.Magenta);
                         continue;
                     }
 
-                    // 创建新的文件项
+                    // 如果是分卷压缩包，检测所有分卷并只添加主卷
+                    if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(archiveFile))
+                    {
+                        var volumeInfo = DetectMultiVolumeArchive(archiveFile);
+                        
+                        if (volumeInfo.IsMultiVolume)
+                        {
+                            AppendLog($"[线程 {taskId}] 检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
+                            
+                            // 只添加主卷到列表
+                            var mainFileInfo = new FileInfo(volumeInfo.MainVolumePath);
+                            var mainVolumeItem = new FileItem
+                            {
+                                FileName = mainFileInfo.Name,
+                                FilePath = volumeInfo.MainVolumePath,
+                                Status = "等待处理",
+                                FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length),
+                                Parent = parentFileItem,
+                                VolumeInfo = volumeInfo  // 设置分卷信息！
+                            };
+
+                            Dispatcher.Invoke(() =>
+                            {
+                                if (parentFileItem != null)
+                                {
+                                    parentFileItem.Children.Add(mainVolumeItem);
+                                }
+                                else
+                                {
+                                    _fileList.Add(mainVolumeItem);
+                                }
+                            });
+
+                            addedCount++;
+                            AppendLog($"[线程 {taskId}] 添加分卷压缩包（主卷）: {mainVolumeItem.FileName} ({volumeInfo.VolumeCount} 个分卷)", ConsoleColor.Green);
+                            continue;  // 跳过后续单个文件添加逻辑
+                        }
+                    }
+
+                    // 创建新的文件项（普通文件或非分卷压缩包）
                     var fileInfo = new FileInfo(archiveFile);
                     var fileItem = new FileItem
                     {
@@ -1234,7 +1590,8 @@ namespace AutoUnpackTool
                         FilePath = archiveFile,
                         Status = "等待处理",  // 统一初始状态
                         FileSize = fileInfo.Length,
-                        Parent = parentFileItem
+                        Parent = parentFileItem,
+                        TaskId = taskId
                     };
 
                     Dispatcher.Invoke(() =>
@@ -1360,39 +1717,34 @@ namespace AutoUnpackTool
             // 如果所有子节点都已完成，更新父节点状态并继续向上上报
             if (allCompleted)
             {
-                // 保留原有的密码信息，更新状态为完成
-                var passwordInfo = parentItem.FoundPassword != null 
-                    ? $" (密码: {parentItem.FoundPassword})" 
-                    : " (无密码)";
+                // 检查父节点自身的解压结果
+                bool parentSelfSuccess = parentItem.GetSelfExtractResult();
                 
-                Dispatcher.Invoke(() =>
+                if (parentSelfSuccess)
                 {
-                    parentItem.Status = $"解压成功{passwordInfo} [包含 {parentItem.Children.Count} 个子压缩包]";
-                });
-                
-                AppendLog($"[{parentItem.FileName}] ✓ 所有子压缩包处理完成，父压缩包标记为完成", ConsoleColor.Green);
-                
-                // 从密码映射表中移除
-                _passwordMap.Remove(parentItem.FilePath);
-                
-                // 处理原文件（移动到回收站/删除等）
-                // 由于这个方法是同步调用，使用 fire-and-forget 模式
-                _ = HandleOriginalFileAsync(parentItem.FilePath);
-                
-                // 智能路径处理：记录目录映射，等所有顶级节点完成后再统一处理
-                if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder)
-                {
-                    string extractedFolder = GetOutputDirectory(parentItem.FilePath);
-                    // rootDir 应该是压缩包所在的目录（不是解压输出目录）
-                    string rootDir = Path.GetDirectoryName(parentItem.FilePath) ?? string.Empty;
+                    // 父节点自身解压成功，更新状态为完成
+                    var passwordInfo = parentItem.FoundPassword != null 
+                        ? $" (密码: {parentItem.FoundPassword})" 
+                        : " (无密码)";
                     
-                    if (!string.IsNullOrEmpty(rootDir))
+                    Dispatcher.Invoke(() =>
                     {
-                        // 使用规范化路径作为 Key
-                        string normalizedRootDir = Path.GetFullPath(rootDir);
-                        _pendingSmartPathDirs[normalizedRootDir] = extractedFolder;
-                        AppendLog($"[{parentItem.FileName}] 已记录智能路径处理: rootDir={normalizedRootDir}, extractedFolder={extractedFolder}", ConsoleColor.Gray);
-                    }
+                        parentItem.Status = $"解压成功{passwordInfo} [包含 {parentItem.Children.Count} 个子压缩包]";
+                    });
+                    
+                    AppendLog($"[{parentItem.FileName}] ✓ 所有子压缩包处理完成，父压缩包标记为完成", ConsoleColor.Green);
+                    
+                    // 从密码映射表中移除
+                    _passwordMap.Remove(parentItem.FilePath);
+                    
+                    // 处理原文件（移动到回收站/删除等）
+                    // 由于这个方法是同步调用，使用 fire-and-forget 模式
+                    _ = HandleOriginalFileAsync(parentItem.FilePath);
+                }
+                else
+                {
+                    // 父节点自身解压失败，保留失败状态
+                    AppendLog($"[{parentItem.FileName}] ⚠ 父节点自身解压失败，即使所有子节点完成也不处理原文件", ConsoleColor.Yellow);
                 }
                 
                 // 递归处理：向上一级上报
@@ -1405,6 +1757,9 @@ namespace AutoUnpackTool
                 {
                     // 到达顶级，整个树形结构处理完成
                     AppendLog($"[{parentItem.FileName}] ✓ 已到达顶级，整个树形结构处理完成", ConsoleColor.Green);
+                    
+                    // 检查是否还有其他顶级项未完成，如果没有则触发批量智能路径处理
+                    CheckAndTriggerBatchSmartPathProcessing();
                 }
             }
             else
@@ -1466,131 +1821,438 @@ namespace AutoUnpackTool
         #region 辅助方法
 
         /// <summary>
-        /// 智能路径处理：扁平化多层嵌套文件夹
-        /// 执行时机：顶级压缩包完全处理完成后
+        /// 批量智能路径处理：当整个任务的所有文件节点处理完成后执行
+        /// 执行时机：任务级别的所有解压完成后统一处理
         /// </summary>
-        /// <param name="rootDir">真正的顶级输出目录（用户选择的目录）</param>
+        private async Task BatchProcessSmartPathForTask(int taskId)
+        {
+            if (!_settings.EnableSmartPathProcessing || _settings.OutputMode != OutputMode.ArchiveFolder)
+                return;
+
+            AppendLog($"[任务 {taskId}] 开始批量智能路径处理...", ConsoleColor.Cyan);
+
+            // 收集该任务涉及的所有顶级输出目录
+            var allItems = CollectAllFileItems(_fileList);
+            var taskRootDirs = new HashSet<string>();
+
+            foreach (var item in allItems)
+            {
+                // 找到属于该任务的顶级项（没有父节点或父节点不属于该任务）
+                if (item.Parent == null && item.TaskId == taskId)
+                {
+                    string? outputDir = Path.GetDirectoryName(item.FilePath);
+                    if (!string.IsNullOrEmpty(outputDir) && Directory.Exists(outputDir))
+                    {
+                        taskRootDirs.Add(outputDir);
+                    }
+                }
+            }
+
+            // 对每个顶级输出目录执行批量扁平化
+            foreach (var rootDir in taskRootDirs)
+            {
+                await Task.Run(() => ProcessSmartPathBatch(rootDir));
+            }
+
+            AppendLog($"[任务 {taskId}] ✓ 批量智能路径处理完成", ConsoleColor.Green);
+        }
+
+        /// <summary>
+        /// 检查是否所有顶级文件项都已完成，如果是则触发批量智能路径处理
+        /// </summary>
+        private void CheckAndTriggerBatchSmartPathProcessing()
+        {
+            // 添加调试日志
+            AppendLog($"[批量智能路径] 检查触发条件: EnableSmartPathProcessing={_settings.EnableSmartPathProcessing}, OutputMode={_settings.OutputMode}", ConsoleColor.Gray);
+            
+            if (!_settings.EnableSmartPathProcessing || _settings.OutputMode != OutputMode.ArchiveFolder)
+            {
+                AppendLog($"[批量智能路径] 条件不满足，跳过处理", ConsoleColor.Gray);
+                return;
+            }
+
+            // 检查是否所有顶级文件项都已完成
+            var topLevelItems = _fileList.Where(f => f.Parent == null).ToList();
+            AppendLog($"[批量智能路径] 顶级文件项数量: {topLevelItems.Count}", ConsoleColor.Gray);
+            
+            if (topLevelItems.Count == 0)
+            {
+                AppendLog($"[批量智能路径] 没有顶级文件项，跳过处理", ConsoleColor.Gray);
+                return;
+            }
+
+            // 打印每个顶级项的状态用于调试
+            foreach (var item in topLevelItems)
+            {
+                AppendLog($"[批量智能路径] 顶级项: {item.FileName}, 状态: {item.Status}", ConsoleColor.Gray);
+            }
+
+            bool allCompleted = topLevelItems.All(item => 
+            {
+                // 检查状态是否表示完成（扩大匹配范围）
+                return item.Status.Contains("解压成功") || 
+                       item.Status.Contains("完成") ||
+                       item.Status.Contains("跳过") ||
+                       item.Status.Contains("非压缩文件") ||
+                       item.Status.Contains("失败") ||
+                       item.Status.Contains("异常") ||
+                       item.Status.Contains("取消");
+            });
+
+            AppendLog($"[批量智能路径] 所有项是否完成: {allCompleted}", ConsoleColor.Gray);
+
+            if (allCompleted)
+            {
+                AppendLog($"[批量智能路径] 所有顶级文件项已完成，开始批量处理...", ConsoleColor.Cyan);
+                
+                // 收集所有顶级输出目录
+                var rootDirs = new HashSet<string>();
+                foreach (var item in topLevelItems)
+                {
+                    string? outputDir = Path.GetDirectoryName(item.FilePath);
+                    AppendLog($"[批量智能路径] 顶级项 {item.FileName} 的输出目录: {outputDir ?? "null"}", ConsoleColor.Gray);
+                    
+                    if (!string.IsNullOrEmpty(outputDir) && Directory.Exists(outputDir))
+                    {
+                        rootDirs.Add(outputDir);
+                    }
+                }
+
+                AppendLog($"[批量智能路径] 找到 {rootDirs.Count} 个输出目录待处理", ConsoleColor.Cyan);
+
+                // 对每个顶级输出目录执行批量扁平化（fire-and-forget）
+                foreach (var rootDir in rootDirs)
+                {
+                    _ = Task.Run(() => ProcessSmartPathBatch(rootDir));
+                }
+            }
+        }
+
+        /// <summary>
+        /// 批量处理单个输出目录的智能路径扁平化（从叶子节点向上遍历）
+        /// </summary>
+        private void ProcessSmartPathBatch(string rootDir)
+        {
+            if (!Directory.Exists(rootDir))
+                return;
+
+            AppendLog($"[批量智能路径] 开始处理: {rootDir}", ConsoleColor.Cyan);
+
+            // 后序遍历：先处理深层嵌套，再处理浅层
+            ProcessDirectoryTreePostOrder(rootDir);
+
+            AppendLog($"[批量智能路径] ✓ 处理完成: {Path.GetFileName(rootDir)}", ConsoleColor.Green);
+        }
+
+        /// <summary>
+        /// 后序遍历目录树，从叶子节点开始处理
+        /// </summary>
+        private void ProcessDirectoryTreePostOrder(string dirPath)
+        {
+            try
+            {
+                // 1. 先递归处理所有子目录（深度优先）
+                var subDirs = Directory.GetDirectories(dirPath);
+                foreach (var subDir in subDirs)
+                {
+                    ProcessDirectoryTreePostOrder(subDir);
+                }
+
+                // 2. 处理当前目录（此时子目录已经处理完毕）
+                ProcessSingleDirectoryIfNeeded(dirPath);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 遍历目录失败 {dirPath}: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
+        /// 检查并处理单个目录的扁平化（如果符合条件）
+        /// </summary>
+        private void ProcessSingleDirectoryIfNeeded(string dirPath)
+        {
+            try
+            {
+                var subDirs = Directory.GetDirectories(dirPath);
+                var files = Directory.GetFiles(dirPath);
+
+                // 触发条件：恰好一个子目录且没有其他文件
+                if (subDirs.Length != 1 || files.Length > 0)
+                    return;
+
+                string singleSubDir = subDirs[0];
+                string subDirName = Path.GetFileName(singleSubDir);
+                string parentDirName = Path.GetFileName(dirPath);
+
+                AppendLog($"[批量智能路径] 检测到可扁平化: {parentDirName} -> {subDirName}", ConsoleColor.Gray);
+
+                // 根据配置决定最终名称
+                string finalFolderName = DetermineFolderName(parentDirName, subDirName);
+
+                // 执行扁平化：将子目录内容提升到父目录
+                FlattenDirectory(dirPath, singleSubDir, finalFolderName);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 处理目录失败 {dirPath}: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
+        /// 根据配置模式决定最终的文件夹名称
+        /// </summary>
+        private string DetermineFolderName(string parentName, string childName)
+        {
+            if (_settings.SmartPathProcessingMode == SmartPathMode.Concatenate)
+            {
+                // 拼接模式
+                return $"{parentName}_{childName}";
+            }
+            else
+            {
+                // 智能选择模式
+                bool parentHasJapanese = System.Text.RegularExpressions.Regex.IsMatch(
+                    parentName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+                bool childHasJapanese = System.Text.RegularExpressions.Regex.IsMatch(
+                    childName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+
+                bool parentIsLong = parentName.Length > 10;
+                bool childIsLong = childName.Length > 10;
+
+                int parentScore = (parentHasJapanese ? 100 : 0) + (parentIsLong ? 50 : 0);
+                int childScore = (childHasJapanese ? 100 : 0) + (childIsLong ? 50 : 0);
+
+                // 选择评分高的，评分相同选较长的
+                if (childScore > parentScore || (childScore == parentScore && childName.Length > parentName.Length))
+                {
+                    return childName;
+                }
+                else
+                {
+                    return parentName;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 执行目录扁平化：将子目录内容提升到父目录并重命名
+        /// </summary>
+        private void FlattenDirectory(string parentDir, string childDir, string finalName)
+        {
+            try
+            {
+                string? parentDirPath = Path.GetDirectoryName(parentDir);
+                if (string.IsNullOrEmpty(parentDirPath))
+                    return;
+
+                // 步骤1: 移动子目录到临时位置（避免冲突）
+                string tempName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{finalName}";
+                string tempPath = Path.Combine(parentDirPath, tempName);
+
+                Directory.Move(childDir, tempPath);
+                AppendLog($"[批量智能路径]   已移动: {Path.GetFileName(childDir)} -> {tempName}", ConsoleColor.Gray);
+
+                // 步骤2: 删除空的父目录
+                if (Directory.Exists(parentDir))
+                {
+                    try
+                    {
+                        Directory.Delete(parentDir);
+                        AppendLog($"[批量智能路径]   已删除空目录: {Path.GetFileName(parentDir)}", ConsoleColor.Gray);
+                    }
+                    catch (Exception deleteEx)
+                    {
+                        AppendLog($"[批量智能路径] ⚠ 删除失败: {deleteEx.Message}", ConsoleColor.Yellow);
+                        return;
+                    }
+                }
+
+                // 步骤3: 重命名为最终名称
+                string finalPath = Path.Combine(parentDirPath, finalName);
+                
+                if (Directory.Exists(finalPath))
+                {
+                    Directory.Delete(finalPath, true);
+                    AppendLog($"[批量智能路径]   已删除已存在的目录: {finalName}", ConsoleColor.Gray);
+                }
+
+                Directory.Move(tempPath, finalPath);
+                AppendLog($"[批量智能路径]   ✓ 扁平化完成: {finalName}", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 扁平化失败: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
+        /// 智能路径处理：扁平化多层嵌套文件夹（旧版本，已废弃）
+        /// 执行时机：每次解压完成后立即处理
+        /// </summary>
         /// <param name="extractedFolder">7z 实际解压到的目录</param>
-        private void ProcessSmartPath(string rootDir, string extractedFolder)
+        private void ProcessSmartPath(string extractedFolder)
         {
             // 等待一下确保文件操作完成
             Thread.Sleep(500);
             
-            AppendLog($"[智能路径] 开始处理", ConsoleColor.Cyan);
-            AppendLog($"[智能路径]   顶级输出目录: {rootDir}", ConsoleColor.Gray);
-            AppendLog($"[智能路径]   7z解压目录: {extractedFolder}", ConsoleColor.Gray);
+            AppendLog($"[智能路径] 开始处理: {extractedFolder}", ConsoleColor.Cyan);
             
-            if (!Directory.Exists(rootDir)) 
+            if (!Directory.Exists(extractedFolder)) 
             {
-                AppendLog($"[智能路径] 目录不存在，跳过处理", ConsoleColor.Yellow);
+                AppendLog($"[智能路径] 目录不存在", ConsoleColor.Yellow);
                 return;
             }
 
-            try
+            // 循环处理多层嵌套，直到没有符合条件的嵌套为止
+            int maxIterations = 10; // 防止无限循环
+            for (int iteration = 0; iteration < maxIterations; iteration++)
             {
-                // 从 7z 解压目录开始，寻找只包含一个子文件夹的路径
-                string currentDir = extractedFolder;
-                int depth = 0;
-                
-                while (true)
+                if (!Directory.Exists(extractedFolder))
                 {
-                    var subDirs = Directory.GetDirectories(currentDir);
-                    var files = Directory.GetFiles(currentDir);
-                    
-                    AppendLog($"[智能路径] 层级 {depth}: {Path.GetFileName(currentDir)} - 子文件夹数: {subDirs.Length}, 文件数: {files.Length}", ConsoleColor.Gray);
-
-                    // 如果当前目录包含文件，或者包含多个子文件夹，则停止深入
-                    if (files.Length > 0 || subDirs.Length != 1)
-                    {
-                        AppendLog($"[智能路径] 停止深入: 文件数={files.Length}, 子文件夹数={subDirs.Length}", ConsoleColor.Gray);
-                        break;
-                    }
-
-                    // 只有一个子文件夹，继续深入
-                    currentDir = subDirs[0];
-                    depth++;
+                    AppendLog($"[智能路径] 目录不存在，停止处理", ConsoleColor.Gray);
+                    break;
                 }
 
-                // 如果 currentDir 不是 extractedFolder，说明找到了深层嵌套的文件夹
-                if (currentDir != extractedFolder && depth > 0)
+                if (!ProcessSmartPathOnce(ref extractedFolder))
                 {
-                    string deepestFolderName = Path.GetFileName(currentDir);
-                    AppendLog($"[智能路径] 找到深层文件夹: {deepestFolderName} (深度: {depth})", ConsoleColor.Cyan);
-                    
-                    // 判断是否需要处理：有日文 或 名称较长
-                    bool hasJapanese = System.Text.RegularExpressions.Regex.IsMatch(deepestFolderName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
-                    bool isLongName = deepestFolderName.Length > 10;
-                    
-                    AppendLog($"[智能路径] 判断结果: 日文={hasJapanese}, 长名称={isLongName} (长度: {deepestFolderName.Length})", ConsoleColor.Gray);
+                    break; // 没有可处理的嵌套了
+                }
+            }
+            
+            AppendLog($"[智能路径] ✓ 智能路径处理完成", ConsoleColor.Green);
+        }
 
-                    if (hasJapanese || isLongName)
+        /// <summary>
+        /// 执行一次智能路径扁平化处理
+        /// </summary>
+        /// <param name="extractedFolder">当前处理的目录（可能被修改）</param>
+        /// <returns>是否成功执行了扁平化（true=有处理，false=没有可处理的）</returns>
+        private bool ProcessSmartPathOnce(ref string extractedFolder)
+        {
+            try
+            {
+                // 检查当前目录下是否只有一个子文件夹
+                var subDirs = Directory.GetDirectories(extractedFolder);
+                var files = Directory.GetFiles(extractedFolder);
+                
+                AppendLog($"[智能路径] 当前目录: {Path.GetFileName(extractedFolder)} - 子文件夹数: {subDirs.Length}, 文件数: {files.Length}", ConsoleColor.Gray);
+
+                // 如果当前目录包含文件，或者不包含恰好一个子文件夹，则不处理
+                if (files.Length > 0 || subDirs.Length != 1)
+                {
+                    AppendLog($"[智能路径] 不符合处理条件（文件数={files.Length}, 子文件夹数={subDirs.Length}）", ConsoleColor.Gray);
+                    return false;
+                }
+
+                // 只有一个子文件夹，获取其名称
+                string singleSubDir = subDirs[0];
+                string subDirName = Path.GetFileName(singleSubDir);
+                
+                AppendLog($"[智能路径] 找到唯一子文件夹: {subDirName}", ConsoleColor.Cyan);
+                
+                // 根据配置的处理模式决定最终文件夹名称
+                string finalFolderName;
+                
+                if (_settings.SmartPathProcessingMode == SmartPathMode.Concatenate)
+                {
+                    // 拼接模式：将父文件夹名和子文件夹名用下划线连接
+                    string parentDirName = Path.GetFileName(extractedFolder);
+                    finalFolderName = $"{parentDirName}_{subDirName}";
+                    AppendLog($"[智能路径] 使用拼接模式: {parentDirName} + {subDirName} = {finalFolderName}", ConsoleColor.Gray);
+                }
+                else // SmartPathMode.SmartSelect
+                {
+                    // 智能选择模式：优先选择长的、有日文的文件夹名
+                    string parentDirName = Path.GetFileName(extractedFolder);
+                    
+                    bool parentHasJapanese = System.Text.RegularExpressions.Regex.IsMatch(parentDirName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+                    bool subHasJapanese = System.Text.RegularExpressions.Regex.IsMatch(subDirName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+                    
+                    bool parentIsLong = parentDirName.Length > 10;
+                    bool subIsLong = subDirName.Length > 10;
+                    
+                    AppendLog($"[智能路径] 父文件夹: '{parentDirName}' (长度: {parentDirName.Length}, 日文: {parentHasJapanese})", ConsoleColor.Gray);
+                    AppendLog($"[智能路径] 子文件夹: '{subDirName}' (长度: {subDirName.Length}, 日文: {subHasJapanese})", ConsoleColor.Gray);
+                    
+                    // 评分系统：日文+100分，长名称+50分
+                    int parentScore = (parentHasJapanese ? 100 : 0) + (parentIsLong ? 50 : 0);
+                    int subScore = (subHasJapanese ? 100 : 0) + (subIsLong ? 50 : 0);
+                    
+                    AppendLog($"[智能路径] 父文件夹评分: {parentScore}, 子文件夹评分: {subScore}", ConsoleColor.Gray);
+                    
+                    // 选择评分高的，如果评分相同则选择较长的
+                    if (subScore > parentScore || (subScore == parentScore && subDirName.Length >= parentDirName.Length))
                     {
-                        // 步骤1：生成临时名称（带 GUID 前缀）
-                        string tempName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{deepestFolderName}";
-                        string tempPath = Path.Combine(rootDir, tempName);
-                        
-                        AppendLog($"[智能路径] 步骤1: 移动深层文件夹到顶级目录", ConsoleColor.Cyan);
-                        
-                        // 步骤2：移动深层文件夹到顶级目录（带临时前缀）
-                        Directory.Move(currentDir, tempPath);
-                        AppendLog($"[智能路径]   已移动: {deepestFolderName} -> {tempName}", ConsoleColor.Green);
-                        
-                        // 步骤3：从下往上删除空的中间文件夹
-                        AppendLog($"[智能路径] 步骤2: 删除空文件夹", ConsoleColor.Cyan);
-                        
-                        string? deleteDir = Path.GetDirectoryName(currentDir);
-                        while (deleteDir != null && deleteDir != rootDir && Directory.Exists(deleteDir))
-                        {
-                            if (Directory.GetFiles(deleteDir).Length == 0 && Directory.GetDirectories(deleteDir).Length == 0)
-                            {
-                                string dirName = Path.GetFileName(deleteDir);
-                                Directory.Delete(deleteDir);
-                                AppendLog($"[智能路径]   已删除: {dirName}", ConsoleColor.Gray);
-                                deleteDir = Path.GetDirectoryName(deleteDir);
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-                        
-                        // 步骤4：重命名，去掉 GUID 前缀
-                        string finalPath = Path.Combine(rootDir, deepestFolderName);
-                        AppendLog($"[智能路径] 步骤3: 重命名（去掉临时前缀）", ConsoleColor.Cyan);
-                        
-                        try
-                        {
-                            // 如果目标已存在，先删除
-                            if (Directory.Exists(finalPath))
-                            {
-                                Directory.Delete(finalPath, true);
-                                AppendLog($"[智能路径]   已删除已存在的: {deepestFolderName}", ConsoleColor.Gray);
-                            }
-                            
-                            Directory.Move(tempPath, finalPath);
-                            AppendLog($"[智能路径]   已重命名: {tempName} -> {deepestFolderName}", ConsoleColor.Green);
-                            AppendLog($"[智能路径] ✓ 智能路径处理完成", ConsoleColor.Green);
-                        }
-                        catch (Exception renameEx)
-                        {
-                            AppendLog($"[智能路径] ⚠ 重命名失败: {renameEx.Message}", ConsoleColor.Yellow);
-                            AppendLog($"[智能路径]   保留临时名称: {tempName}", ConsoleColor.Yellow);
-                        }
+                        finalFolderName = subDirName;
+                        AppendLog($"[智能路径] 选择子文件夹名称: {finalFolderName}", ConsoleColor.Cyan);
                     }
                     else
                     {
-                        AppendLog($"[智能路径] 不符合处理条件，跳过", ConsoleColor.Gray);
+                        finalFolderName = parentDirName;
+                        AppendLog($"[智能路径] 选择父文件夹名称: {finalFolderName}", ConsoleColor.Cyan);
                     }
                 }
-                else
+                
+                // 生成临时名称（带 GUID 前缀）
+                string tempName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{finalFolderName}";
+                string tempPath = Path.Combine(Path.GetDirectoryName(extractedFolder) ?? "", tempName);
+                
+                AppendLog($"[智能路径] 步骤1: 移动子文件夹到上级目录", ConsoleColor.Cyan);
+                
+                // 移动子文件夹到上级目录（带临时前缀）
+                Directory.Move(singleSubDir, tempPath);
+                AppendLog($"[智能路径]   已移动: {subDirName} -> {tempName}", ConsoleColor.Green);
+                
+                // 删除原来的空文件夹
+                AppendLog($"[智能路径] 步骤2: 删除空文件夹", ConsoleColor.Cyan);
+                
+                if (Directory.Exists(extractedFolder))
                 {
-                    AppendLog($"[智能路径] 未找到深层嵌套文件夹（深度: {depth}）", ConsoleColor.Gray);
+                    try
+                    {
+                        Directory.Delete(extractedFolder);
+                        AppendLog($"[智能路径]   已删除: {Path.GetFileName(extractedFolder)}", ConsoleColor.Gray);
+                    }
+                    catch (Exception deleteEx)
+                    {
+                        AppendLog($"[智能路径] ⚠ 删除空文件夹失败: {deleteEx.Message}", ConsoleColor.Yellow);
+                        AppendLog($"[智能路径]   保留原文件夹: {Path.GetFileName(extractedFolder)}", ConsoleColor.Yellow);
+                    }
+                }
+                
+                // 重命名，去掉 GUID 前缀
+                string finalPath = Path.Combine(Path.GetDirectoryName(tempPath) ?? "", finalFolderName);
+                AppendLog($"[智能路径] 步骤3: 重命名（去掉临时前缀）", ConsoleColor.Cyan);
+                
+                try
+                {
+                    // 如果目标已存在，先删除
+                    if (Directory.Exists(finalPath))
+                    {
+                        Directory.Delete(finalPath, true);
+                        AppendLog($"[智能路径]   已删除已存在的: {finalFolderName}", ConsoleColor.Gray);
+                    }
+                    
+                    Directory.Move(tempPath, finalPath);
+                    AppendLog($"[智能路径]   已重命名: {tempName} -> {finalFolderName}", ConsoleColor.Green);
+                    
+                    // 更新 extractedFolder 指向新位置，以便循环继续处理
+                    extractedFolder = finalPath;
+                    return true;
+                }
+                catch (Exception renameEx)
+                {
+                    AppendLog($"[智能路径] ⚠ 重命名失败: {renameEx.Message}", ConsoleColor.Yellow);
+                    AppendLog($"[智能路径]   保留临时名称: {tempName}", ConsoleColor.Yellow);
+                    return false;
                 }
             }
             catch (Exception ex)
             {
                 AppendLog($"[智能路径] 处理失败: {ex.Message}", ConsoleColor.Red);
                 AppendLog($"[智能路径] 堆栈: {ex.StackTrace}", ConsoleColor.Red);
+                return false;
             }
         }
 
@@ -1618,8 +2280,92 @@ namespace AutoUnpackTool
             }
         }
 
+        #region 黑名单文件处理
+
         /// <summary>
-        /// 判断文件是否为压缩文件（基于扩展名 + 文件头特征）
+        /// 检查文件是否匹配黑名单模式
+        /// </summary>
+        /// <param name="filePath">文件完整路径</param>
+        /// <param name="matchedPattern">匹配到的模式（输出）</param>
+        /// <returns>是否为黑名单文件</returns>
+        private bool IsBlacklistedFile(string filePath, out string matchedPattern)
+        {
+            matchedPattern = string.Empty;
+
+            // 获取黑名单模式列表
+            var patterns = _settings.GetBlacklistPatterns();
+            if (patterns == null || patterns.Count == 0)
+                return false;
+
+            string fileName = Path.GetFileName(filePath);
+            string fullPath = Path.GetFullPath(filePath).ToLowerInvariant();
+
+            foreach (var pattern in patterns)
+            {
+                if (string.IsNullOrWhiteSpace(pattern))
+                    continue;
+
+                string normalizedPattern = pattern.Trim().ToLowerInvariant();
+
+                // 判断是文件名模式还是完整路径模式
+                bool isPathPattern = normalizedPattern.Contains("\\") || normalizedPattern.Contains("/");
+                string target = isPathPattern ? fullPath : fileName.ToLowerInvariant();
+
+                // 将通配符转换为正则表达式
+                string regexPattern = "^" + Regex.Escape(normalizedPattern)
+                    .Replace("\\*", ".*")
+                    .Replace("\\?", ".") + "$";
+
+                try
+                {
+                    if (Regex.IsMatch(target, regexPattern, RegexOptions.IgnoreCase))
+                    {
+                        matchedPattern = pattern;
+                        return true;
+                    }
+                }
+                catch (RegexParseException)
+                {
+                    // 忽略无效的正则表达式
+                    AppendLog($"[黑名单] 无效的模式: {pattern}", ConsoleColor.Yellow);
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 永久删除黑名单文件
+        /// </summary>
+        /// <param name="filePath">文件路径</param>
+        /// <param name="matchedPattern">匹配到的模式</param>
+        private void DeleteBlacklistedFile(string filePath, string matchedPattern)
+        {
+            try
+            {
+                string fileName = Path.GetFileName(filePath);
+                AppendLog($"[黑名单] 检测到黑名单文件: {fileName} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
+
+                File.Delete(filePath);
+                AppendLog($"[黑名单] 已永久删除: {fileName}", ConsoleColor.Green);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                AppendLog($"[黑名单] 删除失败（权限不足）: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
+            }
+            catch (IOException ex)
+            {
+                AppendLog($"[黑名单] 删除失败（文件被占用）: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[黑名单] 删除失败: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        #endregion
+
+
         /// 流程：
         /// 1. 先检查扩展名是否在排除列表中，如果是则直接返回 false
         /// 2. 再检查扩展名是否在包含列表中，如果是则用魔术数验证
@@ -1643,7 +2389,7 @@ namespace AutoUnpackTool
             // 如果在排除列表中，直接返回 false，结束解压流程
             if (excludedExtensions.Contains(extension))
             {
-                AppendLog($"  [跳过] {Path.GetFileName(filePath)}: 扩展名在排除列表中", ConsoleColor.Gray);
+                AppendLog($"  {Path.GetFileName(filePath)}: 扩展名在排除列表中", ConsoleColor.Gray);
                 return false;
             }
 
@@ -2176,13 +2922,43 @@ namespace AutoUnpackTool
                         else
                         {
                             // 普通文件：移动到回收站
-                            await Task.Run(() =>
+                            // 等待文件解锁
+                            if (!await WaitForFileUnlock(filePath, 3000))
                             {
-                                Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(filePath, 
-                                    Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                                    Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                            });
-                            AppendLog($"  原文件已移动到回收站: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                AppendLog($"  警告：原文件仍在占用中: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                break;
+                            }
+
+                            bool success = false;
+                            int retryCount = 3;
+                            for (int i = 0; i < retryCount; i++)
+                            {
+                                try
+                                {
+                                    await Task.Run(() =>
+                                    {
+                                        Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(filePath, 
+                                            Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                                            Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                                    });
+                                    success = true;
+                                    break;
+                                }
+                                catch (IOException) when (i < retryCount - 1)
+                                {
+                                    AppendLog($"  原文件被占用，等待后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(1000 * (i + 1));
+                                }
+                            }
+
+                            if (success)
+                            {
+                                AppendLog($"  原文件已移动到回收站: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                            }
+                            else
+                            {
+                                AppendLog($"  移动原文件失败（多次重试后仍被占用）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
+                            }
                         }
                         break;
 
@@ -2196,8 +2972,38 @@ namespace AutoUnpackTool
                         else
                         {
                             // 普通文件：直接删除
-                            await Task.Run(() => File.Delete(filePath));
-                            AppendLog($"  原文件已删除: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                            // 等待文件解锁
+                            if (!await WaitForFileUnlock(filePath, 3000))
+                            {
+                                AppendLog($"  警告：原文件仍在占用中: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                break;
+                            }
+
+                            bool success = false;
+                            int retryCount = 3;
+                            for (int i = 0; i < retryCount; i++)
+                            {
+                                try
+                                {
+                                    await Task.Run(() => File.Delete(filePath));
+                                    success = true;
+                                    break;
+                                }
+                                catch (IOException) when (i < retryCount - 1)
+                                {
+                                    AppendLog($"  原文件被占用，等待后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(1000 * (i + 1));
+                                }
+                            }
+
+                            if (success)
+                            {
+                                AppendLog($"  原文件已删除: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                            }
+                            else
+                            {
+                                AppendLog($"  删除原文件失败（多次重试后仍被占用）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
+                            }
                         }
                         break;
 
@@ -2241,23 +3047,96 @@ namespace AutoUnpackTool
                 {
                     if (File.Exists(volumePath))
                     {
-                        await Task.Run(() =>
+                        // 等待文件解锁（解压进程可能还在占用文件）
+                        if (!await WaitForFileUnlock(volumePath, 3000))
                         {
-                            Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(volumePath, 
-                                Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                                Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                        });
-                        AppendLog($"  已移动分卷到回收站: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                        movedCount++;
+                            AppendLog($"  警告：分卷文件仍在占用中: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                            continue;
+                        }
+
+                        bool success = false;
+                        int retryCount = 3;
+                        for (int i = 0; i < retryCount; i++)
+                        {
+                            try
+                            {
+                                await Task.Run(() =>
+                                {
+                                    Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(volumePath, 
+                                        Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                                        Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+                                });
+                                success = true;
+                                break;
+                            }
+                            catch (IOException) when (i < retryCount - 1)
+                            {
+                                // 文件被占用，等待后重试
+                                AppendLog($"  分卷文件被占用，等待后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                                await Task.Delay(1000 * (i + 1));
+                            }
+                        }
+
+                        if (success)
+                        {
+                            AppendLog($"  已移动分卷到回收站: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                            movedCount++;
+                        }
+                        else
+                        {
+                            AppendLog($"  移动分卷失败（多次重试后仍被占用）: {Path.GetFileName(volumePath)}", ConsoleColor.Red);
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    AppendLog($"  移动分卷失败 {Path.GetFileName(volumePath)}: {ex.Message}", ConsoleColor.Red);
+                    string errorMsg = ex.Message;
+                    if (string.IsNullOrWhiteSpace(errorMsg) && ex.InnerException != null)
+                    {
+                        errorMsg = ex.InnerException.Message;
+                    }
+                    AppendLog($"  移动分卷失败 {Path.GetFileName(volumePath)}: {errorMsg}", ConsoleColor.Red);
                 }
             }
             
             AppendLog($"  分卷压缩包已处理（已移动 {movedCount}/{volumeInfo.VolumeCount} 个分卷到回收站）", ConsoleColor.Green);
+        }
+
+        /// <summary>
+        /// 等待文件解锁（文件不再被其他进程占用）
+        /// </summary>
+        /// <param name="filePath">文件路径</param>
+        /// <param name="timeoutMs">超时时间（毫秒）</param>
+        /// <returns>true=文件已解锁, false=超时</returns>
+        private async Task<bool> WaitForFileUnlock(string filePath, int timeoutMs)
+        {
+            int waited = 0;
+            int interval = 100; // 每100ms检查一次
+
+            while (waited < timeoutMs)
+            {
+                try
+                {
+                    // 尝试以独占模式打开文件
+                    using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    {
+                        return true; // 成功打开，文件已解锁
+                    }
+                }
+                catch (IOException)
+                {
+                    // 文件被占用，等待后重试
+                    await Task.Delay(interval);
+                    waited += interval;
+                }
+                catch
+                {
+                    // 其他错误（如文件不存在），认为已解锁
+                    return true;
+                }
+            }
+
+            return false; // 超时
         }
 
         /// <summary>
@@ -2274,14 +3153,49 @@ namespace AutoUnpackTool
                 {
                     if (File.Exists(volumePath))
                     {
-                        await Task.Run(() => File.Delete(volumePath));
-                        AppendLog($"  已删除分卷: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                        deletedCount++;
+                        // 等待文件解锁
+                        if (!await WaitForFileUnlock(volumePath, 3000))
+                        {
+                            AppendLog($"  警告：分卷文件仍在占用中: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                            continue;
+                        }
+
+                        bool success = false;
+                        int retryCount = 3;
+                        for (int i = 0; i < retryCount; i++)
+                        {
+                            try
+                            {
+                                await Task.Run(() => File.Delete(volumePath));
+                                success = true;
+                                break;
+                            }
+                            catch (IOException) when (i < retryCount - 1)
+                            {
+                                AppendLog($"  分卷文件被占用，等待后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                                await Task.Delay(1000 * (i + 1));
+                            }
+                        }
+
+                        if (success)
+                        {
+                            AppendLog($"  已删除分卷: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                            deletedCount++;
+                        }
+                        else
+                        {
+                            AppendLog($"  删除分卷失败（多次重试后仍被占用）: {Path.GetFileName(volumePath)}", ConsoleColor.Red);
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    AppendLog($"  删除分卷失败 {Path.GetFileName(volumePath)}: {ex.Message}", ConsoleColor.Red);
+                    string errorMsg = ex.Message;
+                    if (string.IsNullOrWhiteSpace(errorMsg) && ex.InnerException != null)
+                    {
+                        errorMsg = ex.InnerException.Message;
+                    }
+                    AppendLog($"  删除分卷失败 {Path.GetFileName(volumePath)}: {errorMsg}", ConsoleColor.Red);
                 }
             }
             
@@ -2295,7 +3209,7 @@ namespace AutoUnpackTool
         {
             if (string.IsNullOrWhiteSpace(_settings.ArchiveCleanupDir))
             {
-                AppendLog($"  警告：未设置分卷清理目录，跳过移动", ConsoleColor.Yellow);
+                AppendLog($"  警告：未设置分卷清理目录", ConsoleColor.Yellow);
                 return;
             }
 
@@ -2349,7 +3263,7 @@ namespace AutoUnpackTool
         {
             if (string.IsNullOrWhiteSpace(_settings.ArchiveCleanupDir))
             {
-                AppendLog($"  警告：未设置清理目录，跳过移动", ConsoleColor.Yellow);
+                AppendLog($"  警告：未设置清理目录", ConsoleColor.Yellow);
                 return;
             }
 
@@ -2470,10 +3384,32 @@ namespace AutoUnpackTool
         public FileItem? Parent { get; set; }
         public bool IsParent => Children.Count > 0;
         
+        /// <summary>
+        /// 所属的任务ID（用于批量处理时识别任务范围）
+        /// </summary>
+        public int TaskId { get; set; } = -1;
+        
         // 新增：子节点完成状态跟踪（用于反向传播）
         private int _expectedChildrenCount = 0;      // 预期的子节点总数
         private int _completedChildrenCount = 0;     // 已完成的子节点数
         private bool _isMarkedComplete = false;      // 是否已标记为完成（防止重复上报）
+        private bool _selfExtractSuccess = false;    // 自身解压是否成功
+        
+        /// <summary>
+        /// 设置自身解压结果
+        /// </summary>
+        public void SetSelfExtractResult(bool success)
+        {
+            _selfExtractSuccess = success;
+        }
+        
+        /// <summary>
+        /// 获取自身解压结果
+        /// </summary>
+        public bool GetSelfExtractResult()
+        {
+            return _selfExtractSuccess;
+        }
         
         /// <summary>
         /// 设置预期的子节点数量（在扫描完解压目录后调用）
