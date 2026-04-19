@@ -1831,27 +1831,27 @@ namespace AutoUnpackTool
 
             AppendLog($"[任务 {taskId}] 开始批量智能路径处理...", ConsoleColor.Cyan);
 
-            // 收集该任务涉及的所有顶级输出目录
+            // 收集该任务涉及的所有解压生成的文件夹
             var allItems = CollectAllFileItems(_fileList);
-            var taskRootDirs = new HashSet<string>();
+            var taskExtractedFolders = new HashSet<string>();
 
             foreach (var item in allItems)
             {
-                // 找到属于该任务的顶级项（没有父节点或父节点不属于该任务）
-                if (item.Parent == null && item.TaskId == taskId)
+                // 收集该任务的所有文件项（包括子压缩包）的解压文件夹
+                if (item.TaskId == taskId)
                 {
-                    string? outputDir = Path.GetDirectoryName(item.FilePath);
-                    if (!string.IsNullOrEmpty(outputDir) && Directory.Exists(outputDir))
+                    string extractedFolder = GetOutputDirectory(item.FilePath);
+                    if (!string.IsNullOrEmpty(extractedFolder) && Directory.Exists(extractedFolder))
                     {
-                        taskRootDirs.Add(outputDir);
+                        taskExtractedFolders.Add(extractedFolder);
                     }
                 }
             }
 
-            // 对每个顶级输出目录执行批量扁平化
-            foreach (var rootDir in taskRootDirs)
+            // 对每个解压生成的文件夹执行批量扁平化
+            foreach (var extractedFolder in taskExtractedFolders)
             {
-                await Task.Run(() => ProcessSmartPathBatch(rootDir));
+                await Task.Run(() => ProcessSmartPathBatch(extractedFolder));
             }
 
             AppendLog($"[任务 {taskId}] ✓ 批量智能路径处理完成", ConsoleColor.Green);
@@ -1905,25 +1905,27 @@ namespace AutoUnpackTool
             {
                 AppendLog($"[批量智能路径] 所有顶级文件项已完成，开始批量处理...", ConsoleColor.Cyan);
                 
-                // 收集所有顶级输出目录
-                var rootDirs = new HashSet<string>();
+                // 收集所有解压生成的文件夹（而不是目标目录）
+                var extractedFolders = new HashSet<string>();
                 foreach (var item in topLevelItems)
                 {
-                    string? outputDir = Path.GetDirectoryName(item.FilePath);
-                    AppendLog($"[批量智能路径] 顶级项 {item.FileName} 的输出目录: {outputDir ?? "null"}", ConsoleColor.Gray);
+                    // 在 ArchiveFolder 模式下，输出目录是压缩包同名文件夹
+                    // 例如: ba366.7z.001 -> D:\tem\ba366
+                    string extractedFolder = GetOutputDirectory(item.FilePath);
+                    AppendLog($"[批量智能路径] 顶级项 {item.FileName} 的解压文件夹: {extractedFolder}", ConsoleColor.Gray);
                     
-                    if (!string.IsNullOrEmpty(outputDir) && Directory.Exists(outputDir))
+                    if (!string.IsNullOrEmpty(extractedFolder) && Directory.Exists(extractedFolder))
                     {
-                        rootDirs.Add(outputDir);
+                        extractedFolders.Add(extractedFolder);
                     }
                 }
 
-                AppendLog($"[批量智能路径] 找到 {rootDirs.Count} 个输出目录待处理", ConsoleColor.Cyan);
+                AppendLog($"[批量智能路径] 找到 {extractedFolders.Count} 个解压文件夹待处理", ConsoleColor.Cyan);
 
-                // 对每个顶级输出目录执行批量扁平化（fire-and-forget）
-                foreach (var rootDir in rootDirs)
+                // 对每个解压生成的文件夹执行批量扁平化（fire-and-forget）
+                foreach (var extractedFolder in extractedFolders)
                 {
-                    _ = Task.Run(() => ProcessSmartPathBatch(rootDir));
+                    _ = Task.Run(() => ProcessSmartPathBatch(extractedFolder));
                 }
             }
         }
@@ -1951,15 +1953,41 @@ namespace AutoUnpackTool
         {
             try
             {
+                // 检查目录是否存在（可能在之前的扁平化操作中被删除）
+                if (!Directory.Exists(dirPath))
+                {
+                    AppendLog($"[批量智能路径] 目录已不存在，跳过: {dirPath}", ConsoleColor.Gray);
+                    return;
+                }
+
+                AppendLog($"[批量智能路径] [DEBUG] 开始遍历目录: {dirPath}", ConsoleColor.Gray);
+
                 // 1. 先递归处理所有子目录（深度优先）
                 var subDirs = Directory.GetDirectories(dirPath);
+                AppendLog($"[批量智能路径] [DEBUG] 找到 {subDirs.Length} 个子目录", ConsoleColor.Gray);
+                
                 foreach (var subDir in subDirs)
                 {
-                    ProcessDirectoryTreePostOrder(subDir);
+                    AppendLog($"[批量智能路径] [DEBUG] 递归处理子目录: {Path.GetFileName(subDir)}", ConsoleColor.Gray);
+                    // 对每个子目录的遍历进行独立异常处理
+                    try
+                    {
+                        ProcessDirectoryTreePostOrder(subDir);
+                    }
+                    catch (Exception subEx)
+                    {
+                        // 单个子目录处理失败不影响其他子目录
+                        AppendLog($"[批量智能路径] 处理子目录失败 {subDir}: {subEx.Message}", ConsoleColor.Yellow);
+                    }
                 }
 
                 // 2. 处理当前目录（此时子目录已经处理完毕）
-                ProcessSingleDirectoryIfNeeded(dirPath);
+                // 再次检查目录是否存在（可能子目录处理时被删除）
+                if (Directory.Exists(dirPath))
+                {
+                    AppendLog($"[批量智能路径] [DEBUG] 开始处理当前目录: {Path.GetFileName(dirPath)}", ConsoleColor.Gray);
+                    ProcessSingleDirectoryIfNeeded(dirPath);
+                }
             }
             catch (Exception ex)
             {
@@ -1977,9 +2005,17 @@ namespace AutoUnpackTool
                 var subDirs = Directory.GetDirectories(dirPath);
                 var files = Directory.GetFiles(dirPath);
 
+                AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {files.Length} 个文件", ConsoleColor.Gray);
+
                 // 触发条件：恰好一个子目录且没有其他文件
                 if (subDirs.Length != 1 || files.Length > 0)
+                {
+                    if (subDirs.Length != 1)
+                        AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 子目录数量不为1 ({subDirs.Length})，跳过扁平化", ConsoleColor.Gray);
+                    if (files.Length > 0)
+                        AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 存在 {files.Length} 个文件，跳过扁平化", ConsoleColor.Gray);
                     return;
+                }
 
                 string singleSubDir = subDirs[0];
                 string subDirName = Path.GetFileName(singleSubDir);
@@ -1989,6 +2025,7 @@ namespace AutoUnpackTool
 
                 // 根据配置决定最终名称
                 string finalFolderName = DetermineFolderName(parentDirName, subDirName);
+                AppendLog($"[批量智能路径] [DEBUG] 最终文件夹名: {finalFolderName}", ConsoleColor.Gray);
 
                 // 执行扁平化：将子目录内容提升到父目录
                 FlattenDirectory(dirPath, singleSubDir, finalFolderName);
