@@ -212,7 +212,7 @@ namespace AutoUnpackTool
                 {
                     var volumeInfo = DetectMultiVolumeArchive(filePath);
                     
-                    if (volumeInfo.IsMultiVolume)
+                    if (volumeInfo.HasVolumeList)
                     {
                         AppendLog($"检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
                         
@@ -222,7 +222,9 @@ namespace AutoUnpackTool
                         {
                             FileName = mainFileInfo.Name,
                             FilePath = volumeInfo.MainVolumePath,
-                            Status = $"等待处理 (分卷: {volumeInfo.VolumeCount})",
+                            Status = volumeInfo.IsMultiVolume
+                                ? $"等待处理 (分卷: {volumeInfo.VolumeCount})"
+                                : $"等待处理 (分卷主文件)",
                             FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length)
                         };
                         
@@ -326,7 +328,7 @@ namespace AutoUnpackTool
                         {
                             var volumeInfo = DetectMultiVolumeArchive(archiveFile);
                             
-                            if (volumeInfo.IsMultiVolume && volumeInfo.AllVolumePaths.Count > 0)
+                            if (volumeInfo.HasVolumeList)
                             {
                                 AppendLog($"检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
                                 
@@ -342,7 +344,9 @@ namespace AutoUnpackTool
                                 {
                                     FileName = mainFileInfo.Name,
                                     FilePath = volumeInfo.MainVolumePath,
-                                    Status = $"等待处理 (分卷: {volumeInfo.VolumeCount})",
+                                    Status = volumeInfo.IsMultiVolume
+                                        ? $"等待处理 (分卷: {volumeInfo.VolumeCount})"
+                                        : $"等待处理 (分卷主文件)",
                                     FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length)
                                 };
                                 
@@ -1276,6 +1280,33 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
+        /// 顶级解压链完成时：先 await 清理原压缩包（含分卷），再触发批量智能路径。
+        /// 避免 HandleOriginalFile 在首个 await 让出后，与 CheckAndTriggerBatchSmartPathProcessing
+        /// 触发的目录遍历并发，导致分卷仍被占用或回收站移动失败。
+        /// </summary>
+        private async Task FinalizeTopLevelExtractAndSmartPathAsync(string topArchivePath)
+        {
+            try
+            {
+                if (_settings.FileAfterExtract != FileAction.Keep)
+                    await HandleOriginalFile(topArchivePath);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"处理原文件时出错: {ex.Message}", ConsoleColor.Red);
+            }
+
+            try
+            {
+                await Dispatcher.InvokeAsync(() => CheckAndTriggerBatchSmartPathProcessing());
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 触发检查失败: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
         /// 检查是否还有待处理的文件，如果有则触发新一轮解压
         /// </summary>
 
@@ -1425,6 +1456,32 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
+        /// 扫描后无（或不再有）待入队子压缩包时，对当前解压项做叶子收尾：更新状态、按设置清理当前归档、再向上汇报。
+        /// 须与「发现候选但 addedCount==0」（例如全部被黑名单删除）分支共用，否则会跳过清理中间层压缩包。
+        /// </summary>
+        private void FinishLeafAfterScanNoChildArchivesToQueue(FileItem leafItem, int taskId, string debugSuffix = "")
+        {
+            if (leafItem == null)
+                return;
+
+            string suffix = string.IsNullOrEmpty(debugSuffix) ? "" : " " + debugSuffix;
+            AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {leafItem.FileName}{suffix}", ConsoleColor.Magenta);
+
+            var passwordInfo = leafItem.FoundPassword != null
+                ? $" (密码: {leafItem.FoundPassword})"
+                : " (无密码)";
+            Dispatcher.Invoke(() =>
+            {
+                leafItem.Status = $"解压成功{passwordInfo}";
+            });
+            AppendLog($"[{leafItem.FileName}] 叶子节点解压完成: {leafItem.Status}", ConsoleColor.Green);
+
+            AppendLog($"[{leafItem.FileName}] 叶子节点解压完成，处理原文件...", ConsoleColor.Cyan);
+            _ = HandleOriginalFileAsync(leafItem.FilePath);
+            UpdateParentStatusWhenChildrenComplete(leafItem);
+        }
+
+        /// <summary>
         /// 扫描解压后的文件，检测是否包含新的压缩文件并添加到列表
         /// 注意：此方法只负责扫描和添加文件，不测试密码，不启动解压
         /// 密码测试和解压由 CheckAndTriggerNextRoundExtractAsync 统一处理
@@ -1485,28 +1542,8 @@ namespace AutoUnpackTool
                 if (allArchiveFiles.Count == 0)
                 {
                     AppendLog($"[线程 {taskId}] 未发现新的压缩文件", ConsoleColor.Gray);
-                    
                     if (parentFileItem != null)
-                    {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {parentFileItem.FileName}", ConsoleColor.Magenta);
-                        
-                        // 叶子节点：设置解压成功状态
-                        var passwordInfo = parentFileItem.FoundPassword != null
-                            ? $" (密码: {parentFileItem.FoundPassword})"
-                            : " (无密码)";
-                        Dispatcher.Invoke(() =>
-                        {
-                            parentFileItem.Status = $"解压成功{passwordInfo}";
-                        });
-                        AppendLog($"[{parentFileItem.FileName}] 叶子节点解压完成: {parentFileItem.Status}", ConsoleColor.Green);
-                        
-                        // 当前节点（叶子节点）：先处理自身原文件
-                        AppendLog($"[{parentFileItem.FileName}] 叶子节点解压完成，处理原文件...", ConsoleColor.Cyan);
-                        _ = HandleOriginalFileAsync(parentFileItem.FilePath);
-                        
-                        // 然后向父节点传播完成状态
-                        UpdateParentStatusWhenChildrenComplete(parentFileItem);
-                    }
+                        FinishLeafAfterScanNoChildArchivesToQueue(parentFileItem, taskId);
                     return;
                 }
 
@@ -1548,7 +1585,7 @@ namespace AutoUnpackTool
                     {
                         var volumeInfo = DetectMultiVolumeArchive(archiveFile);
                         
-                        if (volumeInfo.IsMultiVolume)
+                        if (volumeInfo.HasVolumeList)
                         {
                             AppendLog($"[线程 {taskId}] 检测到分卷压缩包: {volumeInfo.VolumeCount} 个分卷", ConsoleColor.Cyan);
                             
@@ -1641,11 +1678,11 @@ namespace AutoUnpackTool
                 }
                 else
                 {
-                    // 没有添加新文件，检查父项是否可以完成
+                    // 有候选但未入队（黑名单删除、已在树中等）：须走与「零候选」相同的叶子收尾，否则会跳过清理当前层归档且父链不完整
                     if (parentFileItem != null)
                     {
-                        AppendLog($"[线程 {taskId}] 没有新文件，更新父项状态: {parentFileItem.FileName}", ConsoleColor.Gray);
-                        UpdateParentStatusWhenChildrenComplete(parentFileItem);
+                        AppendLog($"[线程 {taskId}] 没有新文件入队，执行叶子收尾: {parentFileItem.FileName}", ConsoleColor.Gray);
+                        FinishLeafAfterScanNoChildArchivesToQueue(parentFileItem, taskId, "(候选未入队，可能已按黑名单删除或跳过)");
                     }
                 }
             }
@@ -1737,9 +1774,9 @@ namespace AutoUnpackTool
                     // 从密码映射表中移除
                     _passwordMap.Remove(parentItem.FilePath);
                     
-                    // 处理原文件（移动到回收站/删除等）
-                    // 由于这个方法是同步调用，使用 fire-and-forget 模式
-                    _ = HandleOriginalFileAsync(parentItem.FilePath);
+                    // 非顶级：fire-and-forget 清理原文件。顶级：在到达顶级分支里先清理再跑智能路径，避免竞态。
+                    if (parentItem.Parent != null)
+                        _ = HandleOriginalFileAsync(parentItem.FilePath);
                 }
                 else
                 {
@@ -1758,8 +1795,10 @@ namespace AutoUnpackTool
                     // 到达顶级，整个树形结构处理完成
                     AppendLog($"[{parentItem.FileName}] ✓ 已到达顶级，整个树形结构处理完成", ConsoleColor.Green);
                     
-                    // 检查是否还有其他顶级项未完成，如果没有则触发批量智能路径处理
-                    CheckAndTriggerBatchSmartPathProcessing();
+                    if (parentSelfSuccess)
+                        _ = FinalizeTopLevelExtractAndSmartPathAsync(parentItem.FilePath);
+                    else
+                        Dispatcher.Invoke(() => CheckAndTriggerBatchSmartPathProcessing());
                 }
             }
             else
@@ -2951,7 +2990,7 @@ namespace AutoUnpackTool
                 {
                     case FileAction.MoveToRecycleBin:
                         // 移动到回收站
-                        if (fileItem?.VolumeInfo?.IsMultiVolume == true)
+                        if (fileItem?.VolumeInfo?.HasVolumeList == true)
                         {
                             // 分卷压缩包：移动所有分卷
                             await MoveAllVolumesToRecycleBin(fileItem.VolumeInfo);
@@ -3001,7 +3040,7 @@ namespace AutoUnpackTool
 
                     case FileAction.Delete:
                         // 直接删除
-                        if (fileItem?.VolumeInfo?.IsMultiVolume == true)
+                        if (fileItem?.VolumeInfo?.HasVolumeList == true)
                         {
                             // 分卷压缩包：删除所有分卷
                             await DeleteAllVolumes(fileItem.VolumeInfo);
@@ -3046,7 +3085,7 @@ namespace AutoUnpackTool
 
                     case FileAction.MoveToSpecificDir:
                         // 移动到指定目录
-                        if (fileItem?.VolumeInfo?.IsMultiVolume == true)
+                        if (fileItem?.VolumeInfo?.HasVolumeList == true)
                         {
                             // 分卷压缩包：移动所有分卷
                             await MoveAllVolumesToSpecificDir(fileItem.VolumeInfo);
@@ -3154,8 +3193,8 @@ namespace AutoUnpackTool
             {
                 try
                 {
-                    // 尝试以独占模式打开文件
-                    using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    // 独占读即可检测占用；ReadWrite 在只读属性/ACL 上会失败，导致误判未解锁而跳过清理
+                    using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None))
                     {
                         return true; // 成功打开，文件已解锁
                     }

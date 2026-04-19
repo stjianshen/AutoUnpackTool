@@ -58,9 +58,14 @@ namespace AutoUnpackTool
         public int VolumeCount => AllVolumePaths.Count;
         
         /// <summary>
-        /// 是否为分卷压缩包
+        /// 是否为多分卷（至少两个物理分卷文件）
         /// </summary>
         public bool IsMultiVolume => VolumeCount > 1;
+
+        /// <summary>
+        /// 是否按分卷列表处理（含仅存在 .001 单卷的命名格式，用于清理时遍历 AllVolumePaths）
+        /// </summary>
+        public bool HasVolumeList => AllVolumePaths != null && AllVolumePaths.Count > 0;
     }
 
     public class PasswordEntry
@@ -169,7 +174,7 @@ namespace AutoUnpackTool
         public string ExcludedExtensions { get; set; } = ".exe,.dll,.msi,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.pdf,.jpg,.jpeg,.png,.gif,.bmp,.mp3,.mp4,.avi,.mkv";
 
         /// <summary>
-        /// 黑名单文件模式列表（逗号分隔，支持通配符 * 和 ?），匹配的文件将被永久删除
+        /// 黑名单文件模式列表（逗号或换行分隔，支持通配符 * 和 ?），匹配的文件将被永久删除
         /// </summary>
         public string BlacklistFiles { get; set; } = "";
 
@@ -644,17 +649,26 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 获取黑名单文件模式列表
+        /// 获取黑名单文件模式列表（逗号、中文逗号、换行均可分隔多条）
         /// </summary>
         public List<string> GetBlacklistPatterns()
         {
             if (string.IsNullOrWhiteSpace(BlacklistFiles))
                 return new List<string>();
 
-            return BlacklistFiles.Split(new[] { ',', '，' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(p => p.Trim())
-                .Where(p => !string.IsNullOrEmpty(p))
-                .ToList();
+            var separators = new[] { ',', '，' };
+            var patterns = new List<string>();
+            foreach (var line in BlacklistFiles.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                foreach (var part in line.Split(separators, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string p = part.Trim();
+                    if (p.Length > 0)
+                        patterns.Add(p);
+                }
+            }
+
+            return patterns;
         }
 
         [Obsolete("使用 LoadPasswordsFromFile 代替")]

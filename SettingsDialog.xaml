@@ -122,10 +122,10 @@
             <!-- 黑名单文件设置 - 可折叠 -->
             <Expander Grid.Row="5" Header="🚫 黑名单文件设置" IsExpanded="False" Margin="0,0,0,15">
                 <StackPanel Margin="10,10,0,0">
-                    <TextBlock Text="黑名单文件模式（逗号分隔，支持通配符 * 和 ?）:" FontWeight="Bold" Margin="0,0,0,5"/>
+                    <TextBlock Text="黑名单文件模式（逗号或换行分隔，支持通配符 * 和 ?）:" FontWeight="Bold" Margin="0,0,0,5"/>
                     <TextBox x:Name="TxtBlacklistFiles" Height="80" TextWrapping="Wrap" 
                              AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,5"/>
-                    <TextBlock Text="示例: *.tmp, C:\Temp\*, *temp*" FontSize="11" Foreground="Gray"/>
+                    <TextBlock Text="示例: *.tmp, C:\Temp\*, *temp*（也可每行写一条）" FontSize="11" Foreground="Gray"/>
                     <TextBlock Text="⚠️ 警告：匹配的文件将被永久删除（不经过回收站，不可恢复）" 
                                FontSize="11" Foreground="Red" Margin="0,5,0,0"/>
                 </StackPanel>
