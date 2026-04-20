@@ -2076,37 +2076,75 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
+        /// 去掉目录名末尾的压缩包后缀（支持复合后缀，如 .tar.zst）
+        /// </summary>
+        private string NormalizeArchiveLikeName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return name;
+
+            string result = name;
+            var archiveExtensions = _settings.GetArchiveExtensions()
+                .OrderByDescending(x => x.Length)
+                .ToList();
+
+            bool changed;
+            do
+            {
+                changed = false;
+                foreach (var ext in archiveExtensions)
+                {
+                    if (result.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string trimmed = result.Substring(0, result.Length - ext.Length);
+                        if (!string.IsNullOrWhiteSpace(trimmed))
+                        {
+                            result = trimmed;
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            } while (changed);
+
+            return result;
+        }
+
+        /// <summary>
         /// 根据配置模式决定最终的文件夹名称
         /// </summary>
         private string DetermineFolderName(string parentName, string childName)
         {
+            string normalizedParentName = NormalizeArchiveLikeName(parentName);
+            string normalizedChildName = NormalizeArchiveLikeName(childName);
+
             if (_settings.SmartPathProcessingMode == SmartPathMode.Concatenate)
             {
                 // 拼接模式
-                return $"{parentName}_{childName}";
+                return $"{normalizedParentName}_{normalizedChildName}";
             }
             else
             {
                 // 智能选择模式
                 bool parentHasJapanese = System.Text.RegularExpressions.Regex.IsMatch(
-                    parentName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+                    normalizedParentName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
                 bool childHasJapanese = System.Text.RegularExpressions.Regex.IsMatch(
-                    childName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
+                    normalizedChildName, @"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]");
 
-                bool parentIsLong = parentName.Length > 10;
-                bool childIsLong = childName.Length > 10;
+                bool parentIsLong = normalizedParentName.Length > 10;
+                bool childIsLong = normalizedChildName.Length > 10;
 
                 int parentScore = (parentHasJapanese ? 100 : 0) + (parentIsLong ? 50 : 0);
                 int childScore = (childHasJapanese ? 100 : 0) + (childIsLong ? 50 : 0);
 
                 // 选择评分高的，评分相同选较长的
-                if (childScore > parentScore || (childScore == parentScore && childName.Length > parentName.Length))
+                if (childScore > parentScore || (childScore == parentScore && normalizedChildName.Length > normalizedParentName.Length))
                 {
-                    return childName;
+                    return normalizedChildName;
                 }
                 else
                 {
-                    return parentName;
+                    return normalizedParentName;
                 }
             }
         }
@@ -2874,11 +2912,11 @@ namespace AutoUnpackTool
         /// 例如: ba360.7z.001 -> ba360
         ///       test.rar -> test
         ///       document.zip -> document
+        ///       sample.tar.gz -> sample
         /// </summary>
         private string GetArchiveFolderName(string archivePath)
         {
             string fileName = Path.GetFileName(archivePath);
-            string fileNameWithoutExt = Path.GetFileNameWithoutExtension(archivePath);
             
             // 1. 处理 7z 分卷格式：xxx.7z.001 -> xxx
             var match7z = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.7z\.\d{3,}$");
@@ -2915,11 +2953,10 @@ namespace AutoUnpackTool
                 return matchGeneric.Groups[1].Value;
             }
             
-            // 6. 普通压缩包：去掉一层扩展名
+            // 6. 普通压缩包：去掉后缀（支持复合后缀）
             // xxx.7z -> xxx
-            // xxx.rar -> xxx
-            // xxx.zip -> xxx
-            return fileNameWithoutExt;
+            // xxx.tar.zst -> xxx
+            return NormalizeArchiveLikeName(fileName);
         }
 
         /// <summary>
