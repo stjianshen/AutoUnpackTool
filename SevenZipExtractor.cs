@@ -213,7 +213,8 @@ namespace AutoUnpackTool
             Action<int>? onPercentChanged = null,
             bool showCliWindow = false,
             CancellationToken cancellationToken = default,
-            int extractionTimeout = 3600)
+            int extractionTimeout = 3600,
+            bool useHashTypeMode = false)
         {
             return await Task.Run(() =>
             {
@@ -234,6 +235,10 @@ namespace AutoUnpackTool
                     }
 
                     var arguments = $"x \"{archivePath}\" -o\"{outputDir}\" -y -sccUTF-8";
+                    if (useHashTypeMode)
+                    {
+                        arguments += " -t#";
+                    }
                     
                     if (!string.IsNullOrEmpty(password))
                     {

@@ -110,6 +110,17 @@
             <!-- 文件检测设置 - 可折叠 -->
             <Expander Grid.Row="4" Header="🔍 文件检测设置" IsExpanded="False" Margin="0,0,0,15">
                 <StackPanel Margin="10,10,0,0">
+                    <StackPanel Margin="0,0,0,12">
+                        <CheckBox x:Name="ChkStegoDetection" Content="启用隐写模式探测（MP4/MKV 内嵌压缩包）" VerticalAlignment="Center"/>
+                        <TextBlock Text="默认关闭以节省资源；开启后会对视频容器做额外 7z 探测" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
+                    </StackPanel>
+                    <StackPanel Margin="0,0,0,12">
+                        <TextBlock Text="隐写探测文件大小下限（MB）:" FontSize="11" Margin="0,0,0,3"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBox x:Name="TxtStegoMinSizeMB" Width="120" Height="26" VerticalContentAlignment="Center"/>
+                            <TextBlock Text="低于该大小的文件将跳过隐写探测" FontSize="11" Foreground="Gray" Margin="10,4,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
                     <TextBlock Text="压缩文件扩展名检测:" FontWeight="Bold" Margin="0,0,0,5"/>
                     <TextBlock Text="需要检测的扩展名（逗号分隔）:" FontSize="11" Margin="0,0,0,3"/>
                     <TextBox x:Name="TxtArchiveExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,10"/>

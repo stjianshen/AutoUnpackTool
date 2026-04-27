@@ -49,6 +49,8 @@ namespace AutoUnpackTool
             TxtThreadsCount.Text = Settings.ThreadCount.ToString();
             ChkShowCliWindow.IsChecked = Settings.ShowCliWindow;
             ChkSmartPathProcessing.IsChecked = Settings.EnableSmartPathProcessing;
+            ChkStegoDetection.IsChecked = Settings.EnableStegoDetection;
+            TxtStegoMinSizeMB.Text = Settings.StegoDetectionMinFileSizeMB.ToString();
             
             // 根据智能路径处理是否启用来显示/隐藏模式选择
             PnlSmartPathMode.Visibility = Settings.EnableSmartPathProcessing ? Visibility.Visible : Visibility.Collapsed;
@@ -203,6 +205,14 @@ namespace AutoUnpackTool
                 return;
             }
 
+            // 验证隐写探测大小下限
+            if (!int.TryParse(TxtStegoMinSizeMB.Text.Trim(), out int stegoMinSizeMb) || stegoMinSizeMb <= 0)
+            {
+                MessageBox.Show("隐写探测文件大小下限必须是大于 0 的整数（单位MB）！",
+                    "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             try
             {
                 // 保存设置
@@ -237,6 +247,8 @@ namespace AutoUnpackTool
                 
                 // 保存智能路径处理设置
                 Settings.EnableSmartPathProcessing = ChkSmartPathProcessing.IsChecked == true;
+                Settings.EnableStegoDetection = ChkStegoDetection.IsChecked == true;
+                Settings.StegoDetectionMinFileSizeMB = stegoMinSizeMb;
                 
                 // 保存智能路径处理模式
                 if (RdoSmartPathConcatenate?.IsChecked == true)

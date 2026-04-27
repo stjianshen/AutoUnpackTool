@@ -3,6 +3,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -39,6 +40,11 @@ namespace AutoUnpackTool
         
         // 记录所有顶级 FileItem
         private List<FileItem> _topLevelItems = new();
+        private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".mp4", ".mkv", ".webm", ".mov", ".m4v"
+        };
 
         public MainWindow()
         {
@@ -914,6 +920,24 @@ namespace AutoUnpackTool
             }
 
             string? foundPassword = null;
+            bool stegoMode = IsStegoDetectionActiveForFile(fileItem.FilePath);
+
+            if (stegoMode)
+            {
+                _passwordMap.Add(fileItem.FilePath, null);
+                Dispatcher.Invoke(() =>
+                {
+                    fileItem.FoundPassword = null;
+                    TxtStatusCurrentPassword.Text = "测试中的密码: 无";
+                    fileItem.Status = "隐写容器（无需密码）";
+                });
+
+                _extractQueue.Enqueue(fileItem);
+                AppendLog($"[{fileItem.FileName}] 识别为隐写容器，已加入待解压队列（-t#）", ConsoleColor.Cyan);
+                WakeupExtractThread();
+                await Task.Delay(100, token);
+                return;
+            }
 
             // 步骤2：尝试无密码
             Dispatcher.Invoke(() =>
@@ -1357,7 +1381,8 @@ namespace AutoUnpackTool
                         });
                     },
                     showCliWindow: _settings.ShowCliWindow,
-                    cancellationToken: token);
+                    cancellationToken: token,
+                    useHashTypeMode: IsStegoDetectionActiveForFile(fileItem.FilePath));
 
                 if (result.Success)
                 {
@@ -1987,6 +2012,7 @@ namespace AutoUnpackTool
 
         /// <summary>
         /// 后序遍历目录树，从叶子节点开始处理
+        /// 注意：只处理压缩包解压出的文件夹结构，不处理非压缩包（如游戏应用）的原始结构
         /// </summary>
         private void ProcessDirectoryTreePostOrder(string dirPath)
         {
@@ -1996,6 +2022,14 @@ namespace AutoUnpackTool
                 if (!Directory.Exists(dirPath))
                 {
                     AppendLog($"[批量智能路径] 目录已不存在，跳过: {dirPath}", ConsoleColor.Gray);
+                    return;
+                }
+
+                // 检查当前目录是否是压缩包解压出来的
+                // 如果不是（即原始文件结构），则不进行扁平化
+                if (!IsExtractedArchiveFolder(dirPath))
+                {
+                    AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 非压缩包解压文件夹，跳过扁平化", ConsoleColor.Gray);
                     return;
                 }
 
@@ -2031,6 +2065,90 @@ namespace AutoUnpackTool
             catch (Exception ex)
             {
                 AppendLog($"[批量智能路径] 遍历目录失败 {dirPath}: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
+        /// 判断目录是否是压缩包解压出来的
+        /// 通过检查目录下是否有压缩包解压的典型特征来判断
+        /// </summary>
+        private bool IsExtractedArchiveFolder(string dirPath)
+        {
+            try
+            {
+                string dirName = Path.GetFileName(dirPath);
+                string? parentDir = Path.GetDirectoryName(dirPath);
+                
+                if (string.IsNullOrEmpty(parentDir) || !Directory.Exists(parentDir))
+                {
+                    return false;
+                }
+
+                var archiveExtensions = _settings.GetArchiveExtensions();
+                
+                // 方法1：检查目录名是否与某个压缩包文件名匹配（去掉扩展名后）
+                // 需要考虑分卷压缩包的情况（.001, .part1.rar 等）
+                var parentFiles = Directory.GetFiles(parentDir);
+                foreach (var file in parentFiles)
+                {
+                    string fileName = Path.GetFileNameWithoutExtension(file);
+                    string fileExt = Path.GetExtension(file).ToLowerInvariant();
+                    
+                    // 检查是否是分卷压缩包（.001, .002, .part1.rar 等）
+                    bool isVolumeArchive = IsMultiVolumeArchive(file);
+                    
+                    // 获取压缩包的基础名称（去掉所有扩展名）
+                    string baseName = fileName;
+                    
+                    // 去掉可能的分卷后缀
+                    if (isVolumeArchive)
+                    {
+                        // 对于 .7z.001 这样的文件，fileName 是 "bb.7z"
+                        // 需要进一步去掉 .7z
+                        foreach (var ext in archiveExtensions.OrderByDescending(x => x.Length))
+                        {
+                            if (baseName.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+                            {
+                                baseName = baseName.Substring(0, baseName.Length - ext.Length);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // 检查目录名是否匹配
+                    if (dirName.Equals(baseName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+                
+                // 方法2：如果目录下有压缩包，则认为这是压缩包解压出的文件夹
+                var files = Directory.GetFiles(dirPath);
+                foreach (var file in files)
+                {
+                    if (IsArchiveFile(file))
+                    {
+                        return true;
+                    }
+                }
+                
+                // 方法3：递归检查子目录
+                var subDirs = Directory.GetDirectories(dirPath);
+                foreach (var subDir in subDirs)
+                {
+                    if (IsExtractedArchiveFolder(subDir))
+                    {
+                        return true;
+                    }
+                }
+                
+                // 默认返回false，避免误判
+                return false;
+            }
+            catch
+            {
+                // 如果检查失败，默认不进行扁平化（安全优先）
+                return false;
             }
         }
 
@@ -2485,6 +2603,90 @@ namespace AutoUnpackTool
         /// 2. 再检查扩展名是否在包含列表中，如果是则用魔术数验证
         /// 3. 如果扩展名不在包含列表中，直接用魔术数检测
         /// </summary>
+        private bool IsStegoCarrierExtension(string filePath)
+        {
+            string ext = Path.GetExtension(filePath).ToLowerInvariant();
+            return StegoCarrierExtensions.Contains(ext);
+        }
+
+        private bool IsStegoDetectionActiveForFile(string filePath)
+        {
+            if (!_settings.EnableStegoDetection)
+                return false;
+
+            if (!IsStegoCarrierExtension(filePath))
+                return false;
+
+            long minSizeBytes = (long)Math.Max(1, _settings.StegoDetectionMinFileSizeMB) * 1024L * 1024L;
+            long fileSizeBytes = new FileInfo(filePath).Length;
+            if (fileSizeBytes < minSizeBytes)
+            {
+                AppendLog(
+                    $"  [隐写探测] {Path.GetFileName(filePath)}: 文件过小 ({fileSizeBytes / 1024 / 1024}MB)，低于下限 {_settings.StegoDetectionMinFileSizeMB}MB，跳过探测",
+                    ConsoleColor.Gray);
+                return false;
+            }
+
+            return IsStegoFileBy7ZipProbe(filePath);
+        }
+
+        private bool IsStegoFileBy7ZipProbe(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+                return false;
+
+            if (_stegoProbeCache.TryGetValue(filePath, out bool cached))
+                return cached;
+
+            bool detected = false;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
+                    return false;
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = _settings.SevenZipPath,
+                    Arguments = $"l -t# -sccUTF-8 \"{filePath}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    StandardOutputEncoding = System.Text.Encoding.UTF8,
+                    StandardErrorEncoding = System.Text.Encoding.UTF8
+                };
+
+                using var process = new Process { StartInfo = startInfo };
+                process.Start();
+                string output = process.StandardOutput.ReadToEnd();
+                string error = process.StandardError.ReadToEnd();
+
+                if (!process.WaitForExit(15000))
+                {
+                    try { process.Kill(); } catch { }
+                    AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 探测超时，跳过", ConsoleColor.Gray);
+                    detected = false;
+                }
+                else if (process.ExitCode == 0)
+                {
+                    string lower = (output + Environment.NewLine + error).ToLowerInvariant();
+                    detected = lower.Contains(".zip") ||
+                               lower.Contains(".7z") ||
+                               lower.Contains(".rar") ||
+                               lower.Contains(".tar") ||
+                               lower.Contains("listing archive");
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: {ex.Message}", ConsoleColor.Gray);
+                detected = false;
+            }
+
+            _stegoProbeCache[filePath] = detected;
+            return detected;
+        }
+
         /// <param name="filePath">文件路径</param>
         /// <returns>是否为压缩文件</returns>
         private bool IsArchiveFile(string filePath)
@@ -2503,7 +2705,12 @@ namespace AutoUnpackTool
             // 如果在排除列表中，直接返回 false，结束解压流程
             if (excludedExtensions.Contains(extension))
             {
-                AppendLog($"  {Path.GetFileName(filePath)}: 扩展名在排除列表中", ConsoleColor.Gray);
+                if (IsStegoDetectionActiveForFile(filePath))
+                {
+                    AppendLog($"  [确认] {Path.GetFileName(filePath)}: 命中隐写探测，按隐写容器处理", ConsoleColor.Green);
+                    return true;
+                }
+
                 return false;
             }
 
@@ -2531,7 +2738,6 @@ namespace AutoUnpackTool
             if (extensionMatched)
             {
                 // 扩展名匹配，用魔术数验证
-                AppendLog($"  [检测] {Path.GetFileName(filePath)}: 扩展名匹配，进行魔术数验证...", ConsoleColor.Gray);
                 if (IsArchiveFileByMagicNumber(filePath))
                 {
                     AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数验证通过，是压缩文件", ConsoleColor.Green);
@@ -2539,14 +2745,12 @@ namespace AutoUnpackTool
                 }
                 else
                 {
-                    AppendLog($"  [拒绝] {Path.GetFileName(filePath)}: 魔术数验证失败，不是压缩文件", ConsoleColor.Yellow);
                     return false;
                 }
             }
             else
             {
                 // 扩展名不匹配，直接用魔术数检测
-                AppendLog($"  [检测] {Path.GetFileName(filePath)}: 扩展名不匹配，尝试魔术数检测...", ConsoleColor.Gray);
                 if (IsArchiveFileByMagicNumber(filePath))
                 {
                     AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数检测通过，是压缩文件", ConsoleColor.Green);
@@ -2554,7 +2758,12 @@ namespace AutoUnpackTool
                 }
                 else
                 {
-                    AppendLog($"  [拒绝] {Path.GetFileName(filePath)}: 魔术数检测失败，不是压缩文件", ConsoleColor.Yellow);
+                    if (IsStegoDetectionActiveForFile(filePath))
+                    {
+                        AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数失败但隐写探测命中", ConsoleColor.Green);
+                        return true;
+                    }
+
                     return false;
                 }
             }

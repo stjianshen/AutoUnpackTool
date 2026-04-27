@@ -157,6 +157,18 @@ namespace AutoUnpackTool
         /// 是否启用智能路径处理（解压后自动扁平化多层嵌套文件夹）
         /// </summary>
         public bool EnableSmartPathProcessing { get; set; } = false;
+
+        /// <summary>
+        /// 是否启用隐写文件探测（MP4/MKV 等容器内嵌压缩包）
+        /// 默认关闭以减少扫描开销
+        /// </summary>
+        public bool EnableStegoDetection { get; set; } = false;
+
+        /// <summary>
+        /// 隐写探测文件大小下限（MB），低于该值不做隐写探测
+        /// 默认 10MB（视频文件通常不会太小）
+        /// </summary>
+        public int StegoDetectionMinFileSizeMB { get; set; } = 10;
         
         /// <summary>
         /// 智能路径处理模式
