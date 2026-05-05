@@ -1,39 +1,39 @@
 @echo off
 chcp 65001 >nul
 echo ========================================
-echo   AutoUnpackTool 发布脚本
+echo   AutoUnpackTool Publish Script
 echo ========================================
 echo.
 
-REM 检查 dotnet 是否安装
+REM Check if dotnet is installed
 where dotnet >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ❌ 错误：未找到 dotnet 命令
-    echo 请先安装 .NET SDK: https://dotnet.microsoft.com/download
+    echo [ERROR] dotnet command not found
+    echo Please install .NET SDK: https://dotnet.microsoft.com/download
     pause
     exit /b 1
 )
 
-echo 📌 当前 .NET 版本：
+echo [INFO] Current .NET version:
 dotnet --version
 echo.
 
-REM 清理旧的发布文件
+REM Clean old publish files
 if exist publish (
-    echo 🗑️  清理旧的发布文件...
+    echo [INFO] Cleaning old publish files...
     rmdir /s /q publish
 )
 
 echo.
-echo 📦 开始发布...
+echo [INFO] Starting publish...
 echo.
 
-REM 发布为单文件应用（自包含，用户无需安装 .NET）
-echo 🔧 发布配置：
-echo    - 模式：Release
-echo    - 平台：Windows x64
-echo    - 自包含：是（包含 .NET 运行时）
-echo    - 单文件：是
+REM Publish as single-file application (self-contained, no .NET required for users)
+echo [CONFIG] Publish settings:
+echo    - Mode: Release
+echo    - Platform: Windows x64
+echo    - Self-contained: Yes (includes .NET runtime)
+echo    - Single file: Yes
 echo.
 
 dotnet publish -c Release -r win-x64 ^
@@ -46,22 +46,22 @@ dotnet publish -c Release -r win-x64 ^
 
 if %errorlevel% neq 0 (
     echo.
-    echo ❌ 发布失败！
+    echo [ERROR] Publish failed!
     pause
     exit /b 1
 )
 
 echo.
-echo ✅ 发布成功！
+echo [SUCCESS] Publish completed!
 echo.
-echo 📂 发布文件位于：publish 目录
+echo [INFO] Published files location: publish directory
 echo.
-echo 📊 文件大小：
+echo [INFO] File size:
 dir publish\AutoUnpackTool.exe | findstr AutoUnpackTool
 echo.
-echo 💡 提示：
-echo    1. 将 publish 文件夹打包为 zip 分发给用户
-echo    2. 用户首次运行需要配置 7z.exe 路径
-echo    3. 建议同时提供使用说明文档
+echo [TIPS]:
+echo    1. Zip the publish folder and distribute to users
+echo    2. Users need to configure 7z.exe path on first run
+echo    3. Recommend including usage documentation
 echo.
 pause
