@@ -44,6 +44,8 @@
                         <RadioButton x:Name="RdoKeepOriginal" Content="保留原文件" GroupName="FileAction" IsChecked="True" Margin="0,0,0,5"/>
                         <RadioButton x:Name="RdoMoveToRecycleBin" Content="移动到回收站" GroupName="FileAction" Margin="0,0,0,5"/>
                         <RadioButton x:Name="RdoDeleteOriginal" Content="直接删除" GroupName="FileAction"/>
+                        <CheckBox x:Name="ChkKeepChildArchives" Content="保留解压出的子压缩包" IsChecked="True" Margin="0,8,0,0"
+                                  ToolTip="取消勾选后，解压出的子压缩包一律删除/移至回收站，不受上述保留设置影响。拖入的顶级压缩包仍按上述设置处理。"/>
                     </StackPanel>
 
                     <!-- 解压模式 -->

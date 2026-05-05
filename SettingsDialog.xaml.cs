@@ -81,6 +81,9 @@ namespace AutoUnpackTool
                     break;
             }
 
+            // 设置子压缩包保留
+            ChkKeepChildArchives.IsChecked = Settings.KeepChildArchives;
+
             // 设置输出模式
             switch (Settings.OutputMode)
             {
@@ -228,6 +231,9 @@ namespace AutoUnpackTool
                     Settings.FileAfterExtract = FileAction.MoveToRecycleBin;
                 else if (RdoDeleteOriginal.IsChecked == true)
                     Settings.FileAfterExtract = FileAction.Delete;
+
+                // 保存子压缩包保留设置
+                Settings.KeepChildArchives = ChkKeepChildArchives.IsChecked == true;
 
                 // 保存输出模式
                 if (RdoOutputToSpecificDir?.IsChecked == true)

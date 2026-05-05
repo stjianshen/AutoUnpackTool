@@ -139,6 +139,11 @@ namespace AutoUnpackTool
         public string OutputDir { get; set; } = string.Empty;
         public int ThreadCount { get; set; } = 2;
         public FileAction FileAfterExtract { get; set; } = FileAction.Keep;
+
+        /// <summary>
+        /// 是否保留解压出的子压缩包。false 时子压缩包一律清理（不受 FileAfterExtract 影响）。
+        /// </summary>
+        public bool KeepChildArchives { get; set; } = true;
         public OutputMode OutputMode { get; set; } = OutputMode.SpecificDir;
         public ExtractMode ExtractMode { get; set; } = ExtractMode.Manual;
         public bool ShowCliWindow { get; set; } = false; // 是否显示CLI窗口
