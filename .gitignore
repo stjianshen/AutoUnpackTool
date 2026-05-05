@@ -22,3 +22,4 @@ _ReSharper*/
 # 日志文件
 *.log
 .history/
+.claude/
