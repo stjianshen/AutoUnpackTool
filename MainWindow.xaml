@@ -23,13 +23,15 @@
             <!-- 解压模式选择 -->
             <RadioButton x:Name="RdoManualMode" Content="手动解压" GroupName="ExtractMode" VerticalAlignment="Center" Margin="15,0,0,0" IsChecked="True"/>
             <RadioButton x:Name="RdoAutoMode" Content="自动解压" GroupName="ExtractMode" VerticalAlignment="Center" Margin="10,0,0,0"/>
+            
+            <!-- 状态显示（顶部右侧） -->
+            <TextBlock x:Name="TxtStatusMain" Text="状态: 未开始" VerticalAlignment="Center" Margin="15,0,0,0" FontWeight="Bold" Foreground="Gray"/>
         </StackPanel>
 
         <!-- 第二行：主要操作按钮 -->
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,5">
-            <!-- 操作按钮 -->
-            <Button x:Name="BtnStartExtract" Content="开始解压" Width="100" Height="30" Click="BtnStartExtract_Click" Margin="0,0,10,0"/>
-            <Button x:Name="BtnPauseStop" Content="暂停/停止" Width="100" Height="30" Click="BtnPauseStop_Click" Margin="0,0,10,0" IsEnabled="False"/>
+            <!-- 统一操作按钮（根据状态自动切换功能） -->
+            <Button x:Name="BtnMainAction" Content="开始解压" Width="100" Height="30" Click="BtnMainAction_Click" Margin="0,0,10,0"/>
             <Button x:Name="BtnClear" Content="清空内容" Width="100" Height="30" Click="BtnClear_Click" Margin="0,0,10,0"/>
             
             <Separator Width="20" Visibility="Hidden"/>
@@ -46,7 +48,7 @@
                 <ComboBoxItem Content="覆盖"/>
                 <ComboBoxItem Content="重命名"/>
             </ComboBox>
-            <CheckBox x:Name="ChkTreatAllAsArchive" Content="所有文件视为压缩包" VerticalAlignment="Center" Margin="15,0,0,0"/>
+
         </StackPanel>
 
         <!-- 主内容区域 -->

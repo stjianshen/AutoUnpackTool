@@ -35,6 +35,9 @@ namespace AutoUnpackTool
         private bool _isExtracting = false;
         private bool _isMonitoring = false;
         
+        // 暂停状态标志 - 用于优雅暂停（等待当前任务完成后再停止）
+        private bool _isPaused = false;
+        
         // 任务完成信号
         private TaskCompletionSource<bool> _testCompletionSource = new();
         private TaskCompletionSource<bool> _extractCompletionSource = new();
@@ -428,6 +431,20 @@ namespace AutoUnpackTool
             // 自动模式下，检查是否有待处理的任务需要继续
             if (_settings.ExtractMode == ExtractMode.Auto)
             {
+                // 如果处于暂停状态，先清除暂停标志
+                if (_isPaused)
+                {
+                    AppendLog("\n继续处理...", ConsoleColor.Cyan);
+                    _isPaused = false;
+                    
+                    // 唤醒线程继续处理
+                    _pendingQueueSignal.Set();
+                    _extractQueueSignal.Set();
+                    
+                    UpdateUiState();
+                    return;
+                }
+                
                 bool needTestThread = !_isTesting && !_pendingQueue.IsEmpty;
                 bool needExtractThread = !_isExtracting && !_extractQueue.IsEmpty;
 
@@ -569,6 +586,7 @@ namespace AutoUnpackTool
             // 6. 重置状态
             _isTesting = false;
             _isExtracting = false;
+            _isPaused = false;
             
             // 7. 重置信号
             _pendingQueueSignal.Reset();
@@ -649,46 +667,30 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 暂停/停止按钮点击事件
+        /// 统一操作按钮点击事件（根据状态自动切换功能）
         /// </summary>
-        private void BtnPauseStop_Click(object sender, RoutedEventArgs e)
+        private void BtnMainAction_Click(object sender, RoutedEventArgs e)
         {
-            // 如果正在测试密码，取消测试
-            if (_isTesting && _testCancellationTokenSource != null)
+            if (_isPaused)
             {
-                AppendLog("\n正在暂停密码测试...", ConsoleColor.Yellow);
-                
-                // 立即更新UI状态，不需要等待线程退出
-                _isTesting = false;
-                
-                // 取消并清理token source，防止启动新线程时冲突
-                var oldTokenSource = _testCancellationTokenSource;
-                _testCancellationTokenSource = null;
-                oldTokenSource.Cancel();
-                oldTokenSource.Dispose();
-                
+                // 暂停状态 → 继续
+                AppendLog("\n继续处理...", ConsoleColor.Cyan);
+                _isPaused = false;
+                _pendingQueueSignal.Set();
+                _extractQueueSignal.Set();
                 UpdateUiState();
-                AppendLog("测试已暂停。点击'开始解压'可继续处理", ConsoleColor.Cyan);
-                return;
             }
-
-            // 如果正在解压，取消解压
-            if (_isExtracting && _extractCancellationTokenSource != null)
+            else if (_isTesting || _isExtracting)
             {
-                AppendLog("\n正在暂停解压操作...", ConsoleColor.Yellow);
-                
-                // 立即更新UI状态，不需要等待线程退出
-                _isExtracting = false;
-                
-                // 取消并清理token source，防止启动新线程时冲突
-                var oldTokenSource = _extractCancellationTokenSource;
-                _extractCancellationTokenSource = null;
-                oldTokenSource.Cancel();
-                oldTokenSource.Dispose();
-                
+                // 运行中 → 暂停
+                AppendLog("\n正在暂停...（等待当前任务完成后停止）", ConsoleColor.Yellow);
+                _isPaused = true;
                 UpdateUiState();
-                AppendLog("解压已暂停。点击'开始解压'可继续处理", ConsoleColor.Cyan);
-                return;
+            }
+            else
+            {
+                // 未开始 → 开始解压
+                BtnStartExtract_Click(sender, e);
             }
         }
 
@@ -700,9 +702,6 @@ namespace AutoUnpackTool
             try
             {
                 AppendLog("\n正在关闭程序...", ConsoleColor.Yellow);
-                
-                // 1. 取消所有正在运行的操作
-                CancelAllOperations();
                 
                 // 2. 等待一小段时间让线程退出
                 Task.Delay(500).Wait();
@@ -781,6 +780,9 @@ namespace AutoUnpackTool
                 return;
             }
 
+            // 重置暂停标志
+            _isPaused = false;
+            
             // 重置完成信号
             _testCompletionSource = new TaskCompletionSource<bool>();
             _extractCompletionSource = new TaskCompletionSource<bool>();
@@ -868,6 +870,23 @@ namespace AutoUnpackTool
 
                 while (!token.IsCancellationRequested)
                 {
+                    // 检查是否被暂停（优雅暂停：完成当前任务后停止）
+                    if (_isPaused)
+                    {
+                        AppendLog("[测试线程] 检测到暂停标志，等待继续...", ConsoleColor.Yellow);
+                        
+                        // 等待直到取消暂停或被取消
+                        while (_isPaused && !token.IsCancellationRequested)
+                        {
+                            await Task.Delay(100, token);
+                        }
+                        
+                        if (token.IsCancellationRequested)
+                            break;
+                            
+                        AppendLog("[测试线程] 继续处理", ConsoleColor.Cyan);
+                    }
+                    
                     if (_pendingQueue.TryDequeue(out var fileItem))
                     {
                         try
@@ -930,6 +949,7 @@ namespace AutoUnpackTool
                 if (_testCancellationTokenSource == tokenSource)
                 {
                     _isTesting = false;
+                    _isPaused = false; // 重置暂停标志
                     _testCancellationTokenSource?.Dispose();
                     _testCancellationTokenSource = null;
                     UpdateUiState();
@@ -1100,6 +1120,23 @@ namespace AutoUnpackTool
 
                         while (!token.IsCancellationRequested)
                         {
+                            // 检查是否被暂停（优雅暂停：完成当前任务后停止）
+                            if (_isPaused)
+                            {
+                                AppendLog($"[解压线程 {taskId}] 检测到暂停标志，等待继续...", ConsoleColor.Yellow);
+                                
+                                // 等待直到取消暂停或被取消
+                                while (_isPaused && !token.IsCancellationRequested)
+                                {
+                                    await Task.Delay(100, token);
+                                }
+                                
+                                if (token.IsCancellationRequested)
+                                    break;
+                                    
+                                AppendLog($"[解压线程 {taskId}] 继续处理", ConsoleColor.Cyan);
+                            }
+                            
                             if (_extractQueue.TryDequeue(out var fileItem))
                             {
                                 // 尝试获取文件锁，防止竞争
@@ -1177,6 +1214,7 @@ namespace AutoUnpackTool
                 if (_extractCancellationTokenSource == tokenSource)
                 {
                     _isExtracting = false;
+                    _isPaused = false; // 重置暂停标志
                     _extractCancellationTokenSource?.Dispose();
                     _extractCancellationTokenSource = null;
                     UpdateUiState();
@@ -1991,23 +2029,50 @@ namespace AutoUnpackTool
                 bool isAutoMode = _settings.ExtractMode == ExtractMode.Auto;
                 bool isProcessing = _isTesting || _isExtracting;
                 
-                // 开始解压按钮：
-                // - 自动模式：始终启用（兼任"继续"功能，点击后由 BtnStartExtract_Click 判断具体操作）
-                // - 手动模式：仅在不处理时启用
-                if (isAutoMode)
+                // 更新顶部状态栏
+                if (_isPaused)
                 {
-                    BtnStartExtract.IsEnabled = true;
+                    TxtStatusMain.Text = "状态: 已暂停";
+                    TxtStatusMain.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Orange);
+                }
+                else if (isProcessing)
+                {
+                    TxtStatusMain.Text = "状态: 运行中";
+                    TxtStatusMain.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Green);
                 }
                 else
                 {
-                    BtnStartExtract.IsEnabled = !isProcessing;
+                    TxtStatusMain.Text = "状态: 未开始";
+                    TxtStatusMain.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Gray);
+                }
+                
+                // 更新统一操作按钮
+                if (_isPaused)
+                {
+                    BtnMainAction.Content = "继续";
+                }
+                else if (isProcessing)
+                {
+                    BtnMainAction.Content = "暂停";
+                }
+                else
+                {
+                    BtnMainAction.Content = "开始解压";
+                }
+                
+                // 手动模式下，未开始时才启用按钮
+                if (!isAutoMode)
+                {
+                    BtnMainAction.IsEnabled = !isProcessing;
+                }
+                else
+                {
+                    // 自动模式始终启用
+                    BtnMainAction.IsEnabled = true;
                 }
 
-                // 暂停/停止按钮：只在处理中时启用
-                BtnPauseStop.IsEnabled = isProcessing;
-
-                TxtStatusTestThread.Text = $"测试线程: {(_isTesting ? "工作中" : "空闲")}";
-                TxtStatusExtractThread.Text = $"解压线程: {(_isExtracting ? "工作中" : "空闲")}";
+                TxtStatusTestThread.Text = $"测试线程: {(_isTesting ? (_isPaused ? "已暂停" : "工作中") : "空闲")}";
+                TxtStatusExtractThread.Text = $"解压线程: {(_isExtracting ? (_isPaused ? "已暂停" : "工作中") : "空闲")}";
             });
         }
 
