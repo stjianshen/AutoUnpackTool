@@ -1367,8 +1367,9 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 顶级解压链完成时：先执行批量智能路径处理（解压目录内黑名单清理后再扁平化），再清理原压缩包（含分卷）。
-        /// 这样可以确保 IsExtractedArchiveFolder 能够通过检查父目录下的压缩包文件来识别解压文件夹。
+        /// 顶级解压链完成时：先清理解压目录内的残留压缩包（黑名单+原压缩包本身），
+        /// 再执行扁平化，最后清理原压缩包（含分卷，移动到回收站等）。
+        /// 扁平化条件（恰好一个子目录且无文件）会忽略压缩包文件，因此压缩包残留不影响扁平化判定。
         /// </summary>
         private async Task FinalizeTopLevelExtractAndSmartPathAsync(string topArchivePath)
         {
@@ -1384,7 +1385,7 @@ namespace AutoUnpackTool
 
             try
             {
-                // 再清理原压缩包（移动到回收站等）
+                // 再清理原压缩包（移动到回收站等，含分卷）
                 if (_settings.FileAfterExtract != FileAction.Keep)
                     await HandleOriginalFile(topArchivePath);
             }
@@ -2291,17 +2292,19 @@ namespace AutoUnpackTool
             try
             {
                 var subDirs = Directory.GetDirectories(dirPath);
-                var files = Directory.GetFiles(dirPath);
+                var allFiles = Directory.GetFiles(dirPath);
+                // 忽略压缩包文件（含分卷），这些残留文件将在后续 HandleOriginalFile 中统一清理
+                var nonArchiveFiles = allFiles.Where(f => !IsArchiveFile(f)).ToArray();
 
-                AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {files.Length} 个文件", ConsoleColor.Gray);
+                AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {allFiles.Length} 个文件 (非压缩包: {nonArchiveFiles.Length})", ConsoleColor.Gray);
 
-                // 触发条件：恰好一个子目录且没有其他文件
-                if (subDirs.Length != 1 || files.Length > 0)
+                // 触发条件：恰好一个子目录且没有非压缩包文件
+                if (subDirs.Length != 1 || nonArchiveFiles.Length > 0)
                 {
                     if (subDirs.Length != 1)
                         AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 子目录数量不为1 ({subDirs.Length})，跳过扁平化", ConsoleColor.Gray);
-                    if (files.Length > 0)
-                        AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 存在 {files.Length} 个文件，跳过扁平化", ConsoleColor.Gray);
+                    if (nonArchiveFiles.Length > 0)
+                        AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 存在 {nonArchiveFiles.Length} 个非压缩包文件，跳过扁平化", ConsoleColor.Gray);
                     return;
                 }
 
@@ -2416,7 +2419,7 @@ namespace AutoUnpackTool
                 Directory.Move(childDir, tempPath);
                 AppendLog($"[批量智能路径]   已移动: {Path.GetFileName(childDir)} -> {tempName}", ConsoleColor.Gray);
 
-                // 步骤2: 删除空的父目录
+                // 步骤2: 删除空的父目录（可能因残留压缩包而失败，不阻断流程）
                 if (Directory.Exists(parentDir))
                 {
                     try
@@ -2426,8 +2429,8 @@ namespace AutoUnpackTool
                     }
                     catch (Exception deleteEx)
                     {
-                        AppendLog($"[批量智能路径] ⚠ 删除失败: {deleteEx.Message}", ConsoleColor.Yellow);
-                        return;
+                        // 目录非空（分卷等残留文件），记录警告并继续，后续 HandleOriginalFile 会清理
+                        AppendLog($"[批量智能路径] ⚠ 父目录未空，跳过删除: {deleteEx.Message}", ConsoleColor.Yellow);
                     }
                 }
 
