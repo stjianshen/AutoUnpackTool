@@ -143,9 +143,9 @@ namespace AutoUnpackTool
         /// <summary>
         /// 是否保留解压出的子压缩包。false 时子压缩包一律清理（不受 FileAfterExtract 影响）。
         /// </summary>
-        public bool KeepChildArchives { get; set; } = true;
+        public bool KeepChildArchives { get; set; } = false;
         public OutputMode OutputMode { get; set; } = OutputMode.SpecificDir;
-        public ExtractMode ExtractMode { get; set; } = ExtractMode.Manual;
+        public ExtractMode ExtractMode { get; set; } = ExtractMode.Auto;
         public bool ShowCliWindow { get; set; } = false; // 是否显示CLI窗口
         
         /// <summary>
@@ -161,13 +161,13 @@ namespace AutoUnpackTool
         /// <summary>
         /// 是否启用智能路径处理（解压后自动扁平化多层嵌套文件夹）
         /// </summary>
-        public bool EnableSmartPathProcessing { get; set; } = false;
+        public bool EnableSmartPathProcessing { get; set; } = true;
 
         /// <summary>
         /// 是否启用隐写文件探测（MP4/MKV 等容器内嵌压缩包）
-        /// 默认关闭以减少扫描开销
+        /// 默认开启以检测视频文件中的隐藏压缩包
         /// </summary>
-        public bool EnableStegoDetection { get; set; } = false;
+        public bool EnableStegoDetection { get; set; } = true;
 
         /// <summary>
         /// 隐写探测文件大小下限（MB），低于该值不做隐写探测
