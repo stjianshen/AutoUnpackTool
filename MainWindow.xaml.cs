@@ -33,6 +33,7 @@ namespace AutoUnpackTool
         private CancellationTokenSource? _globalCancellationTokenSource; // 全局取消令牌，用于清空时终止所有操作
         private bool _isTesting = false;
         private bool _isExtracting = false;
+        private bool _isMonitoring = false;
         
         // 任务完成信号
         private TaskCompletionSource<bool> _testCompletionSource = new();
@@ -134,12 +135,12 @@ namespace AutoUnpackTool
                     // 判断是文件还是文件夹
                     if (File.Exists(path))
                     {
-                        // 处理单个文件
+                        // 处理单个文件：只处理该文件及其分卷，不扫描同级目录的其他压缩文件
                         ProcessSingleFile(path, ref addedCount, newFileItems);
                     }
                     else if (Directory.Exists(path))
                     {
-                        // 处理文件夹：扫描文件夹下的所有压缩文件
+                        // 处理文件夹：只扫描该文件夹内部（包括子文件夹），不处理同级目录的其他文件或文件夹
                         AppendLog($"检测到文件夹: {path}", ConsoleColor.Cyan);
                         ScanDirectoryForArchives(path, ref addedCount, newFileItems);
                     }
@@ -200,6 +201,7 @@ namespace AutoUnpackTool
 
         /// <summary>
         /// 处理单个文件（包括黑名单检查和分卷检测）
+        /// 注意：只处理当前文件及其分卷，不扫描同级目录的其他压缩文件
         /// </summary>
         private void ProcessSingleFile(string filePath, ref int addedCount, List<FileItem>? newFileItems = null)
         {
@@ -213,7 +215,7 @@ namespace AutoUnpackTool
             // 检测是否为压缩文件
             if (IsArchiveFile(filePath))
             {
-                // 如果是分卷压缩包，自动检测所有分卷
+                // 如果是分卷压缩包，自动检测所有分卷（仅在同级目录中查找分卷文件）
                 if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(filePath))
                 {
                     var volumeInfo = DetectMultiVolumeArchive(filePath);
@@ -264,12 +266,13 @@ namespace AutoUnpackTool
 
         /// <summary>
         /// 递归扫描文件夹中的压缩文件
+        /// 注意：只扫描指定文件夹内部（包括子文件夹），不处理同级目录的其他文件或文件夹
         /// </summary>
         private void ScanDirectoryForArchives(string directoryPath, ref int addedCount, List<FileItem>? newFileItems = null)
         {
             try
             {
-                // 获取文件夹中的所有文件
+                // 获取文件夹中的所有文件（包括子文件夹）
                 string[] files = Directory.GetFiles(directoryPath, "*.*", SearchOption.AllDirectories);
                 
                 AppendLog($"正在扫描文件夹: {directoryPath}", ConsoleColor.Gray);
@@ -422,10 +425,35 @@ namespace AutoUnpackTool
 
         private async void BtnStartExtract_Click(object? sender, RoutedEventArgs e)
         {
-            // 自动模式下此按钮应被禁用，这里作为防御性编程
+            // 自动模式下，检查是否有待处理的任务需要继续
             if (_settings.ExtractMode == ExtractMode.Auto)
             {
-                AppendLog("自动模式下无需点击此按钮", ConsoleColor.Yellow);
+                bool needTestThread = !_isTesting && !_pendingQueue.IsEmpty;
+                bool needExtractThread = !_isExtracting && !_extractQueue.IsEmpty;
+
+                if (!needTestThread && !needExtractThread)
+                {
+                    if (_isTesting || _isExtracting)
+                        AppendLog("处理流程已在运行中...", ConsoleColor.Yellow);
+                    else
+                        AppendLog("队列为空，等待新文件...", ConsoleColor.Gray);
+                    return;
+                }
+
+                AppendLog("继续处理剩余任务...", ConsoleColor.Cyan);
+
+                if (needTestThread && needExtractThread)
+                {
+                    StartDualQueueProcessing();
+                }
+                else if (needTestThread)
+                {
+                    WakeupTestThread();
+                }
+                else
+                {
+                    WakeupExtractThread();
+                }
                 return;
             }
 
@@ -628,16 +656,38 @@ namespace AutoUnpackTool
             // 如果正在测试密码，取消测试
             if (_isTesting && _testCancellationTokenSource != null)
             {
-                AppendLog("\n正在取消密码测试...", ConsoleColor.Yellow);
-                _testCancellationTokenSource.Cancel();
+                AppendLog("\n正在暂停密码测试...", ConsoleColor.Yellow);
+                
+                // 立即更新UI状态，不需要等待线程退出
+                _isTesting = false;
+                
+                // 取消并清理token source，防止启动新线程时冲突
+                var oldTokenSource = _testCancellationTokenSource;
+                _testCancellationTokenSource = null;
+                oldTokenSource.Cancel();
+                oldTokenSource.Dispose();
+                
+                UpdateUiState();
+                AppendLog("测试已暂停。点击'开始解压'可继续处理", ConsoleColor.Cyan);
                 return;
             }
 
             // 如果正在解压，取消解压
             if (_isExtracting && _extractCancellationTokenSource != null)
             {
-                AppendLog("\n正在取消解压操作...", ConsoleColor.Yellow);
-                _extractCancellationTokenSource.Cancel();
+                AppendLog("\n正在暂停解压操作...", ConsoleColor.Yellow);
+                
+                // 立即更新UI状态，不需要等待线程退出
+                _isExtracting = false;
+                
+                // 取消并清理token source，防止启动新线程时冲突
+                var oldTokenSource = _extractCancellationTokenSource;
+                _extractCancellationTokenSource = null;
+                oldTokenSource.Cancel();
+                oldTokenSource.Dispose();
+                
+                UpdateUiState();
+                AppendLog("解压已暂停。点击'开始解压'可继续处理", ConsoleColor.Cyan);
                 return;
             }
         }
@@ -802,8 +852,9 @@ namespace AutoUnpackTool
                 return;
 
             _isTesting = true;
-            _testCancellationTokenSource = new CancellationTokenSource();
-            var token = _testCancellationTokenSource.Token;
+            var tokenSource = new CancellationTokenSource();
+            _testCancellationTokenSource = tokenSource;
+            var token = tokenSource.Token;
 
             try
             {
@@ -875,25 +926,24 @@ namespace AutoUnpackTool
             }
             finally
             {
-                _isTesting = false;
-                _testCancellationTokenSource?.Dispose();
-                _testCancellationTokenSource = null;
-                UpdateUiState();
+                // 只有当前tokenSource仍是自己创建的时才清理（暂停时会置null，新线程会创建新的）
+                if (_testCancellationTokenSource == tokenSource)
+                {
+                    _isTesting = false;
+                    _testCancellationTokenSource?.Dispose();
+                    _testCancellationTokenSource = null;
+                    UpdateUiState();
+                }
+
                 _testCompletionSource.TrySetResult(true);
-                
-                // 测试线程完成后，检查待解压队列是否有内容
-                // 如果有且解压线程不在运行，需要启动解压线程
-                if (!_extractQueue.IsEmpty && !_isExtracting)
+
+                // 测试线程正常完成后，检查待解压队列是否有内容
+                // 如果被取消（暂停），不自动重启解压线程
+                if (!_extractQueue.IsEmpty && !_isExtracting && !token.IsCancellationRequested)
                 {
                     AppendLog("[测试线程] 检测到有待解压文件，但解压线程未运行，重新启动...", ConsoleColor.Cyan);
-                    
-                    // 重置完成信号
                     _extractCompletionSource = new TaskCompletionSource<bool>();
-                    
-                    // 启动解压线程
                     StartExtractThread();
-                    
-                    // 设置信号
                     _extractQueueSignal.Set();
                 }
             }
@@ -1027,8 +1077,9 @@ namespace AutoUnpackTool
                 return;
 
             _isExtracting = true;
-            _extractCancellationTokenSource = new CancellationTokenSource();
-            var token = _extractCancellationTokenSource.Token;
+            var tokenSource = new CancellationTokenSource();
+            _extractCancellationTokenSource = tokenSource;
+            var token = tokenSource.Token;
 
             try
             {
@@ -1122,10 +1173,15 @@ namespace AutoUnpackTool
             }
             finally
             {
-                _isExtracting = false;
-                _extractCancellationTokenSource?.Dispose();
-                _extractCancellationTokenSource = null;
-                UpdateUiState();
+                // 只有当前tokenSource仍是自己创建的时才清理（暂停时会置null，新线程会创建新的）
+                if (_extractCancellationTokenSource == tokenSource)
+                {
+                    _isExtracting = false;
+                    _extractCancellationTokenSource?.Dispose();
+                    _extractCancellationTokenSource = null;
+                    UpdateUiState();
+                }
+
                 _extractCompletionSource.TrySetResult(true);
             }
         }
@@ -1135,6 +1191,9 @@ namespace AutoUnpackTool
         /// </summary>
         private async void MonitorProcessingComplete()
         {
+            if (_isMonitoring)
+                return;
+            _isMonitoring = true;
             try
             {
                 int emptyCheckCount = 0;
@@ -1218,6 +1277,10 @@ namespace AutoUnpackTool
             catch (Exception ex)
             {
                 AppendLog($"监控流程出错: {ex.Message}", ConsoleColor.Red);
+            }
+            finally
+            {
+                _isMonitoring = false;
             }
         }
 
@@ -1304,29 +1367,30 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 顶级解压链完成时：先 await 清理原压缩包（含分卷），再触发批量智能路径。
-        /// 避免 HandleOriginalFile 在首个 await 让出后，与 CheckAndTriggerBatchSmartPathProcessing
-        /// 触发的目录遍历并发，导致分卷仍被占用或回收站移动失败。
+        /// 顶级解压链完成时：先执行批量智能路径处理（解压目录内黑名单清理后再扁平化），再清理原压缩包（含分卷）。
+        /// 这样可以确保 IsExtractedArchiveFolder 能够通过检查父目录下的压缩包文件来识别解压文件夹。
         /// </summary>
         private async Task FinalizeTopLevelExtractAndSmartPathAsync(string topArchivePath)
         {
             try
             {
+                // 先触发批量智能路径处理（扁平化）
+                await Dispatcher.InvokeAsync(() => CheckAndTriggerBatchSmartPathProcessing());
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 触发检查失败: {ex.Message}", ConsoleColor.Red);
+            }
+
+            try
+            {
+                // 再清理原压缩包（移动到回收站等）
                 if (_settings.FileAfterExtract != FileAction.Keep)
                     await HandleOriginalFile(topArchivePath);
             }
             catch (Exception ex)
             {
                 AppendLog($"处理原文件时出错: {ex.Message}", ConsoleColor.Red);
-            }
-
-            try
-            {
-                await Dispatcher.InvokeAsync(() => CheckAndTriggerBatchSmartPathProcessing());
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[批量智能路径] 触发检查失败: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -1501,9 +1565,19 @@ namespace AutoUnpackTool
             });
             AppendLog($"[{leafItem.FileName}] 叶子节点解压完成: {leafItem.Status}", ConsoleColor.Green);
 
-            AppendLog($"[{leafItem.FileName}] 叶子节点解压完成，处理原文件...", ConsoleColor.Cyan);
-            _ = HandleOriginalFileAsync(leafItem.FilePath);
-            UpdateParentStatusWhenChildrenComplete(leafItem);
+            if (leafItem.Parent == null)
+            {
+                // 顶级叶子节点：走统一收尾流程（先智能路径扁平化，再清理原压缩包）
+                AppendLog($"[{leafItem.FileName}] 顶级叶子节点解压完成，触发智能路径处理...", ConsoleColor.Cyan);
+                _ = FinalizeTopLevelExtractAndSmartPathAsync(leafItem.FilePath);
+            }
+            else
+            {
+                // 非顶级叶子节点：清理当前归档，向上汇报完成
+                AppendLog($"[{leafItem.FileName}] 叶子节点解压完成，处理原文件...", ConsoleColor.Cyan);
+                _ = HandleOriginalFileAsync(leafItem.FilePath);
+                UpdateParentStatusWhenChildrenComplete(leafItem);
+            }
         }
 
         /// <summary>
@@ -1511,7 +1585,11 @@ namespace AutoUnpackTool
         /// 注意：此方法只负责扫描和添加文件，不测试密码，不启动解压
         /// 密码测试和解压由 CheckAndTriggerNextRoundExtractAsync 统一处理
         /// </summary>
-        private async Task ScanExtractedFilesForArchives(string outputDir, int taskId, FileItem? parentFileItem = null)
+        /// <param name="outputDir">输出目录</param>
+        /// <param name="taskId">任务ID</param>
+        /// <param name="parentFileItem">父文件项</param>
+        /// <param name="existingFilesBeforeExtract">解压前已存在的文件列表，用于过滤</param>
+        private async Task ScanExtractedFilesForArchives(string outputDir, int taskId, FileItem? parentFileItem = null, HashSet<string>? existingFilesBeforeExtract = null)
         {
             try
             {
@@ -1561,6 +1639,14 @@ namespace AutoUnpackTool
                 
                 // 去重
                 allArchiveFiles = allArchiveFiles.Distinct().ToList();
+
+                // 过滤掉解压前已存在的文件，只保留新解压的文件
+                if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Count > 0)
+                {
+                    var newlyExtractedFiles = allArchiveFiles.Where(f => !existingFilesBeforeExtract.Contains(f)).ToList();
+                    AppendLog($"[线程 {taskId}] [DEBUG] 过滤前: {allArchiveFiles.Count} 个, 过滤后: {newlyExtractedFiles.Count} 个新文件", ConsoleColor.Magenta);
+                    allArchiveFiles = newlyExtractedFiles;
+                }
 
                 AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allArchiveFiles.Count} 个候选压缩文件", ConsoleColor.Magenta);
 
@@ -1844,18 +1930,31 @@ namespace AutoUnpackTool
         {
             Dispatcher.Invoke(() =>
             {
-                // 自动模式下，开始解压按钮应该禁用（因为会自动触发）
                 bool isAutoMode = _settings.ExtractMode == ExtractMode.Auto;
+                bool isProcessing = _isTesting || _isExtracting;
                 
-                // 如果正在测试或解压，禁用开始解压按钮
-                // 如果是自动模式，也禁用开始解压按钮
-                if (_isTesting || _isExtracting || isAutoMode)
+                // 开始解压按钮状态逻辑：
+                // 1. 如果正在处理中，禁用（防止重复启动）
+                // 2. 如果是自动模式但已暂停（不在处理中），启用（允许继续）
+                // 3. 如果是手动模式且未在处理中，启用
+                if (isProcessing)
                 {
                     BtnStartExtract.IsEnabled = false;
                 }
                 else
                 {
+                    // 不在处理中，无论是自动还是手动模式都启用
                     BtnStartExtract.IsEnabled = true;
+                }
+
+                // 暂停/停止按钮：只在处理中时启用
+                if (isProcessing)
+                {
+                    BtnPauseStop.IsEnabled = true;
+                }
+                else
+                {
+                    BtnPauseStop.IsEnabled = false;
                 }
 
                 TxtStatusTestThread.Text = $"测试线程: {(_isTesting ? "工作中" : "空闲")}";
@@ -1995,6 +2094,36 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
+        /// 在智能路径扁平化之前，对解压目录递归删除黑名单匹配的文件（含解压残留的压缩包）。
+        /// 否则同级黑名单文件会导致「恰好一个子目录且无文件」条件不满足而无法扁平化。
+        /// </summary>
+        private void DeleteBlacklistedFilesUnderDirectory(string rootDir)
+        {
+            if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
+                return;
+
+            var patterns = _settings.GetBlacklistPatterns();
+            if (patterns == null || patterns.Count == 0)
+                return;
+
+            try
+            {
+                AppendLog($"[批量智能路径] 扁平化前黑名单清理: {rootDir}", ConsoleColor.Gray);
+                foreach (string file in Directory.GetFiles(rootDir, "*.*", SearchOption.AllDirectories))
+                {
+                    if (!File.Exists(file))
+                        continue;
+                    if (IsBlacklistedFile(file, out string matchedPattern))
+                        DeleteBlacklistedFile(file, matchedPattern);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 扁平化前黑名单扫描失败: {ex.Message}", ConsoleColor.Yellow);
+            }
+        }
+
+        /// <summary>
         /// 批量处理单个输出目录的智能路径扁平化（从叶子节点向上遍历）
         /// </summary>
         private void ProcessSmartPathBatch(string rootDir)
@@ -2003,6 +2132,8 @@ namespace AutoUnpackTool
                 return;
 
             AppendLog($"[批量智能路径] 开始处理: {rootDir}", ConsoleColor.Cyan);
+
+            DeleteBlacklistedFilesUnderDirectory(rootDir);
 
             // 后序遍历：先处理深层嵌套，再处理浅层
             ProcessDirectoryTreePostOrder(rootDir);

@@ -49,6 +49,7 @@ namespace AutoUnpackTool
             TxtThreadsCount.Text = Settings.ThreadCount.ToString();
             ChkShowCliWindow.IsChecked = Settings.ShowCliWindow;
             ChkSmartPathProcessing.IsChecked = Settings.EnableSmartPathProcessing;
+            ChkMultiVolumeDetection.IsChecked = Settings.EnableMultiVolumeDetection;
             ChkStegoDetection.IsChecked = Settings.EnableStegoDetection;
             TxtStegoMinSizeMB.Text = Settings.StegoDetectionMinFileSizeMB.ToString();
             
@@ -247,6 +248,10 @@ namespace AutoUnpackTool
                 
                 // 保存智能路径处理设置
                 Settings.EnableSmartPathProcessing = ChkSmartPathProcessing.IsChecked == true;
+                
+                // 保存分卷检测设置
+                Settings.EnableMultiVolumeDetection = ChkMultiVolumeDetection.IsChecked == true;
+                
                 Settings.EnableStegoDetection = ChkStegoDetection.IsChecked == true;
                 Settings.StegoDetectionMinFileSizeMB = stegoMinSizeMb;
                 

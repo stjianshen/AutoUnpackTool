@@ -110,6 +110,13 @@
             <!-- 文件检测设置 - 可折叠 -->
             <Expander Grid.Row="4" Header="🔍 文件检测设置" IsExpanded="False" Margin="0,0,0,15">
                 <StackPanel Margin="10,10,0,0">
+                    <!-- 分卷压缩检测 -->
+                    <StackPanel Margin="0,0,0,12">
+                        <CheckBox x:Name="ChkMultiVolumeDetection" Content="启用分卷压缩包自动检测" VerticalAlignment="Center"/>
+                        <TextBlock Text="开启后会自动识别并合并分卷文件（如 .7z.001, .part1.rar 等）" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
+                    </StackPanel>
+                    
+                    <!-- 隐写模式探测 -->
                     <StackPanel Margin="0,0,0,12">
                         <CheckBox x:Name="ChkStegoDetection" Content="启用隐写模式探测（MP4/MKV 内嵌压缩包）" VerticalAlignment="Center"/>
                         <TextBlock Text="默认关闭以节省资源；开启后会对视频容器做额外 7z 探测" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
