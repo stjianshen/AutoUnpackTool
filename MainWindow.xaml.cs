@@ -44,6 +44,10 @@ namespace AutoUnpackTool
         
         // 记录所有顶级 FileItem
         private List<FileItem> _topLevelItems = new();
+        
+        // 记录所有解压产生的目录节点（用于扁平化时只处理解压的目录）
+        private HashSet<string> _extractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
+        
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -581,6 +585,7 @@ namespace AutoUnpackTool
             _pendingQueue = new ConcurrentQueue<FileItem>();
             _extractQueue = new ConcurrentQueue<FileItem>();
             _topLevelItems.Clear();
+            _extractedDirectoryNodes.Clear();  // 清空解压目录标记
             TxtLog.Clear();
             
             // 6. 重置状态
@@ -1561,6 +1566,13 @@ namespace AutoUnpackTool
                     // 不在这里立即设置状态，而是根据是否有子节点来决定
                     // 标记自身解压成功
                     fileItem.SetSelfExtractResult(true);
+                    
+                    // 记录解压产生的目录节点（用于扁平化时只处理解压的目录）
+                    if (Directory.Exists(outputDir))
+                    {
+                        _extractedDirectoryNodes.Add(outputDir);
+                        AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记解压目录节点 {outputDir}", ConsoleColor.Gray);
+                    }
 
                     // 从密码映射表中移除已完成处理的文件记录
                     string filePath = fileItem.FilePath;
@@ -2308,7 +2320,7 @@ namespace AutoUnpackTool
         /// 后序遍历目录树，从叶子节点开始处理
         /// 注意：只处理压缩包解压出的文件夹结构，不处理非压缩包（如游戏应用）的原始结构
         /// </summary>
-        private void ProcessDirectoryTreePostOrder(string dirPath)
+        private void ProcessDirectoryTreePostOrder(string dirPath, bool isInExtractedTree = false)
         {
             try
             {
@@ -2319,17 +2331,12 @@ namespace AutoUnpackTool
                     return;
                 }
 
-                // 检查当前目录是否是压缩包解压出来的
-                // 如果不是（即原始文件结构），则不进行扁平化
-                if (!IsExtractedArchiveFolder(dirPath))
-                {
-                    AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 非压缩包解压文件夹，跳过扁平化", ConsoleColor.Gray);
-                    return;
-                }
-
                 AppendLog($"[批量智能路径] [DEBUG] 开始遍历目录: {dirPath}", ConsoleColor.Gray);
 
-                // 1. 先递归处理所有子目录（深度优先）
+                // 检查当前目录是否是被标记的解压目录节点，或者在解压树中
+                bool isExtractedNode = isInExtractedTree || _extractedDirectoryNodes.Contains(dirPath);
+                
+                // 1. 先递归处理所有子目录（深度优先）- 如果在解压树中，子目录也继承这个状态
                 var subDirs = Directory.GetDirectories(dirPath);
                 AppendLog($"[批量智能路径] [DEBUG] 找到 {subDirs.Length} 个子目录", ConsoleColor.Gray);
                 
@@ -2339,7 +2346,7 @@ namespace AutoUnpackTool
                     // 对每个子目录的遍历进行独立异常处理
                     try
                     {
-                        ProcessDirectoryTreePostOrder(subDir);
+                        ProcessDirectoryTreePostOrder(subDir, isExtractedNode);  // 传递解压树状态
                     }
                     catch (Exception subEx)
                     {
@@ -2352,8 +2359,16 @@ namespace AutoUnpackTool
                 // 再次检查目录是否存在（可能子目录处理时被删除）
                 if (Directory.Exists(dirPath))
                 {
-                    AppendLog($"[批量智能路径] [DEBUG] 开始处理当前目录: {Path.GetFileName(dirPath)}", ConsoleColor.Gray);
-                    ProcessSingleDirectoryIfNeeded(dirPath);
+                    // 只有在解压树中的目录才进行扁平化
+                    if (isExtractedNode)
+                    {
+                        AppendLog($"[批量智能路径] [DEBUG] 开始处理当前目录: {Path.GetFileName(dirPath)}", ConsoleColor.Gray);
+                        ProcessSingleDirectoryIfNeeded(dirPath);
+                    }
+                    else
+                    {
+                        AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 非标记的解压节点，跳过扁平化", ConsoleColor.Gray);
+                    }
                 }
             }
             catch (Exception ex)
