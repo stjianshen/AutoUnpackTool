@@ -1512,6 +1512,7 @@ CheckAndTriggerBatchSmartPathProcessing()
     ├─ DeleteBlacklistedFilesUnderDirectory()  // 清黑名单文件
     └─ ProcessDirectoryTreePostOrder()         // 后序遍历扁平化
         ├─ 递归处理所有子目录（深度优先）
+        │   └─ 传递 isInExtractedTree 状态
         └─ ProcessSingleDirectoryIfNeeded()    // 处理当前目录
             ├─ 检查是否符合扁平化条件
             │   ├─ subDirs.Length == 1
@@ -1609,7 +1610,7 @@ private void DeleteBlacklistedFilesUnderDirectory(string rootDir)
 **后序遍历目录树：**
 
 ```csharp
-private void ProcessDirectoryTreePostOrder(string dirPath)
+private void ProcessDirectoryTreePostOrder(string dirPath, bool isInExtractedTree = false)
 {
     try
     {
@@ -1617,20 +1618,16 @@ private void ProcessDirectoryTreePostOrder(string dirPath)
         if (!Directory.Exists(dirPath))
             return;
 
-        // 检查当前目录是否是压缩包解压出来的
-        if (!IsExtractedArchiveFolder(dirPath))
-        {
-            AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 非压缩包解压文件夹，跳过扁平化", ConsoleColor.Gray);
-            return;
-        }
-
-        // 1. 先递归处理所有子目录（深度优先）
+        // 检查当前目录是否是被标记的解压目录节点，或者在解压树中
+        bool isExtractedNode = isInExtractedTree || _extractedDirectoryNodes.Contains(dirPath);
+        
+        // 1. 先递归处理所有子目录（深度优先）- 如果在解压树中，子目录也继承这个状态
         var subDirs = Directory.GetDirectories(dirPath);
         foreach (var subDir in subDirs)
         {
             try
             {
-                ProcessDirectoryTreePostOrder(subDir);
+                ProcessDirectoryTreePostOrder(subDir, isExtractedNode);  // 传递解压树状态
             }
             catch (Exception subEx)
             {
@@ -1642,7 +1639,15 @@ private void ProcessDirectoryTreePostOrder(string dirPath)
         // 2. 处理当前目录（此时子目录已经处理完毕）
         if (Directory.Exists(dirPath))
         {
-            ProcessSingleDirectoryIfNeeded(dirPath);
+            // 只有在解压树中的目录才进行扁平化
+            if (isExtractedNode)
+            {
+                ProcessSingleDirectoryIfNeeded(dirPath);
+            }
+            else
+            {
+                AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 非标记的解压节点，跳过扁平化", ConsoleColor.Gray);
+            }
         }
     }
     catch (Exception ex)
@@ -1652,77 +1657,70 @@ private void ProcessDirectoryTreePostOrder(string dirPath)
 }
 ```
 
-**判断是否为压缩包解压文件夹：**
+**关键改进：解压目录标记系统**
 
+**问题背景：**
+- 原方案依赖 `IsExtractedArchiveFolder()` 启发式判断，但存在以下缺陷：
+  - 方法1：检查目录名是否与父目录压缩包匹配 → **子压缩包被删除后无法匹配**
+  - 方法2：检查目录下是否有压缩包文件 → **深层嵌套可能没有压缩包**
+  - 方法3：递归检查子目录 → **也可能失败**
+- 时序问题：程序先删除子压缩包，再进行扁平化，导致无法通过压缩包识别解压文件夹
+
+**解决方案：解压时立即标记输出目录**
+
+1. **数据结构**：
 ```csharp
-private bool IsExtractedArchiveFolder(string dirPath)
-{
-    try
-    {
-        string dirName = Path.GetFileName(dirPath);
-        string? parentDir = Path.GetDirectoryName(dirPath);
-        
-        if (string.IsNullOrEmpty(parentDir) || !Directory.Exists(parentDir))
-            return false;
+// 记录所有解压产生的目录节点（用于扁平化时只处理解压的目录）
+private HashSet<string> _extractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
+```
 
-        var archiveExtensions = _settings.GetArchiveExtensions();
-        
-        // 方法1：检查目录名是否与某个压缩包文件名匹配（去掉扩展名后）
-        var parentFiles = Directory.GetFiles(parentDir);
-        foreach (var file in parentFiles)
-        {
-            string fileName = Path.GetFileNameWithoutExtension(file);
-            
-            // 检查是否是分卷压缩包
-            bool isVolumeArchive = IsMultiVolumeArchive(file);
-            
-            // 获取压缩包的基础名称（去掉所有扩展名）
-            string baseName = fileName;
-            
-            if (isVolumeArchive)
-            {
-                // 对于 .7z.001 这样的文件，fileName 是 "bb.7z"
-                // 需要进一步去掉 .7z
-                foreach (var ext in archiveExtensions.OrderByDescending(x => x.Length))
-                {
-                    if (baseName.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
-                    {
-                        baseName = baseName.Substring(0, baseName.Length - ext.Length);
-                        break;
-                    }
-                }
-            }
-            
-            // 检查目录名是否匹配
-            if (dirName.Equals(baseName, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        
-        // 方法2：如果目录下有压缩包，则认为这是压缩包解压出的文件夹
-        var files = Directory.GetFiles(dirPath);
-        foreach (var file in files)
-        {
-            if (IsArchiveFile(file))
-                return true;
-        }
-        
-        // 方法3：递归检查子目录
-        var subDirs = Directory.GetDirectories(dirPath);
-        foreach (var subDir in subDirs)
-        {
-            if (IsExtractedArchiveFolder(subDir))
-                return true;
-        }
-        
-        return false;
-    }
-    catch
+2. **标记时机**（解压成功后立即标记）：
+```csharp
+// 在 ExtractFileWithSevenZip 方法中
+if (result.Success)
+{
+    string outputDir = GetOutputDirectory(fileItem.FilePath);
+    
+    // 标记解压产生的目录节点（在删除子压缩包之前）
+    if (Directory.Exists(outputDir))
     {
-        // 如果检查失败，默认不进行扁平化（安全优先）
-        return false;
+        _extractedDirectoryNodes.Add(outputDir);
+        AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记解压目录节点 {outputDir}", ConsoleColor.Gray);
     }
+    
+    // ... 后续处理（包括删除子压缩包）
 }
 ```
+
+3. **使用标记**（扁平化时只处理标记的节点及其子树）：
+```csharp
+// 检查当前目录是否是被标记的解压目录节点，或者在解压树中
+bool isExtractedNode = isInExtractedTree || _extractedDirectoryNodes.Contains(dirPath);
+
+// 递归处理子目录时传递状态
+ProcessDirectoryTreePostOrder(subDir, isExtractedNode);
+
+// 只有被标记的节点才进行扁平化
+if (isExtractedNode)
+{
+    ProcessSingleDirectoryIfNeeded(dirPath);
+}
+```
+
+4. **清空操作**：
+```csharp
+// 在清空日志和重置状态时
+_extractedDirectoryNodes.Clear();
+```
+
+**优势：**
+- ✅ **时序安全**：在删除子压缩包之前就已标记，不受删除操作影响
+- ✅ **精确识别**：基于实际解压操作标记，而非启发式猜测
+- ✅ **避免误处理**：只处理真正由解压产生的目录结构，不会误处理应用程序的原始目录
+- ✅ **状态传递**：通过 `isInExtractedTree` 参数确保整个解压树都被正确处理
+- ✅ **性能优化**：HashSet 查找时间复杂度 O(1)，快速判断是否为解压节点
+
+
 
 **决定最终文件夹名称：**
 
