@@ -234,6 +234,8 @@ namespace AutoUnpackTool
                         Directory.CreateDirectory(outputDir);
                     }
 
+                    // 注意：-t# 参数用于隐写模式（hash type mode），它会将视频容器当作压缩包处理
+                    // 使用 -x 命令解压到指定目录
                     var arguments = $"x \"{archivePath}\" -o\"{outputDir}\" -y -sccUTF-8";
                     if (useHashTypeMode)
                     {
