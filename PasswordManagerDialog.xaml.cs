@@ -12,14 +12,16 @@ namespace AutoUnpackTool
     public partial class PasswordManagerDialog : Window
     {
         private ObservableCollection<PasswordItem> _passwordList = new ObservableCollection<PasswordItem>();
+        private ObservableCollection<PasswordItem> _filteredPasswordList = new ObservableCollection<PasswordItem>();
         private AppSettings _settings;
         private bool _isDirty = false;
+        private string _searchText = "";
 
         public PasswordManagerDialog(AppSettings settings)
         {
             InitializeComponent();
             _settings = settings;
-            DgPasswords.ItemsSource = _passwordList;
+            DgPasswords.ItemsSource = _filteredPasswordList; // 使用过滤后的列表
 
             // 加载密码
             LoadPasswords();
@@ -28,6 +30,12 @@ namespace AutoUnpackTool
             TxtPasswordFilePath.Text = string.IsNullOrEmpty(_settings.PasswordFilePath) 
                 ? "未设置（使用默认密码）" 
                 : _settings.PasswordFilePath;
+
+            // 绑定选择变化事件以更新选中计数
+            DgPasswords.SelectionChanged += DgPasswords_SelectionChanged;
+            
+            // 绑定键盘事件以支持Ctrl+A
+            DgPasswords.PreviewKeyDown += DgPasswords_PreviewKeyDown;
         }
 
         private void LoadPasswords()
@@ -64,6 +72,9 @@ namespace AutoUnpackTool
 
             // 重新编号
             ReindexPasswords();
+            
+            // 应用搜索过滤
+            ApplySearchFilter();
         }
 
         private void ReindexPasswords()
@@ -72,6 +83,218 @@ namespace AutoUnpackTool
             {
                 _passwordList[i].Index = i + 1;
             }
+        }
+
+        /// <summary>
+        /// 应用搜索过滤
+        /// </summary>
+        private void ApplySearchFilter()
+        {
+            _filteredPasswordList.Clear();
+            
+            if (string.IsNullOrWhiteSpace(_searchText))
+            {
+                // 没有搜索文本，显示所有密码
+                foreach (var item in _passwordList)
+                {
+                    _filteredPasswordList.Add(item);
+                }
+            }
+            else
+            {
+                // 根据搜索文本过滤
+                foreach (var item in _passwordList)
+                {
+                    if (item.Password.IndexOf(_searchText, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        item.Type.IndexOf(_searchText, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        _filteredPasswordList.Add(item);
+                    }
+                }
+            }
+            
+            // 更新选中计数
+            UpdateSelectedCount();
+        }
+
+        /// <summary>
+        /// 搜索文本变化事件
+        /// </summary>
+        private void TxtSearch_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            _searchText = TxtSearch.Text.Trim();
+            ApplySearchFilter();
+        }
+
+        /// <summary>
+        /// 清除搜索
+        /// </summary>
+        private void BtnClearSearch_Click(object sender, RoutedEventArgs e)
+        {
+            TxtSearch.Clear();
+            _searchText = "";
+            ApplySearchFilter();
+        }
+
+        /// <summary>
+        /// 全选
+        /// </summary>
+        private void BtnSelectAll_Click(object sender, RoutedEventArgs e)
+        {
+            DgPasswords.SelectAll();
+            UpdateSelectedCount();
+        }
+
+        /// <summary>
+        /// 反选
+        /// </summary>
+        private void BtnInvertSelection_Click(object sender, RoutedEventArgs e)
+        {
+            var selectedItems = new List<PasswordItem>(DgPasswords.SelectedItems.Cast<PasswordItem>());
+            
+            // 先取消所有选择
+            DgPasswords.UnselectAll();
+            
+            // 选择之前未选中的项
+            foreach (var item in _filteredPasswordList)
+            {
+                if (!selectedItems.Contains(item))
+                {
+                    DgPasswords.SelectedItems.Add(item);
+                }
+            }
+            
+            UpdateSelectedCount();
+        }
+
+        /// <summary>
+        /// 批量删除选中项
+        /// </summary>
+        private void BtnBatchDelete_Click(object sender, RoutedEventArgs e)
+        {
+            if (DgPasswords.SelectedItems.Count == 0)
+            {
+                MessageBox.Show("请先选择要删除的密码！", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var result = MessageBox.Show($"确定要删除选中的 {DgPasswords.SelectedItems.Count} 个密码吗？", 
+                "确认删除", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                
+            if (result != MessageBoxResult.Yes)
+                return;
+
+            // 收集要删除的项
+            var itemsToDelete = new List<PasswordItem>(DgPasswords.SelectedItems.Cast<PasswordItem>());
+            
+            bool hasPermanentDeleted = false;
+            
+            foreach (var item in itemsToDelete)
+            {
+                if (item.Type == "一次性")
+                {
+                    _settings.RemoveOneTimePassword(item.Password);
+                }
+                else
+                {
+                    // 从配置文件中删除永久密码
+                    _settings.RemovePermanentPassword(item.Password);
+                    hasPermanentDeleted = true;
+                }
+
+                _passwordList.Remove(item);
+                _isDirty = true;
+            }
+
+            // 如果有永久密码被删除，立即保存到配置文件（带备份）
+            if (hasPermanentDeleted)
+            {
+                SaveSettingsWithBackup();
+            }
+
+            ReindexPasswords();
+            ApplySearchFilter(); // 重新应用过滤
+            
+            MessageBox.Show($"已删除 {itemsToDelete.Count} 个密码！", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        /// <summary>
+        /// DataGrid选择变化事件
+        /// </summary>
+        private void DgPasswords_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            UpdateSelectedCount();
+        }
+
+        /// <summary>
+        /// DataGrid键盘事件 - 支持Ctrl+A全选
+        /// </summary>
+        private void DgPasswords_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            // 检测Ctrl+A组合键
+            if (e.Key == System.Windows.Input.Key.A && 
+                (System.Windows.Input.Keyboard.Modifiers & System.Windows.Input.ModifierKeys.Control) == System.Windows.Input.ModifierKeys.Control)
+            {
+                BtnSelectAll_Click(null, null);
+                e.Handled = true; // 阻止默认行为
+            }
+        }
+
+        /// <summary>
+        /// 更新选中计数显示
+        /// </summary>
+        private void UpdateSelectedCount()
+        {
+            TxtSelectedCount.Text = $"已选择: {DgPasswords.SelectedItems.Count} 项";
+        }
+
+        /// <summary>
+        /// 复制选中的密码到剪贴板
+        /// </summary>
+        private void CopySelectedPasswordsToClipboard()
+        {
+            if (DgPasswords.SelectedItems.Count == 0)
+            {
+                MessageBox.Show("请先选择要复制的密码！", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var selectedItems = DgPasswords.SelectedItems.Cast<PasswordItem>().ToList();
+            
+            // 只提取密码，每行一个
+            var passwords = selectedItems.Select(item => item.Password).ToList();
+            string clipboardText = string.Join(Environment.NewLine, passwords);
+
+            try
+            {
+                System.Windows.Clipboard.SetText(clipboardText);
+                
+                string message = passwords.Count == 1
+                    ? $"已复制 1 个密码到剪贴板"
+                    : $"已复制 {passwords.Count} 个密码到剪贴板";
+                    
+                MessageBox.Show(message, "成功", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"复制到剪贴板失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>
+        /// 右键菜单 - 复制密码
+        /// </summary>
+        private void MenuItem_CopyPassword_Click(object sender, RoutedEventArgs e)
+        {
+            CopySelectedPasswordsToClipboard();
+        }
+
+        /// <summary>
+        /// 批量操作栏 - 复制密码按钮
+        /// </summary>
+        private void BtnCopyPasswords_Click(object sender, RoutedEventArgs e)
+        {
+            CopySelectedPasswordsToClipboard();
         }
 
         private void BtnAddPassword_Click(object sender, RoutedEventArgs e)
@@ -137,11 +360,15 @@ namespace AutoUnpackTool
                 }
                 else
                 {
+                    // 从配置文件中删除永久密码
                     _settings.RemovePermanentPassword(selected.Password);
+                    // 立即保存到配置文件（带备份）
+                    SaveSettingsWithBackup();
                 }
 
                 _passwordList.Remove(selected);
                 ReindexPasswords();
+                ApplySearchFilter(); // 重新应用过滤以刷新显示
                 _isDirty = true;
 
                 MessageBox.Show("密码已删除！", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -378,10 +605,47 @@ namespace AutoUnpackTool
             File.WriteAllLines(filePath, lines);
         }
 
+        /// <summary>
+        /// 保存配置到文件（带备份）
+        /// </summary>
+        private void SaveSettingsWithBackup()
+        {
+            try
+            {
+                // 检查配置文件是否存在
+                string configPath = AppSettings.ConfigFilePath;
+                
+                if (File.Exists(configPath))
+                {
+                    // 创建备份文件路径（只保留一个备份）
+                    string backupPath = configPath + ".backup";
+                    
+                    // 删除旧备份（如果存在）
+                    if (File.Exists(backupPath))
+                    {
+                        File.Delete(backupPath);
+                    }
+                    
+                    // 复制当前配置到备份
+                    File.Copy(configPath, backupPath);
+                    Console.WriteLine($"配置文件已备份: {backupPath}");
+                }
+                
+                // 保存新配置
+                _settings.Save();
+                Console.WriteLine("配置文件已保存");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"保存配置文件失败: {ex.Message}");
+                MessageBox.Show($"保存配置失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
         private void BtnSave_Click(object sender, RoutedEventArgs e)
         {
-            // 保存配置文件（包括密码本文件路径设置）
-            _settings.Save();
+            // 保存配置文件（带备份）
+            SaveSettingsWithBackup();
 
             // 如果有密码更改，保存密码到配置文件
             if (_isDirty)
