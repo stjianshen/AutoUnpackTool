@@ -71,6 +71,12 @@ namespace AutoUnpackTool
         // 记录所有解压产生的目录节点（用于扁平化时只处理解压的目录）
         private HashSet<string> _extractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
         
+        // 记录拖入的文件夹（用于后续智能路径处理，即使没有压缩包）
+        private HashSet<string> _droppedFolders = new(StringComparer.OrdinalIgnoreCase);
+        
+        // 记录已处理的扁平化目录（防止重复处理导致死循环）
+        private HashSet<string> _processedFlattenDirs = new(StringComparer.OrdinalIgnoreCase);
+        
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -172,6 +178,10 @@ namespace AutoUnpackTool
                     {
                         // 处理文件夹：只扫描该文件夹内部（包括子文件夹），不处理同级目录的其他文件或文件夹
                         AppendLog($"检测到文件夹: {path}", ConsoleColor.Cyan);
+                        
+                        // 记录拖入的文件夹，即使没有压缩包也会进行智能路径处理
+                        _droppedFolders.Add(path);
+                        
                         ScanDirectoryForArchives(path, ref addedCount, newFileItems);
                     }
                 }
@@ -203,6 +213,18 @@ namespace AutoUnpackTool
                 else
                 {
                     AppendLog("未检测到压缩文件", ConsoleColor.Yellow);
+                    
+                    // 即使没有压缩包，如果启用了智能路径处理，也应该对拖入的文件夹进行处理
+                    if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
+                    {
+                        AppendLog("虽然没有压缩文件，但将对拖入的文件夹进行智能路径处理", ConsoleColor.Cyan);
+                        foreach (var folder in _droppedFolders)
+                        {
+                            _ = Task.Run(() => ProcessSmartPathBatchAsync(folder));
+                        }
+                        // 处理完后清空记录
+                        _droppedFolders.Clear();
+                    }
                 }
             }
         }
@@ -1370,6 +1392,35 @@ namespace AutoUnpackTool
                 if (_globalCancellationTokenSource?.Token.IsCancellationRequested != true)
                 {
                     AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
+                    
+                    // 对拖入的文件夹进行智能路径处理（即使没有压缩包）
+                    if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
+                    {
+                        AppendLog($"[智能路径] 开始处理拖入的文件夹（{_droppedFolders.Count} 个）...", ConsoleColor.Cyan);
+                        
+                        // 使用 Task.Run 在后台处理，不阻塞主流程
+                        var folders = _droppedFolders.ToList();
+                        _droppedFolders.Clear();
+                        
+                        _ = Task.Run(async () =>
+                        {
+                            foreach (var folder in folders)
+                            {
+                                if (Directory.Exists(folder))
+                                {
+                                    try
+                                    {
+                                        AppendLog($"[智能路径] 处理拖入的文件夹: {folder}", ConsoleColor.Cyan);
+                                        await ProcessSmartPathBatchAsync(folder);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        AppendLog($"[智能路径] 处理文件夹失败 {folder}: {ex.Message}", ConsoleColor.Red);
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
             }
             catch (Exception ex)
@@ -1469,6 +1520,12 @@ namespace AutoUnpackTool
         /// </summary>
         private async Task CleanupChildArchivesInTree()
         {
+            // 【关键修复】先等待所有子压缩包解压完成，再执行清理
+            // 避免竞态条件：子压缩包还在解压时就被判断为"解压失败"
+            AppendLog($"  等待所有子压缩包解压完成...", ConsoleColor.Gray);
+            await WaitForAllChildrenExtractComplete();
+            AppendLog($"  所有子压缩包已解压完成", ConsoleColor.Gray);
+            
             var allItems = CollectAllFileItems(_fileList);
             foreach (var item in allItems)
             {
@@ -1495,6 +1552,50 @@ namespace AutoUnpackTool
                     AppendLog($"  清理子压缩包失败 [{item.FileName}]: {ex.Message}", ConsoleColor.Red);
                 }
             }
+        }
+        
+        /// <summary>
+        /// 等待所有子压缩包解压完成
+        /// 通过轮询检查所有有父节点的FileItem，确保它们的解压状态已设置
+        /// </summary>
+        private async Task WaitForAllChildrenExtractComplete()
+        {
+            const int maxWaitSeconds = 30; // 最多等待30秒
+            const int checkInterval = 500; // 每500ms检查一次
+            
+            int waitedMs = 0;
+            while (waitedMs < maxWaitSeconds * 1000)
+            {
+                var allItems = CollectAllFileItems(_fileList);
+                bool allChildrenDone = true;
+                
+                foreach (var item in allItems)
+                {
+                    // 跳过顶级节点
+                    if (item.Parent == null)
+                        continue;
+                    
+                    // 检查子节点是否有解压状态（SetSelfExtractResult已被调用）
+                    // 如果解压还在进行中，_selfExtractSuccess会是false（默认值）
+                    // 我们需要区分"还在解压中"和"解压失败"
+                    // 通过检查Status来判断：如果Status包含"正在解压"说明还在进行中
+                    if (item.Status.Contains("正在解压"))
+                    {
+                        allChildrenDone = false;
+                        break;
+                    }
+                }
+                
+                if (allChildrenDone)
+                {
+                    return; // 所有子节点都已完成（成功或失败）
+                }
+                
+                await Task.Delay(checkInterval);
+                waitedMs += checkInterval;
+            }
+            
+            AppendLog($"  警告：等待子压缩包完成超时({maxWaitSeconds}秒)，继续执行清理", ConsoleColor.Yellow);
         }
 
         /// <summary>
@@ -1576,6 +1677,10 @@ namespace AutoUnpackTool
                 // 目录可能不为空或有权限问题，忽略
             }
             
+            // 【已移除】状态更新已移至 ProcessSmartPathBatchAsync 完成后执行
+            // 原代码：更新顶级FileItem的状态为“解压完成-扁平化处理完成”
+            // 现在扁平化是异步执行的，需要在扁平化完成后才更新状态
+                    
             AppendLog($"[收尾] 顶级解压链处理完成: {Path.GetFileName(topArchivePath)}", ConsoleColor.Green);
         }
 
@@ -2530,6 +2635,9 @@ namespace AutoUnpackTool
 
             AppendLog($"[批量智能路径] 开始处理: {rootDir}", ConsoleColor.Cyan);
 
+            // 清空已处理标记（每次批量处理都是独立的）
+            _processedFlattenDirs.Clear();
+
             // 步骤1: 清理黑名单文件
             DeleteBlacklistedFilesUnderDirectory(rootDir);
 
@@ -2550,6 +2658,56 @@ namespace AutoUnpackTool
             }
 
             AppendLog($"[批量智能路径] ✓ 处理完成: {Path.GetFileName(rootDir)}", ConsoleColor.Green);
+            
+            // 更新所有相关的FileItem状态为“扁平化处理完成”
+            UpdateSmartPathCompletedStatus(rootDir);
+        }
+
+        /// <summary>
+        /// 更新扁平化处理完成后的FileItem状态
+        /// </summary>
+        private void UpdateSmartPathCompletedStatus(string rootDir)
+        {
+            try
+            {
+                // 找到所有输出目录在 rootDir 下的 FileItem
+                var relatedItems = _fileList.Where(item => 
+                {
+                    string outputPath = GetOutputDirectory(item.FilePath);
+                    return outputPath.Equals(rootDir, StringComparison.OrdinalIgnoreCase) ||
+                           outputPath.StartsWith(rootDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+                }).ToList();
+
+                if (relatedItems.Count == 0)
+                {
+                    AppendLog($"[批量智能路径] [状态更新] 未找到相关的FileItem", ConsoleColor.Gray);
+                    return;
+                }
+
+                AppendLog($"[批量智能路径] [状态更新] 找到 {relatedItems.Count} 个相关的FileItem", ConsoleColor.Gray);
+
+                foreach (var item in relatedItems)
+                {
+                    // 只更新顶级项或状态中包含“解压成功”的项
+                    if (item.Parent == null || item.Status.Contains("解压成功"))
+                    {
+                        var passwordInfo = item.FoundPassword != null 
+                            ? $" (密码: {item.FoundPassword})" 
+                            : " (无密码)";
+                        
+                        Dispatcher.Invoke(() =>
+                        {
+                            item.Status = $"解压完成-扁平化处理完成{passwordInfo}";
+                        });
+                        
+                        AppendLog($"[{item.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] [状态更新] 失败: {ex.Message}", ConsoleColor.Red);
+            }
         }
 
         /// <summary>
@@ -2564,6 +2722,14 @@ namespace AutoUnpackTool
                 if (!Directory.Exists(dirPath))
                 {
                     AppendLog($"[批量智能路径] 目录已不存在，跳过: {dirPath}", ConsoleColor.Gray);
+                    return;
+                }
+
+                // 防止重复处理同一个目录（避免死循环）
+                string normalizedPath = Path.GetFullPath(dirPath).TrimEnd(Path.DirectorySeparatorChar);
+                if (_processedFlattenDirs.Contains(normalizedPath))
+                {
+                    AppendLog($"[批量智能路径] [DEBUG] 目录已处理过，跳过: {Path.GetFileName(dirPath)}", ConsoleColor.Gray);
                     return;
                 }
 
@@ -2600,6 +2766,9 @@ namespace AutoUnpackTool
                     {
                         AppendLog($"[批量智能路径] [DEBUG] 开始处理当前目录: {Path.GetFileName(dirPath)}", ConsoleColor.Gray);
                         ProcessSingleDirectoryIfNeeded(dirPath);
+                        
+                        // 标记为已处理（防止重复处理）
+                        _processedFlattenDirs.Add(normalizedPath);  // 复用上面定义的 normalizedPath
                     }
                     else
                     {
@@ -2923,8 +3092,32 @@ namespace AutoUnpackTool
                 string tempName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{finalName}";
                 string tempPath = Path.Combine(parentDirPath, tempName);
 
-                Directory.Move(childDir, tempPath);
-                AppendLog($"[批量智能路径]   已移动: {Path.GetFileName(childDir)} -> {tempName}", ConsoleColor.Gray);
+                // 添加重试机制，防止文件占用导致卡住
+                int retryCount = 0;
+                const int maxRetries = 3;
+                bool moveSuccess = false;
+                
+                while (retryCount < maxRetries && !moveSuccess)
+                {
+                    try
+                    {
+                        Directory.Move(childDir, tempPath);
+                        moveSuccess = true;
+                        AppendLog($"[批量智能路径]   已移动: {Path.GetFileName(childDir)} -> {tempName}", ConsoleColor.Gray);
+                    }
+                    catch (IOException ioEx) when (retryCount < maxRetries - 1)
+                    {
+                        retryCount++;
+                        AppendLog($"[批量智能路径] ⚠ 移动失败（文件占用？），重试 {retryCount}/{maxRetries}: {ioEx.Message}", ConsoleColor.Yellow);
+                        Thread.Sleep(500); // 等待500ms后重试
+                    }
+                }
+                
+                if (!moveSuccess)
+                {
+                    AppendLog($"[批量智能路径] ✗ 移动失败，跳过扁平化: {Path.GetFileName(childDir)}", ConsoleColor.Red);
+                    return;
+                }
 
                 // 步骤2: 删除空的父目录（可能因残留压缩包而失败，不阻断流程）
                 if (Directory.Exists(parentDir))
@@ -2960,8 +3153,57 @@ namespace AutoUnpackTool
                     AppendLog($"[批量智能路径]   已删除已存在的目录: {finalName}", ConsoleColor.Gray);
                 }
 
-                Directory.Move(tempPath, finalPath);
-                AppendLog($"[批量智能路径]   ✓ 扁平化完成: {finalName}", ConsoleColor.Green);
+                // 添加重试机制，防止文件占用导致卡住
+                retryCount = 0;
+                moveSuccess = false;
+                
+                while (retryCount < maxRetries && !moveSuccess)
+                {
+                    try
+                    {
+                        Directory.Move(tempPath, finalPath);
+                        moveSuccess = true;
+                        AppendLog($"[批量智能路径]   ✓ 扁平化完成: {finalName}", ConsoleColor.Green);
+                    }
+                    catch (IOException ioEx) when (retryCount < maxRetries - 1)
+                    {
+                        retryCount++;
+                        AppendLog($"[批量智能路径] ⚠ 重命名失败（文件占用？），重试 {retryCount}/{maxRetries}: {ioEx.Message}", ConsoleColor.Yellow);
+                        Thread.Sleep(500); // 等待500ms后重试
+                    }
+                }
+                
+                if (!moveSuccess)
+                {
+                    AppendLog($"[批量智能路径] ✗ 重命名失败，保留临时目录: {tempName}", ConsoleColor.Red);
+                    
+                    // 尝试清理：将临时目录重命名回原始位置，避免残留
+                    try
+                    {
+                        if (Directory.Exists(tempPath) && !Directory.Exists(childDir))
+                        {
+                            Directory.Move(tempPath, childDir);
+                            AppendLog($"[批量智能路径]   已恢复临时目录到原始位置", ConsoleColor.Yellow);
+                        }
+                    }
+                    catch (Exception restoreEx)
+                    {
+                        AppendLog($"[批量智能路径]  恢复临时目录失败: {restoreEx.Message}", ConsoleColor.Yellow);
+                    }
+                    
+                    return;
+                }
+
+                // 步骤4: 扁平化后，重新处理新生成的目录（可能仍满足扁平化条件）
+                if (Directory.Exists(finalPath))
+                {
+                    // 清除旧目录的已处理标记（因为目录结构已经改变）
+                    string normalizedOldPath = Path.GetFullPath(parentDir).TrimEnd(Path.DirectorySeparatorChar);
+                    _processedFlattenDirs.Remove(normalizedOldPath);
+                    
+                    AppendLog($"[批量智能路径] [DEBUG] 扁平化后重新处理: {finalName}", ConsoleColor.Gray);
+                    ProcessDirectoryTreePostOrder(finalPath, true);  // 标记为解压树中的节点
+                }
             }
             catch (Exception ex)
             {
@@ -3986,21 +4228,20 @@ namespace AutoUnpackTool
                             // 普通文件：移动到回收站
                             bool success = false;
                             int retryCount = 3;
-                            int waitInterval = 1000; // 每次等待1秒（符合规范）
                                                     
                             for (int i = 0; i < retryCount; i++)
                             {
-                                // 尝试等待文件解锁（每次等待5秒，符合规范）
-                                AppendLog($"  [{i + 1}/{retryCount}] 检查文件占用状态: {Path.GetFileName(filePath)}", ConsoleColor.Gray);
+                                // 尝试等待文件解锁（每次等待5秒）
                                 bool unlocked = await WaitForFileUnlock(filePath, 5000);
-                                
+                                                        
                                 if (!unlocked)
                                 {
-                                    AppendLog($"  原文件仍在占用中，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(waitInterval);
+                                    int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
+                                    AppendLog($"  原文件仍在占用中，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(randomWait);
                                     continue;
                                 }
-
+                            
                                 try
                                 {
                                     // 使用Windows API静默删除到回收站
@@ -4012,14 +4253,16 @@ namespace AutoUnpackTool
                                     }
                                     else
                                     {
-                                        AppendLog($"  删除失败，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                        await Task.Delay(waitInterval);
+                                        int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
+                                        AppendLog($"  删除失败，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                        await Task.Delay(randomWait);
                                     }
                                 }
                                 catch (IOException ex)
                                 {
-                                    AppendLog($"  原文件被占用 ({ex.Message})，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(waitInterval);
+                                    int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
+                                    AppendLog($"  原文件被占用 ({ex.Message})，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(randomWait);
                                 }
                             }
 
@@ -4045,21 +4288,21 @@ namespace AutoUnpackTool
                         {
                             // 普通文件：直接删除
                             bool success = false;
-                            int retryCount = 3;
-                            int waitInterval = 1000; // 每次等待1秒
-                            
+                            int retryCount = 5;  // 增加重试次数到5次
+                                                    
                             for (int i = 0; i < retryCount; i++)
                             {
-                                // 尝试等待文件解锁（每次等待5秒）
-                                bool unlocked = await WaitForFileUnlock(filePath, 5000);
-                                
+                                // 尝试等待文件解锁（增加等待时间到8秒）
+                                bool unlocked = await WaitForFileUnlock(filePath, 8000);
+                                                        
                                 if (!unlocked)
                                 {
-                                    AppendLog($"  原文件仍在占用中，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(waitInterval);
+                                    int randomWait = Random.Shared.Next(1000, 3001); // 1000-3000ms 随机等待
+                                    AppendLog($"  原文件仍在占用中，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(randomWait);
                                     continue;
                                 }
-
+                            
                                 try
                                 {
                                     await Task.Run(() => File.Delete(filePath));
@@ -4068,8 +4311,9 @@ namespace AutoUnpackTool
                                 }
                                 catch (IOException ex)
                                 {
-                                    AppendLog($"  原文件被占用 ({ex.Message})，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(waitInterval);
+                                    int randomWait = Random.Shared.Next(1000, 3001); // 1000-3000ms 随机等待
+                                    AppendLog($"  原文件被占用 ({ex.Message})，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(randomWait);
                                 }
                             }
 
@@ -4079,7 +4323,8 @@ namespace AutoUnpackTool
                             }
                             else
                             {
-                                AppendLog($"  删除原文件失败（多次重试后仍被占用）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
+                                AppendLog($"   删除原文件失败（多次重试后仍被占用）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
+                                AppendLog($"  提示：请关闭可能占用该文件的程序（如资源管理器、杀毒软件等），然后手动删除", ConsoleColor.Gray);
                             }
                         }
                         break;
@@ -4126,7 +4371,6 @@ namespace AutoUnpackTool
                     {
                         bool success = false;
                         int retryCount = 3;
-                        int waitInterval = 1000; // 每次等待1秒
                         
                         for (int i = 0; i < retryCount; i++)
                         {
@@ -4135,8 +4379,9 @@ namespace AutoUnpackTool
                             
                             if (!unlocked)
                             {
-                                AppendLog($"  分卷文件仍在占用中，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                await Task.Delay(waitInterval);
+                                int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
+                                AppendLog($"  分卷文件仍在占用中，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                                await Task.Delay(randomWait);
                                 continue;
                             }
 
@@ -4150,14 +4395,16 @@ namespace AutoUnpackTool
                                 }
                                 else
                                 {
-                                    AppendLog($"  删除失败，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(waitInterval);
+                                    int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
+                                    AppendLog($"  删除失败，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                                    await Task.Delay(randomWait);
                                 }
                             }
                             catch (IOException ex)
                             {
-                                AppendLog($"  分卷文件被占用 ({ex.Message})，等待 {waitInterval/1000} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                await Task.Delay(waitInterval);
+                                int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
+                                AppendLog($"  分卷文件被占用 ({ex.Message})，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
+                                await Task.Delay(randomWait);
                             }
                             catch (Exception ex)
                             {
