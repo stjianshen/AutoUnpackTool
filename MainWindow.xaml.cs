@@ -1120,19 +1120,30 @@ namespace AutoUnpackTool
                 if (foundPassword != null)
                 {
                     fileItem.Status = $"密码正确: {foundPassword}";
+                    
+                    // 找到密码，加入待解压队列
+                    _extractQueue.Enqueue(fileItem);
+                    AppendLog($"[{fileItem.FileName}] 已加入待解压队列", ConsoleColor.Gray);
+                    WakeupExtractThread();
                 }
                 else
                 {
-                    fileItem.Status = "无密码";
+                    // 未找到密码，设置失败状态，不加入解压队列
+                    fileItem.Status = "fail-未找到密码";
+                    AppendLog($"[{fileItem.FileName}] 未找到密码，跳过解压", ConsoleColor.Red);
+                    
+                    // 检查父项完成（传入子节点）
+                    if (fileItem.Parent != null)
+                    {
+                        UpdateParentStatusWhenChildrenComplete(fileItem);
+                    }
+                    else
+                    {
+                        // 顶级文件没有找到密码，检查是否有子项需要等待
+                        CheckAndMarkParentComplete(fileItem);
+                    }
                 }
             });
-
-            // 步骤4：将文件加入待解压队列
-            _extractQueue.Enqueue(fileItem);
-            AppendLog($"[{fileItem.FileName}] 已加入待解压队列", ConsoleColor.Gray);
-            
-            // 唤醒解压线程
-            WakeupExtractThread();
 
             await Task.Delay(100, token);
         }
@@ -1457,6 +1468,7 @@ namespace AutoUnpackTool
         /// <summary>
         /// 检查并标记项为完成（如果所有子项都已完成）
         /// 对于顶级文件，如果解压完成且所有子项也完成，则从列表移除
+        /// 如果解压失败（包括未找到密码），则保留在列表中显示失败状态
         /// </summary>
         private void CheckAndMarkParentComplete(FileItem fileItem)
         {
@@ -1468,31 +1480,39 @@ namespace AutoUnpackTool
             }
             else
             {
-                // 没有子项，如果是顶级文件，从列表移除
+                // 没有子项，如果是顶级文件
                 if (fileItem.Parent == null)
                 {
-                    // 只有解压成功时才处理原文件
+                    // 只有解压成功时才处理原文件并从列表移除
                     bool extractSuccess = fileItem.GetSelfExtractResult();
+                    bool isPasswordNotFound = fileItem.Status.Contains("fail-未找到密码");
                     
-                    if (extractSuccess)
+                    if (extractSuccess && !isPasswordNotFound)
                     {
-                        // 处理原文件（移动到回收站/删除等）
+                        // 解压成功，处理原文件（移动到回收站/删除等）
                         // 由于这个方法被多处调用，且都是同步调用，我们使用 fire-and-forget 模式
                         _ = HandleOriginalFileAsync(fileItem.FilePath);
+                        
+                        // 从列表移除
+                        Dispatcher.Invoke(() =>
+                        {
+                            if (_fileList.Contains(fileItem))
+                            {
+                                _fileList.Remove(fileItem);
+                                AppendLog($"[{fileItem.FileName}] 无子压缩包，已从待处理列表移除", ConsoleColor.Gray);
+                            }
+                        });
+                    }
+                    else if (isPasswordNotFound)
+                    {
+                        // 未找到密码，保留在列表中显示失败状态
+                        AppendLog($"[{fileItem.FileName}] 未找到密码，保留在列表中", ConsoleColor.Yellow);
                     }
                     else
                     {
-                        AppendLog($"[{fileItem.FileName}] 解压失败，保留原文件", ConsoleColor.Yellow);
+                        // 解压失败，保留原文件和列表记录
+                        AppendLog($"[{fileItem.FileName}] 解压失败，保留原文件和列表记录", ConsoleColor.Yellow);
                     }
-                    
-                    Dispatcher.Invoke(() =>
-                    {
-                        if (_fileList.Contains(fileItem))
-                        {
-                            _fileList.Remove(fileItem);
-                            AppendLog($"[{fileItem.FileName}] 无子压缩包，已从待处理列表移除", ConsoleColor.Gray);
-                        }
-                    });
                 }
             }
         }
