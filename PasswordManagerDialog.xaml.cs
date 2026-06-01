@@ -139,7 +139,7 @@ namespace AutoUnpackTool
         /// <summary>
         /// 全选
         /// </summary>
-        private void BtnSelectAll_Click(object sender, RoutedEventArgs e)
+        private void BtnSelectAll_Click(object? sender, RoutedEventArgs? e)
         {
             DgPasswords.SelectAll();
             UpdateSelectedCount();
