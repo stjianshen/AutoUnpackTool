@@ -39,7 +39,8 @@ namespace AutoUnpackTool
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern int SHFileOperation(ref SHFILEOPSTRUCT lpFileOp);
 
-        private ObservableCollection<FileItem> _fileList = new ObservableCollection<FileItem>();
+        private RootNode _rootNode = new RootNode { Title = "待解压任务(共0个文件)" };
+        private ObservableCollection<FileItem> _fileList => _rootNode.Children;
         private AppSettings _settings;
         private PasswordMap _passwordMap = new PasswordMap(); // 密码映射表
         
@@ -86,7 +87,7 @@ namespace AutoUnpackTool
         public MainWindow()
         {
             InitializeComponent();
-            LstFiles.ItemsSource = _fileList;
+            LstFiles.ItemsSource = new ObservableCollection<RootNode> { _rootNode };
             
             // 加载设置
             _settings = AppSettings.Load();
@@ -248,6 +249,7 @@ namespace AutoUnpackTool
             };
             _fileList.Add(fileItem);
             addedCount++;
+            UpdateRootNodeTitle();
             
             // 记录新文件
             if (newFileItems != null)
@@ -300,6 +302,7 @@ namespace AutoUnpackTool
                         {
                             _fileList.Add(fileItem);
                             addedCount++;
+                            UpdateRootNodeTitle();
                             
                             // 记录新文件
                             if (newFileItems != null)
@@ -406,6 +409,7 @@ namespace AutoUnpackTool
                                 {
                                     _fileList.Add(fileItem);
                                     addedCount++;
+                                    UpdateRootNodeTitle();
                                     AppendLog($"  已添加分卷压缩包: {mainFileInfo.Name}", ConsoleColor.Cyan);
                                     
                                     // 记录新文件
@@ -618,8 +622,9 @@ namespace AutoUnpackTool
             _pendingQueue = new ConcurrentQueue<FileItem>();
             _extractQueue = new ConcurrentQueue<FileItem>();
             _topLevelItems.Clear();
-            _extractedDirectoryNodes.Clear();  // 清空解压目录标记
+            _extractedDirectoryNodes.Clear();  // 清空觧压目录标记
             TxtLog.Clear();
+            UpdateRootNodeTitle();
             
             // 6. 重置状态
             _isTesting = false;
@@ -1023,12 +1028,17 @@ namespace AutoUnpackTool
         /// </summary>
         private async Task ProcessPendingFile(FileItem fileItem, SevenZipExtractor extractor, List<string> passwords, CancellationToken token)
         {
+            AppendLog($"[DEBUG-测试] ProcessPendingFile 被调用: {fileItem.FileName}, 路径: {fileItem.FilePath}", ConsoleColor.Magenta);
             Dispatcher.Invoke(() => fileItem.Status = "正在测试密码...");
 
             // 步骤1：判断是否是压缩文件
-            if (!IsArchiveFile(fileItem.FilePath))
+            bool isArchive = IsArchiveFile(fileItem.FilePath);
+            AppendLog($"[DEBUG-测试] {fileItem.FileName} IsArchiveFile 结果: {isArchive}", ConsoleColor.Magenta);
+            
+            if (!isArchive)
             {
                 Dispatcher.Invoke(() => fileItem.Status = "非压缩文件，跳过");
+                AppendLog($"[DEBUG-测试] {fileItem.FileName} 被判定为非压缩文件", ConsoleColor.Yellow);
                 
                 // 检查父项完成（传入子节点）
                 if (fileItem.Parent != null)
@@ -1065,11 +1075,15 @@ namespace AutoUnpackTool
                 fileItem.Status = "测试: 无密码";
             });
 
+            AppendLog($"[DEBUG-测试] {fileItem.FileName} 开始无密码测试", ConsoleColor.Cyan);
+            
             bool noPasswordSuccess = await extractor.TestPasswordAsync(
                 fileItem.FilePath, 
                 "", 
                 onOutput: (msg) => { },
                 cancellationToken: token);
+
+            AppendLog($"[DEBUG-测试] {fileItem.FileName} 无密码测试结果: {noPasswordSuccess}", ConsoleColor.Cyan);
 
             if (noPasswordSuccess)
             {
@@ -1078,6 +1092,8 @@ namespace AutoUnpackTool
             else
             {
                 // 步骤3：测试密码本
+                AppendLog($"[DEBUG-测试] {fileItem.FileName} 无密码失败，开始测试密码本 (共{passwords.Count}个密码)", ConsoleColor.Yellow);
+                
                 int testedCount = 0;
                 foreach (var password in passwords)
                 {
@@ -1100,11 +1116,17 @@ namespace AutoUnpackTool
                     if (isValid)
                     {
                         foundPassword = password;
+                        AppendLog($"[DEBUG-测试] {fileItem.FileName} 找到密码: {password}", ConsoleColor.Green);
                         _settings.RecordPasswordUsage(password);
                         break;
                     }
 
                     await Task.Delay(50, token);
+                }
+                
+                if (foundPassword == null)
+                {
+                    AppendLog($"[DEBUG-测试] {fileItem.FileName} 密码本测试完成，未找到密码", ConsoleColor.Red);
                 }
             }
 
@@ -1117,8 +1139,21 @@ namespace AutoUnpackTool
                 fileItem.FoundPassword = foundPassword;
                 TxtStatusCurrentPassword.Text = "测试中的密码: 无";
                 
-                if (foundPassword != null)
+                // 注意：foundPassword 为 null 表示无密码，空字符串也是有效密码
+                // 只有 noPasswordSuccess = false 且密码本测试也失败才算“未找到密码”
+                if (noPasswordSuccess)
                 {
+                    // 无密码测试成功
+                    fileItem.Status = "解压成功(无密码)";
+                    
+                    // 加入待解压队列
+                    _extractQueue.Enqueue(fileItem);
+                    AppendLog($"[{fileItem.FileName}] 无密码测试成功，已加入待解压队列", ConsoleColor.Green);
+                    WakeupExtractThread();
+                }
+                else if (foundPassword != null)
+                {
+                    // 找到密码
                     fileItem.Status = $"密码正确: {foundPassword}";
                     
                     // 找到密码，加入待解压队列
@@ -1404,6 +1439,13 @@ namespace AutoUnpackTool
                 {
                     AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
                     
+                    // 更新状态栏为“未开始”
+                    Dispatcher.Invoke(() =>
+                    {
+                        TxtStatusMain.Text = "状态: 未开始";
+                        TxtStatusMain.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Gray);
+                    });
+                    
                     // 对拖入的文件夹进行智能路径处理（即使没有压缩包）
                     if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
                     {
@@ -1430,6 +1472,12 @@ namespace AutoUnpackTool
                                     }
                                 }
                             }
+                            
+                            // 智能路径处理完成后，更新状态
+                            Dispatcher.Invoke(() =>
+                            {
+                                AppendLog($"[智能路径] 所有拖入文件夹处理完成", ConsoleColor.Green);
+                            });
                         });
                     }
                 }
@@ -4163,6 +4211,7 @@ namespace AutoUnpackTool
                     };
                     _fileList.Add(fileItem);
                     addedCount++;
+                    UpdateRootNodeTitle();
                 }
 
                 if (addedCount > 0)
@@ -4655,14 +4704,107 @@ namespace AutoUnpackTool
         }
 
 
-        private void AppendLog(string message, ConsoleColor color)
+        /// <summary>
+        /// TreeView 选择改变事件 - 显示选中节点及其子节点的日志
+        /// </summary>
+        private void TreeView_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+        {
+            var selectedItem = e.NewValue;
+            
+            List<LogEntry> logsToShow = new List<LogEntry>();
+            
+            if (selectedItem is RootNode rootNode)
+            {
+                // 根节点:显示所有日志
+                logsToShow = rootNode.CollectAllLogs();
+            }
+            else if (selectedItem is FileItem fileItem)
+            {
+                // 文件节点:显示该节点及所有子节点的日志
+                logsToShow = fileItem.CollectAllLogs();
+            }
+            
+            // 显示日志
+            DisplayFilteredLogs(logsToShow);
+        }
+
+        /// <summary>
+        /// 显示过滤后的日志
+        /// </summary>
+        private void DisplayFilteredLogs(List<LogEntry> logs)
         {
             Dispatcher.Invoke(() =>
             {
-                string timestamp = DateTime.Now.ToString("HH:mm:ss");
-                TxtLog.AppendText($"[{timestamp}]--> {message}\r\n");
+                TxtLog.Clear();
+                foreach (var log in logs)
+                {
+                    string timestamp = log.Timestamp.ToString("HH:mm:ss");
+                    TxtLog.AppendText($"[{timestamp}]--> {log.Message}\r\n");
+                }
                 TxtLog.ScrollToEnd();
             });
+        }
+
+        /// <summary>
+        /// 检查 target 是否是 node 或其子孙节点
+        /// </summary>
+        private bool IsNodeOrDescendant(FileItem node, FileItem target)
+        {
+            if (node == target) return true;
+            
+            foreach (var child in node.Children)
+            {
+                if (IsNodeOrDescendant(child, target)) return true;
+            }
+            
+            return false;
+        }
+
+        private void AppendLog(string message, ConsoleColor color, FileItem? targetNode = null)
+        {
+            // 如果指定了目标节点,记录到该节点
+            if (targetNode != null)
+            {
+                targetNode.AddLog(message, color);
+            }
+            
+            // 同时显示到日志窗口(仅当当前选中的是该节点或其父节点时)
+            Dispatcher.Invoke(() =>
+            {
+                var selectedItem = LstFiles.SelectedItem;
+                bool shouldDisplay = false;
+                
+                if (selectedItem is RootNode)
+                {
+                    // 选中根节点,显示所有日志
+                    shouldDisplay = true;
+                }
+                else if (selectedItem is FileItem selectedFileItem && targetNode != null)
+                {
+                    // 检查 targetNode 是否是选中节点或其子节点
+                    shouldDisplay = IsNodeOrDescendant(selectedFileItem, targetNode);
+                }
+                else if (targetNode == null)
+                {
+                    // 系统日志,始终显示
+                    shouldDisplay = true;
+                }
+                
+                if (shouldDisplay)
+                {
+                    string timestamp = DateTime.Now.ToString("HH:mm:ss");
+                    TxtLog.AppendText($"[{timestamp}]--> {message}\r\n");
+                    TxtLog.ScrollToEnd();
+                }
+            });
+        }
+
+        /// <summary>
+        /// 更新根节点标题
+        /// </summary>
+        private void UpdateRootNodeTitle()
+        {
+            _rootNode.UpdateTitle();
         }
 
         #endregion
@@ -4836,6 +4978,130 @@ namespace AutoUnpackTool
             {
                 _isBeingProcessed = false;
             }
+        }
+        
+        // 日志存储
+        private List<LogEntry> _logs = new List<LogEntry>();
+        private readonly object _logLock = new object();
+        
+        /// <summary>
+        /// 节点关联的日志列表
+        /// </summary>
+        public List<LogEntry> Logs
+        {
+            get { lock (_logLock) return new List<LogEntry>(_logs); }
+        }
+        
+        /// <summary>
+        /// 添加日志到当前节点
+        /// </summary>
+        public void AddLog(string message, ConsoleColor color)
+        {
+            lock (_logLock)
+            {
+                _logs.Add(new LogEntry
+                {
+                    Timestamp = DateTime.Now,
+                    Message = message,
+                    Color = color
+                });
+            }
+        }
+        
+        /// <summary>
+        /// 递归收集当前节点及所有子节点的日志
+        /// </summary>
+        public List<LogEntry> CollectAllLogs()
+        {
+            var allLogs = new List<LogEntry>();
+            
+            lock (_logLock)
+            {
+                allLogs.AddRange(_logs);
+            }
+            
+            // 递归收集子节点日志
+            foreach (var child in Children)
+            {
+                allLogs.AddRange(child.CollectAllLogs());
+            }
+            
+            // 按时间排序
+            allLogs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
+            return allLogs;
+        }
+    }
+    
+    /// <summary>
+    /// 日志条目
+    /// </summary>
+    public class LogEntry
+    {
+        public DateTime Timestamp { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public ConsoleColor Color { get; set; }
+    }
+    
+    /// <summary>
+    /// 根节点类
+    /// </summary>
+    public class RootNode : System.ComponentModel.INotifyPropertyChanged
+    {
+        private string _title = string.Empty;
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+        
+        public string Title
+        {
+            get => _title;
+            set
+            {
+                _title = value;
+                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Title)));
+            }
+        }
+        
+        public ObservableCollection<FileItem> Children { get; set; } = new ObservableCollection<FileItem>();
+        
+        public int FileCount
+        {
+            get
+            {
+                int count = 0;
+                foreach (var child in Children)
+                {
+                    count += CountFilesInTree(child);
+                }
+                return count;
+            }
+        }
+        
+        private int CountFilesInTree(FileItem item)
+        {
+            int count = 1;
+            foreach (var child in item.Children)
+            {
+                count += CountFilesInTree(child);
+            }
+            return count;
+        }
+        
+        public void UpdateTitle()
+        {
+            Title = $"待解压任务(共{FileCount}个文件)";
+        }
+        
+        /// <summary>
+        /// 收集所有日志
+        /// </summary>
+        public List<LogEntry> CollectAllLogs()
+        {
+            var allLogs = new List<LogEntry>();
+            foreach (var child in Children)
+            {
+                allLogs.AddRange(child.CollectAllLogs());
+            }
+            allLogs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
+            return allLogs;
         }
     }
     
