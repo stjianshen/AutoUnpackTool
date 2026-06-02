@@ -1028,17 +1028,17 @@ namespace AutoUnpackTool
         /// </summary>
         private async Task ProcessPendingFile(FileItem fileItem, SevenZipExtractor extractor, List<string> passwords, CancellationToken token)
         {
-            AppendLog($"[DEBUG-测试] ProcessPendingFile 被调用: {fileItem.FileName}, 路径: {fileItem.FilePath}", ConsoleColor.Magenta);
+            AppendLog($"[DEBUG-测试] ProcessPendingFile 被调用: {fileItem.FileName}, 路径: {fileItem.FilePath}", ConsoleColor.Magenta, fileItem);
             Dispatcher.Invoke(() => fileItem.Status = "正在测试密码...");
 
             // 步骤1：判断是否是压缩文件
             bool isArchive = IsArchiveFile(fileItem.FilePath);
-            AppendLog($"[DEBUG-测试] {fileItem.FileName} IsArchiveFile 结果: {isArchive}", ConsoleColor.Magenta);
+            AppendLog($"[DEBUG-测试] {fileItem.FileName} IsArchiveFile 结果: {isArchive}", ConsoleColor.Magenta, fileItem);
             
             if (!isArchive)
             {
                 Dispatcher.Invoke(() => fileItem.Status = "非压缩文件，跳过");
-                AppendLog($"[DEBUG-测试] {fileItem.FileName} 被判定为非压缩文件", ConsoleColor.Yellow);
+                AppendLog($"[DEBUG-测试] {fileItem.FileName} 被判定为非压缩文件", ConsoleColor.Yellow, fileItem);
                 
                 // 检查父项完成（传入子节点）
                 if (fileItem.Parent != null)
@@ -1062,7 +1062,7 @@ namespace AutoUnpackTool
                 });
 
                 _extractQueue.Enqueue(fileItem);
-                AppendLog($"[{fileItem.FileName}] 识别为隐写容器，已加入待解压队列（-t#）", ConsoleColor.Cyan);
+                AppendLog($"[{fileItem.FileName}] 识别为隐写容器，已加入待觧压队列（-t#）", ConsoleColor.Cyan, fileItem);
                 WakeupExtractThread();
                 await Task.Delay(100, token);
                 return;
@@ -1075,7 +1075,7 @@ namespace AutoUnpackTool
                 fileItem.Status = "测试: 无密码";
             });
 
-            AppendLog($"[DEBUG-测试] {fileItem.FileName} 开始无密码测试", ConsoleColor.Cyan);
+            AppendLog($"[DEBUG-测试] {fileItem.FileName} 开始无密码测试", ConsoleColor.Cyan, fileItem);
             
             bool noPasswordSuccess = await extractor.TestPasswordAsync(
                 fileItem.FilePath, 
@@ -1083,7 +1083,7 @@ namespace AutoUnpackTool
                 onOutput: (msg) => { },
                 cancellationToken: token);
 
-            AppendLog($"[DEBUG-测试] {fileItem.FileName} 无密码测试结果: {noPasswordSuccess}", ConsoleColor.Cyan);
+            AppendLog($"[DEBUG-测试] {fileItem.FileName} 无密码测试结果: {noPasswordSuccess}", ConsoleColor.Cyan, fileItem);
 
             if (noPasswordSuccess)
             {
@@ -1092,7 +1092,7 @@ namespace AutoUnpackTool
             else
             {
                 // 步骤3：测试密码本
-                AppendLog($"[DEBUG-测试] {fileItem.FileName} 无密码失败，开始测试密码本 (共{passwords.Count}个密码)", ConsoleColor.Yellow);
+                AppendLog($"[DEBUG-测试] {fileItem.FileName} 无密码失败，开始测试密码本 (共{passwords.Count}个密码)", ConsoleColor.Yellow, fileItem);
                 
                 int testedCount = 0;
                 foreach (var password in passwords)
@@ -1116,7 +1116,7 @@ namespace AutoUnpackTool
                     if (isValid)
                     {
                         foundPassword = password;
-                        AppendLog($"[DEBUG-测试] {fileItem.FileName} 找到密码: {password}", ConsoleColor.Green);
+                        AppendLog($"[DEBUG-测试] {fileItem.FileName} 找到密码: {password}", ConsoleColor.Green, fileItem);
                         _settings.RecordPasswordUsage(password);
                         break;
                     }
@@ -1126,7 +1126,7 @@ namespace AutoUnpackTool
                 
                 if (foundPassword == null)
                 {
-                    AppendLog($"[DEBUG-测试] {fileItem.FileName} 密码本测试完成，未找到密码", ConsoleColor.Red);
+                    AppendLog($"[DEBUG-测试] {fileItem.FileName} 密码本测试完成，未找到密码", ConsoleColor.Red, fileItem);
                 }
             }
 
@@ -1148,7 +1148,7 @@ namespace AutoUnpackTool
                     
                     // 加入待解压队列
                     _extractQueue.Enqueue(fileItem);
-                    AppendLog($"[{fileItem.FileName}] 无密码测试成功，已加入待解压队列", ConsoleColor.Green);
+                    AppendLog($"[{fileItem.FileName}] 无密码测试成功，已加入待觧压队列", ConsoleColor.Green, fileItem);
                     WakeupExtractThread();
                 }
                 else if (foundPassword != null)
@@ -1158,14 +1158,14 @@ namespace AutoUnpackTool
                     
                     // 找到密码，加入待解压队列
                     _extractQueue.Enqueue(fileItem);
-                    AppendLog($"[{fileItem.FileName}] 已加入待解压队列", ConsoleColor.Gray);
+                    AppendLog($"[{fileItem.FileName}] 已加入待觧压队列", ConsoleColor.Gray, fileItem);
                     WakeupExtractThread();
                 }
                 else
                 {
                     // 未找到密码，设置失败状态，不加入解压队列
                     fileItem.Status = "fail-未找到密码";
-                    AppendLog($"[{fileItem.FileName}] 未找到密码，跳过解压", ConsoleColor.Red);
+                    AppendLog($"[{fileItem.FileName}] 未找到密码，跳过觧压", ConsoleColor.Red, fileItem);
                     
                     // 检查父项完成（传入子节点）
                     if (fileItem.Parent != null)
@@ -1802,12 +1802,12 @@ namespace AutoUnpackTool
                 }
             }
             
-            // 记录解压目录用于调试
+            // 记录觧压目录用于调试
             bool isStego = IsStegoDetectionActiveForFile(fileItem.FilePath);
-            AppendLog($"\n[线程 {taskId}] 解压: {fileItem.FileName}", ConsoleColor.White);
-            AppendLog($"  输出目录: {outputDir}", ConsoleColor.Gray);
-            AppendLog($"  隐写模式: {isStego}", ConsoleColor.Gray);
-            AppendLog($"  密码: {password ?? "(无密码)"}", ConsoleColor.Gray);
+            AppendLog($"\n[线程 {taskId}] 觧压: {fileItem.FileName}", ConsoleColor.White, fileItem);
+            AppendLog($"  输出目录: {outputDir}", ConsoleColor.Gray, fileItem);
+            AppendLog($"  隐写模式: {isStego}", ConsoleColor.Gray, fileItem);
+            AppendLog($"  密码: {password ?? "(无密码)"}", ConsoleColor.Gray, fileItem);
 
             try
             {
@@ -1841,17 +1841,17 @@ namespace AutoUnpackTool
                     // 标记自身解压成功
                     fileItem.SetSelfExtractResult(true);
                     
-                    // 记录解压产生的目录节点（用于扁平化时只处理解压的目录）
+                    // 记录觧压产生的目录节点（用于扁平化时只处理觧压的目录）
                     if (Directory.Exists(outputDir))
                     {
                         _extractedDirectoryNodes.Add(outputDir);
-                        AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记解压目录节点 {outputDir}", ConsoleColor.Gray);
+                        AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记压目录节点 {outputDir}", ConsoleColor.Gray, fileItem);
                     }
-
+                    
                     // 从密码映射表中移除已完成处理的文件记录
                     string filePath = fileItem.FilePath;
                     _passwordMap.Remove(filePath);
-                    AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已从密码映射表清除", ConsoleColor.Gray);
+                    AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已从密码映射表清除", ConsoleColor.Gray, fileItem);
 
                     // 添加短暂延迟，让7z.exe进程完全释放文件句柄
                     await Task.Delay(500);
@@ -1878,7 +1878,7 @@ namespace AutoUnpackTool
                         {
                             fileItem.Status = $"等待子节点完成{passwordInfo} ({fileItem.GetProgressInfo()})";
                         });
-                        AppendLog($"[{fileItem.FileName}] 已添加 {fileItem.Children.Count} 个子压缩包到待处理队列，等待递归处理...", ConsoleColor.Cyan);
+                        AppendLog($"[{fileItem.FileName}] 已添加 {fileItem.Children.Count} 个子压缩包到待处理队列，等待递归处理...", ConsoleColor.Cyan, fileItem);
                     }
                     // 叶子节点已在 ScanExtractedFilesForArchives 中处理完成
                 }
@@ -1891,8 +1891,8 @@ namespace AutoUnpackTool
                         TxtExtractProgress.Text = "0%";
                     });
                     
-                    Dispatcher.Invoke(() => fileItem.Status = $"解压失败: {result.Message}");
-                    AppendLog($"[线程 {taskId}] {fileItem.FileName}: 解压失败 - {result.Message}", ConsoleColor.Red);
+                    Dispatcher.Invoke(() => fileItem.Status = $"压失败: {result.Message}");
+                    AppendLog($"[线程 {taskId}] {fileItem.FileName}: 觧压失败 - {result.Message}", ConsoleColor.Red, fileItem);
                     
                     // 标记自身解压失败
                     fileItem.SetSelfExtractResult(false);
@@ -1911,7 +1911,7 @@ namespace AutoUnpackTool
             catch (OperationCanceledException)
             {
                 Dispatcher.Invoke(() => fileItem.Status = "已取消");
-                AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已取消", ConsoleColor.Yellow);
+                AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已取消", ConsoleColor.Yellow, fileItem);
                 
                 // 取消时也需要检查父项状态（传入子节点）
                 if (fileItem.Parent != null)
@@ -1927,7 +1927,7 @@ namespace AutoUnpackTool
             catch (Exception ex)
             {
                 Dispatcher.Invoke(() => fileItem.Status = $"异常: {ex.Message}");
-                AppendLog($"[线程 {taskId}] {fileItem.FileName}: 异常 - {ex.Message}", ConsoleColor.Red);
+                AppendLog($"[线程 {taskId}] {fileItem.FileName}: 异常 - {ex.Message}", ConsoleColor.Red, fileItem);
                 
                 // 异常时也需要检查父项状态（传入子节点）
                 if (fileItem.Parent != null)
@@ -1951,21 +1951,21 @@ namespace AutoUnpackTool
                 return;
 
             string suffix = string.IsNullOrEmpty(debugSuffix) ? "" : " " + debugSuffix;
-            AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {leafItem.FileName}{suffix}", ConsoleColor.Magenta);
-
+            AppendLog($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {leafItem.FileName}{suffix}", ConsoleColor.Magenta, leafItem);
+            
             var passwordInfo = leafItem.FoundPassword != null
                 ? $" (密码: {leafItem.FoundPassword})"
                 : " (无密码)";
             Dispatcher.Invoke(() =>
             {
-                leafItem.Status = $"解压成功{passwordInfo}";
+                leafItem.Status = $"觧压成功{passwordInfo}";
             });
-            AppendLog($"[{leafItem.FileName}] 叶子节点解压完成: {leafItem.Status}", ConsoleColor.Green);
-
+            AppendLog($"[{leafItem.FileName}] 叶子节点觧压完成: {leafItem.Status}", ConsoleColor.Green, leafItem);
+            
             if (leafItem.Parent == null)
             {
                 // 顶级叶子节点：走统一收尾流程（先智能路径扁平化，再清理原压缩包）
-                AppendLog($"[{leafItem.FileName}] 顶级叶子节点解压完成，触发智能路径处理...", ConsoleColor.Cyan);
+                AppendLog($"[{leafItem.FileName}] 顶级叶子节点觧压完成，触发智能路径处理...", ConsoleColor.Cyan, leafItem);
                 _ = FinalizeTopLevelExtractAndSmartPathAsync(leafItem.FilePath);
             }
             else
@@ -1988,12 +1988,20 @@ namespace AutoUnpackTool
         {
             try
             {
-                AppendLog($"[线程 {taskId}] [DEBUG] 开始扫描解压文件: {outputDir}", ConsoleColor.Magenta);
-                
+                AppendLog($"[线程 {taskId}] [DEBUG] 开始扫描压文件: {outputDir}", ConsoleColor.Magenta, parentFileItem);
+                            
                 if (!Directory.Exists(outputDir))
                 {
-                    AppendLog($"[线程 {taskId}] [DEBUG] 输出目录不存在: {outputDir}", ConsoleColor.Magenta);
+                    AppendLog($"[线程 {taskId}] [DEBUG] 输出目录不存在: {outputDir}", ConsoleColor.Magenta, parentFileItem);
                     return;
+                }
+            
+                // 判断父文件是否为隐写文件，如果是则使用更严格的过滤策略
+                bool isParentStegoFile = parentFileItem != null && IsStegoDetectionActiveForFile(parentFileItem.FilePath);
+                            
+                if (isParentStegoFile)
+                {
+                    AppendLog($"[线程 {taskId}] [隐写文件扫描] 父文件是隐写文件，使用严格过滤模式", ConsoleColor.Gray, parentFileItem);
                 }
 
                 // 递归查找输出目录中解压出来的新压缩文件
@@ -2018,12 +2026,43 @@ namespace AutoUnpackTool
                 }
                 
                 // 2. 对所有其他文件使用魔术数检测（不依赖扩展名）
+                // 但对于隐写文件解压场景，跳过没有扩展名的文件和明显不是压缩包的文件
                 var allFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories);
                 foreach (var file in allFiles)
                 {
                     // 跳过已通过扩展名匹配的文件
                     if (allArchiveFiles.Contains(file))
                         continue;
+                    
+                    // 对于隐写文件解压场景，跳过没有扩展名的文件（通常是隐写残留文件）
+                    if (isParentStegoFile)
+                    {
+                        string fileName = Path.GetFileName(file);
+                        string extension = Path.GetExtension(file);
+                        string nameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
+                        
+                        // 跳过无扩展名的文件
+                        if (string.IsNullOrEmpty(extension))
+                        {
+                            AppendLog($"[线程 {taskId}] [隐写文件扫描] 跳过无扩展名文件: {fileName}", ConsoleColor.Gray, parentFileItem);
+                            continue;
+                        }
+                        
+                        // 跳过可能是隐写残留的特殊文件
+                        // 1. 纯数字文件名（如 1、2、3 等）
+                        if (int.TryParse(nameWithoutExt, out _))
+                        {
+                            AppendLog($"[线程 {taskId}] [隐写文件扫描] 跳过纯数字文件名: {fileName}", ConsoleColor.Gray, parentFileItem);
+                            continue;
+                        }
+                        
+                        // 2. 短文件名（长度<=2，可能是残留文件）
+                        if (nameWithoutExt.Length <= 2)
+                        {
+                            AppendLog($"[线程 {taskId}] [隐写文件扫描] 跳过短文件名: {fileName}", ConsoleColor.Gray, parentFileItem);
+                            continue;
+                        }
+                    }
                         
                     // 使用魔术数检测是否为压缩包
                     if (IsArchiveFile(file, false))
@@ -2039,21 +2078,21 @@ namespace AutoUnpackTool
                 if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Count > 0)
                 {
                     var newlyExtractedFiles = allArchiveFiles.Where(f => !existingFilesBeforeExtract.Contains(f)).ToList();
-                    AppendLog($"[线程 {taskId}] [DEBUG] 过滤前: {allArchiveFiles.Count} 个, 过滤后: {newlyExtractedFiles.Count} 个新文件", ConsoleColor.Magenta);
+                    AppendLog($"[线程 {taskId}] [DEBUG] 过滤前: {allArchiveFiles.Count} 个, 过滤后: {newlyExtractedFiles.Count} 个新文件", ConsoleColor.Magenta, parentFileItem);
                     allArchiveFiles = newlyExtractedFiles;
                 }
 
-                AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allArchiveFiles.Count} 个候选压缩文件", ConsoleColor.Magenta);
+                AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allArchiveFiles.Count} 个候选压缩文件", ConsoleColor.Magenta, parentFileItem);
 
                 if (allArchiveFiles.Count == 0)
                 {
-                    AppendLog($"[线程 {taskId}] 未发现新的压缩文件", ConsoleColor.Gray);
+                    AppendLog($"[线程 {taskId}] 未发现新的压缩文件", ConsoleColor.Gray, parentFileItem);
                     if (parentFileItem != null)
                         FinishLeafAfterScanNoChildArchivesToQueue(parentFileItem, taskId);
                     return;
                 }
 
-                AppendLog($"[线程 {taskId}] 发现 {allArchiveFiles.Count} 个新的压缩文件", ConsoleColor.Cyan);
+                AppendLog($"[线程 {taskId}] 发现 {allArchiveFiles.Count} 个新的压缩文件", ConsoleColor.Cyan, parentFileItem);
 
                 int addedCount = 0;
                 foreach (var archiveFile in allArchiveFiles)
@@ -2753,6 +2792,10 @@ namespace AutoUnpackTool
                 }
 
                 AppendLog($"[批量智能路径] [状态更新] 找到 {relatedItems.Count} 个相关的FileItem", ConsoleColor.Gray);
+                
+                // 获取最终扁平化后的路径
+                string? finalPath = FindFinalFlattenedPath(rootDir);
+                AppendLog($"[批量智能路径] [状态更新] 最终路径: {finalPath}", ConsoleColor.Gray);
 
                 foreach (var item in relatedItems)
                 {
@@ -2763,18 +2806,60 @@ namespace AutoUnpackTool
                             ? $" (密码: {item.FoundPassword})" 
                             : " (无密码)";
                         
+                        // 记录最终路径到节点
+                        item.FinalOutputPath = finalPath;
+                                                
                         Dispatcher.Invoke(() =>
                         {
-                            item.Status = $"解压完成-扁平化处理完成{passwordInfo}";
+                            item.Status = $"压完成-扁平化处理完成{passwordInfo}";
+                            
+                            // 如果当前选中的是该节点，立即更新最终路径显示
+                            if (LstFiles.SelectedItem is FileItem selectedItem && selectedItem == item)
+                            {
+                                TxtFinalPath.Text = finalPath ?? "无";
+                            }
                         });
-                        
-                        AppendLog($"[{item.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green);
+                                                
+                        AppendLog($"[{item.FileName}] 状态已更新: 压完成-扁平化处理完成", ConsoleColor.Green, item);
                     }
                 }
             }
             catch (Exception ex)
             {
                 AppendLog($"[批量智能路径] [状态更新] 失败: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+        
+        /// <summary>
+        /// 查找最终扁平化后的路径（rootDir 下的第一个或唯一的子目录）
+        /// </summary>
+        private string? FindFinalFlattenedPath(string rootDir)
+        {
+            try
+            {
+                if (!Directory.Exists(rootDir))
+                    return rootDir;
+                    
+                var subDirs = Directory.GetDirectories(rootDir);
+                if (subDirs.Length == 1)
+                {
+                    // 只有一个子目录，说明已扁平化，返回该子目录
+                    return subDirs[0];
+                }
+                else if (subDirs.Length == 0)
+                {
+                    // 没有子目录，返回 rootDir 本身
+                    return rootDir;
+                }
+                else
+                {
+                    // 有多个子目录，返回 rootDir（未扁平化或扁平化失败）
+                    return rootDir;
+                }
+            }
+            catch
+            {
+                return rootDir;
             }
         }
 
@@ -4717,25 +4802,58 @@ namespace AutoUnpackTool
             {
                 // 根节点:显示所有日志
                 logsToShow = rootNode.CollectAllLogs();
+                
+                // 调试：打印日志统计
+                System.Diagnostics.Debug.WriteLine($"[根节点日志统计] 共收集到 {logsToShow.Count} 条日志");
+                foreach (var child in rootNode.Children)
+                {
+                    var childLogs = child.CollectAllLogs();
+                    System.Diagnostics.Debug.WriteLine($"  - {child.FileName}: {childLogs.Count} 条日志");
+                }
+                
+                // 清空最终路径显示
+                Dispatcher.Invoke(() => TxtFinalPath.Text = "无");
             }
             else if (selectedItem is FileItem fileItem)
             {
                 // 文件节点:显示该节点及所有子节点的日志
                 logsToShow = fileItem.CollectAllLogs();
+                
+                // 调试：打印日志统计
+                System.Diagnostics.Debug.WriteLine($"[文件节点日志统计] {fileItem.FileName} 收集到 {logsToShow.Count} 条日志");
+                
+                // 显示最终路径
+                Dispatcher.Invoke(() =>
+                {
+                    if (!string.IsNullOrEmpty(fileItem.FinalOutputPath))
+                    {
+                        TxtFinalPath.Text = fileItem.FinalOutputPath;
+                    }
+                    else
+                    {
+                        TxtFinalPath.Text = "无";
+                    }
+                });
             }
             
-            // 显示日志
-            DisplayFilteredLogs(logsToShow);
+            // 显示日志(不清空,直接重新渲染)
+            DisplayFilteredLogs(logsToShow, clearFirst: true);
         }
 
         /// <summary>
         /// 显示过滤后的日志
         /// </summary>
-        private void DisplayFilteredLogs(List<LogEntry> logs)
+        /// <param name="logs">要显示的日志列表</param>
+        /// <param name="clearFirst">是否先清空日志窗口</param>
+        private void DisplayFilteredLogs(List<LogEntry> logs, bool clearFirst = false)
         {
             Dispatcher.Invoke(() =>
             {
-                TxtLog.Clear();
+                if (clearFirst)
+                {
+                    TxtLog.Clear();
+                }
+                
                 foreach (var log in logs)
                 {
                     string timestamp = log.Timestamp.ToString("HH:mm:ss");
@@ -4768,34 +4886,12 @@ namespace AutoUnpackTool
                 targetNode.AddLog(message, color);
             }
             
-            // 同时显示到日志窗口(仅当当前选中的是该节点或其父节点时)
+            // 实时显示到日志窗口(始终显示,不过滤)
             Dispatcher.Invoke(() =>
             {
-                var selectedItem = LstFiles.SelectedItem;
-                bool shouldDisplay = false;
-                
-                if (selectedItem is RootNode)
-                {
-                    // 选中根节点,显示所有日志
-                    shouldDisplay = true;
-                }
-                else if (selectedItem is FileItem selectedFileItem && targetNode != null)
-                {
-                    // 检查 targetNode 是否是选中节点或其子节点
-                    shouldDisplay = IsNodeOrDescendant(selectedFileItem, targetNode);
-                }
-                else if (targetNode == null)
-                {
-                    // 系统日志,始终显示
-                    shouldDisplay = true;
-                }
-                
-                if (shouldDisplay)
-                {
-                    string timestamp = DateTime.Now.ToString("HH:mm:ss");
-                    TxtLog.AppendText($"[{timestamp}]--> {message}\r\n");
-                    TxtLog.ScrollToEnd();
-                }
+                string timestamp = DateTime.Now.ToString("HH:mm:ss");
+                TxtLog.AppendText($"[{timestamp}]--> {message}\r\n");
+                TxtLog.ScrollToEnd();
             });
         }
 
@@ -4891,7 +4987,12 @@ namespace AutoUnpackTool
         private int _expectedChildrenCount = 0;      // 预期的子节点总数
         private int _completedChildrenCount = 0;     // 已完成的子节点数
         private bool _isMarkedComplete = false;      // 是否已标记为完成（防止重复上报）
-        private bool _selfExtractSuccess = false;    // 自身解压是否成功
+        private bool _selfExtractSuccess = false;    // 自身压是否成功
+                
+        /// <summary>
+        /// 扁平化处理后的最终路径（用于在日志区域上方显示）
+        /// </summary>
+        public string? FinalOutputPath { get; set; }
         
         /// <summary>
         /// 设置自身解压结果

@@ -89,11 +89,27 @@
 
             <!-- 右侧：信息输出 -->
             <GroupBox Grid.Column="2" Header="信息输出" Margin="0,0,0,0">
-                <TextBox x:Name="TxtLog" IsReadOnly="True" VerticalScrollBarVisibility="Auto"
-                         HorizontalScrollBarVisibility="Auto"
-                         Background="White" FontFamily="Consolas" FontSize="12"
-                         TextWrapping="NoWrap"
-                         AcceptsReturn="True"/>
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    
+                    <!-- 最终路径显示区域 -->
+                    <Border Grid.Row="0" Background="#F0F8FF" BorderBrush="#4682B4" BorderThickness="1" Margin="5" Padding="10" CornerRadius="3">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="最终路径:" FontWeight="Bold" Foreground="#4682B4" Margin="0,0,10,0"/>
+                            <TextBlock x:Name="TxtFinalPath" Text="无" Foreground="#333333" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+                    
+                    <!-- 日志文本框 -->
+                    <TextBox Grid.Row="1" x:Name="TxtLog" IsReadOnly="True" VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto"
+                             Background="White" FontFamily="Consolas" FontSize="12"
+                             TextWrapping="NoWrap"
+                             AcceptsReturn="True"/>
+                </Grid>
             </GroupBox>
         </Grid>
 
