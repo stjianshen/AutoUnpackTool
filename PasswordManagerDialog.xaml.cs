@@ -642,24 +642,8 @@ namespace AutoUnpackTool
             }
         }
 
-        private void BtnSave_Click(object sender, RoutedEventArgs e)
+        private void BtnClose_Click(object sender, RoutedEventArgs e)
         {
-            // 保存配置文件（带备份）
-            SaveSettingsWithBackup();
-
-            // 如果有密码更改，保存密码到配置文件
-            if (_isDirty)
-            {
-                _settings.SavePasswordsToFile();
-            }
-
-            DialogResult = true;
-            Close();
-        }
-
-        private void BtnCancel_Click(object sender, RoutedEventArgs e)
-        {
-            DialogResult = false;
             Close();
         }
     }
