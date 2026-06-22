@@ -50,6 +50,25 @@
                 <ComboBoxItem Content="重命名"/>
             </ComboBox>
 
+            <Separator Width="20" Visibility="Hidden"/>
+            
+            <!-- 强制解压模式复选框 -->
+            <CheckBox x:Name="ChkForceExtractMode" Content="强制解压模式(跳过检测)" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ChkForceExtractMode_Changed" Unchecked="ChkForceExtractMode_Changed"/>
+            
+            <Separator Width="20" Visibility="Hidden"/>
+            
+            <!-- 最大解压层数设置（下拉列表） -->
+            <TextBlock Text="最大解压层数:" VerticalAlignment="Center" Margin="10,0,5,0"/>
+            <ComboBox x:Name="CmbMaxExtractDepth" Width="100" Height="30" VerticalContentAlignment="Center"
+                      IsEditable="True" SelectionChanged="CmbMaxExtractDepth_SelectionChanged"
+                      LostFocus="CmbMaxExtractDepth_LostFocus" Text="0">
+                <ComboBoxItem Content="不限制"/>
+                <ComboBoxItem Content="1 层"/>
+                <ComboBoxItem Content="2 层"/>
+                <ComboBoxItem Content="3 层"/>
+                <ComboBoxItem Content="5 层"/>
+                <ComboBoxItem Content="10 层"/>
+            </ComboBox>
         </StackPanel>
 
         <!-- 主内容区域 -->

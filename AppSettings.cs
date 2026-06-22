@@ -155,15 +155,28 @@ namespace AutoUnpackTool
         public bool EnableMultiVolumeDetection { get; set; } = true;
         
         /// <summary>
-        /// 是否启用智能路径处理（解压后自动扁平化多层嵌套文件夹）
+        /// 是否启用智能路径处理(解压后自动扁平化多层嵌套文件夹)
         /// </summary>
         public bool EnableSmartPathProcessing { get; set; } = true;
-
+        
         /// <summary>
-        /// 是否启用隐写文件探测（MP4/MKV 等容器内嵌压缩包）
+        /// 是否启用隐写文件探测(MP4/MKV 等容器内嵌压缩包)
         /// 默认开启以检测视频文件中的隐藏压缩包
         /// </summary>
         public bool EnableStegoDetection { get; set; } = true;
+        
+        /// <summary>
+        /// 强制解压模式:跳过压缩文件检测,对所有拖入的文件直接尝试解压
+        /// 适用于某些特殊格式的压缩包无法被识别的情况
+        /// 注意:此模式仅对最初拖入的文件生效,解压后发现的新文件仍会进行正常检测
+        /// </summary>
+        public bool ForceExtractMode { get; set; } = false;
+
+        /// <summary>
+        /// 最大解压层数（从拖入的文件开始算起，0表示不限制）
+        /// 默认值为0（不限制层数，保持原有行为）
+        /// </summary>
+        public int MaxExtractDepth { get; set; } = 0;
 
         /// <summary>
         /// 隐写探测文件大小下限（MB），低于该值不做隐写探测
