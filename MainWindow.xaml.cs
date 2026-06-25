@@ -72,9 +72,6 @@ namespace AutoUnpackTool
         // 记录所有解压产生的目录节点（用于扁平化时只处理解压的目录）
         private HashSet<string> _extractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
         
-        // 【新增】记录隐写文件解压出来的目录节点（用于特殊清理规则）
-        private HashSet<string> _stegoExtractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
-        
         // 记录拖入的文件夹（用于后续智能路径处理，即使没有压缩包）
         private HashSet<string> _droppedFolders = new(StringComparer.OrdinalIgnoreCase);
         
@@ -82,6 +79,10 @@ namespace AutoUnpackTool
         private HashSet<string> _processedFlattenDirs = new(StringComparer.OrdinalIgnoreCase);
         
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
+        // 缓存隐写文件检测到的具体压缩类型（如 zip/7z/rar），null 表示非隐写或未检测到类型
+        private readonly ConcurrentDictionary<string, string?> _stegoArchiveTypeCache = new(StringComparer.OrdinalIgnoreCase);
+        // 缓存隐写文件内包含的真实文件列表（白名单），用于过滤 -t# 提取产生的误匹配垃圾文件
+        private readonly ConcurrentDictionary<string, HashSet<string>> _stegoArchiveValidFilesCache = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".mp4", ".mkv", ".webm", ".mov", ".m4v"
@@ -716,7 +717,9 @@ namespace AutoUnpackTool
             _extractQueue = new ConcurrentQueue<FileItem>();
             _topLevelItems.Clear();
             _extractedDirectoryNodes.Clear();  // 清空觧压目录标记
-            _stegoExtractedDirectoryNodes.Clear();  // 【新增】清空隐写文件解压目录标记
+            _stegoProbeCache.Clear();
+            _stegoArchiveTypeCache.Clear();
+            _stegoArchiveValidFilesCache.Clear();
             TxtLog.Clear();
             UpdateRootNodeTitle();
             
@@ -1174,7 +1177,7 @@ namespace AutoUnpackTool
                 });
 
                 _extractQueue.Enqueue(fileItem);
-                AppendLog($"[{fileItem.FileName}] 识别为隐写容器，已加入待觧压队列（-t#）", ConsoleColor.Cyan, fileItem);
+                AppendLog($"[{fileItem.FileName}] 识别为隐写容器，已加入待觧压队列", ConsoleColor.Cyan, fileItem);
                 WakeupExtractThread();
                 await Task.Delay(100, token);
                 return;
@@ -1969,9 +1972,12 @@ namespace AutoUnpackTool
             
             // 记录觧压目录用于调试
             bool isStego = IsStegoDetectionActiveForFile(fileItem.FilePath);
+            string? detectedType = isStego ? DetectStegoArchiveType(fileItem.FilePath) : null;
             AppendLog($"\n[线程 {taskId}] 觧压: {fileItem.FileName}", ConsoleColor.White, fileItem);
             AppendLog($"  输出目录: {outputDir}", ConsoleColor.Gray, fileItem);
             AppendLog($"  隐写模式: {isStego}", ConsoleColor.Gray, fileItem);
+            if (isStego)
+                AppendLog($"  压缩类型: -t{detectedType ?? "(null)"}", ConsoleColor.Gray, fileItem);
             AppendLog($"  密码: {password ?? "(无密码)"}", ConsoleColor.Gray, fileItem);
 
             try
@@ -1991,7 +1997,7 @@ namespace AutoUnpackTool
                     },
                     showCliWindow: _settings.ShowCliWindow,
                     cancellationToken: token,
-                    useHashTypeMode: IsStegoDetectionActiveForFile(fileItem.FilePath));
+                    stegoArchiveType: isStego ? "#" : null);
 
                 if (result.Success)
                 {
@@ -2012,14 +2018,6 @@ namespace AutoUnpackTool
                     {
                         _extractedDirectoryNodes.Add(outputDir);
                         AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记压目录节点 {outputDir}", ConsoleColor.Gray, fileItem);
-                                            
-                        // 【新增】如果是隐写文件解压，同时标记为隐写解压目录
-                        bool isStegoFile = IsStegoDetectionActiveForFile(fileItem.FilePath);
-                        if (isStegoFile)
-                        {
-                            _stegoExtractedDirectoryNodes.Add(outputDir);
-                            AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记为隐写文件解压目录 {outputDir}", ConsoleColor.Cyan, fileItem);
-                        }
                     }
                     else
                     {
@@ -2039,14 +2037,24 @@ namespace AutoUnpackTool
                     // 传入 existingFilesBeforeExtract 过滤掉解压前已存在的文件
                     await ScanExtractedFilesForArchives(outputDir, taskId, fileItem, existingFilesBeforeExtract);
                     
-                    // 【修复】只在隐写文件解压时才清理非压缩包残留文件
-                    // 例如：隐写容器解压出的"1"、"3"等无扩展名噪音文件
-                    // 普通压缩包解压出的文件（如最终产物图片）必须保留
+                    // 【残留清理】隐写文件解压后，删除非压缩包的残留文件
+                    // -t# 可能产生非存档垃圾，这些不会被加入队列，直接删除即可
                     if (isStego)
                     {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 开始清理解压残留文件", ConsoleColor.Gray, fileItem);
-                        await CleanSteganographyResidualFilesAsync(outputDir, taskId, existingFilesBeforeExtract);
-                        AppendLog($"[线程 {taskId}] [DEBUG] 清理解压残留文件完成", ConsoleColor.Gray, fileItem);
+                        try
+                        {
+                            var topFiles = Directory.GetFiles(outputDir, "*", SearchOption.TopDirectoryOnly);
+                            foreach (var f in topFiles)
+                            {
+                                if (!IsArchiveFile(f, false, isDroppedFile: false))
+                                {
+                                    string fName = Path.GetFileName(f);
+                                    AppendLog($"[线程 {taskId}] [残留清理] 删除非压缩包残留: {fName}", ConsoleColor.Yellow, fileItem);
+                                    try { File.Delete(f); } catch { }
+                                }
+                            }
+                        }
+                        catch { }
                     }
                     
                     // 修改：根据是否有子节点来决定显示状态
@@ -2184,14 +2192,6 @@ namespace AutoUnpackTool
                     return;
                 }
             
-                // 判断父文件是否为隐写文件，如果是则使用更严格的过滤策略
-                bool isParentStegoFile = parentFileItem != null && IsStegoDetectionActiveForFile(parentFileItem.FilePath);
-                            
-                if (isParentStegoFile)
-                {
-                    AppendLog($"[线程 {taskId}] [隐写文件扫描] 父文件是隐写文件，使用严格过滤模式", ConsoleColor.Gray, parentFileItem);
-                }
-
                 // 递归查找输出目录中解压出来的新压缩文件
                 // 只扫描压缩包扩展名和分卷压缩格式，不扫描其他文件
                 var archiveExtensions = _settings.GetArchiveExtensions();
@@ -2214,43 +2214,12 @@ namespace AutoUnpackTool
                 }
                 
                 // 2. 对所有其他文件使用魔术数检测（不依赖扩展名）
-                // 但对于隐写文件解压场景，跳过没有扩展名的文件和明显不是压缩包的文件
                 var allFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories);
                 foreach (var file in allFiles)
                 {
                     // 跳过已通过扩展名匹配的文件
                     if (allArchiveFiles.Contains(file))
                         continue;
-                    
-                    // 对于隐写文件解压场景，跳过没有扩展名的文件（通常是隐写残留文件）
-                    if (isParentStegoFile)
-                    {
-                        string fileName = Path.GetFileName(file);
-                        string extension = Path.GetExtension(file);
-                        string nameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
-                        
-                        // 跳过无扩展名的文件
-                        if (string.IsNullOrEmpty(extension))
-                        {
-                            AppendLog($"[线程 {taskId}] [隐写文件扫描] 跳过无扩展名文件: {fileName}", ConsoleColor.Gray, parentFileItem);
-                            continue;
-                        }
-                        
-                        // 跳过可能是隐写残留的特殊文件
-                        // 1. 纯数字文件名（如 1、2、3 等）
-                        if (int.TryParse(nameWithoutExt, out _))
-                        {
-                            AppendLog($"[线程 {taskId}] [隐写文件扫描] 跳过纯数字文件名: {fileName}", ConsoleColor.Gray, parentFileItem);
-                            continue;
-                        }
-                        
-                        // 2. 短文件名（长度<=2，可能是残留文件）
-                        if (nameWithoutExt.Length <= 2)
-                        {
-                            AppendLog($"[线程 {taskId}] [隐写文件扫描] 跳过短文件名: {fileName}", ConsoleColor.Gray, parentFileItem);
-                            continue;
-                        }
-                    }
                         
                     // 使用魔术数检测是否为压缩包
                     // 注意：解压后发现的文件不受强制模式影响，始终进行正常检测
@@ -2262,6 +2231,32 @@ namespace AutoUnpackTool
                 
                 // 去重
                 allArchiveFiles = allArchiveFiles.Distinct().ToList();
+
+                // 【隐写垃圾过滤】-t# 哈希扫描产生的文件用标准 7z l（不带 -t#）逐文件验证
+                // 真正的压缩包通得过标准检测，-t# 误匹配的垃圾文件通不过
+                if (parentFileItem != null && IsStegoDetectionActiveForFile(parentFileItem.FilePath))
+                {
+                    var beforeCount = allArchiveFiles.Count;
+                    var verifiedFiles = new List<string>();
+                    foreach (var f in allArchiveFiles)
+                    {
+                        string fName = Path.GetFileName(f);
+                        AppendLog($"[线程 {taskId}] [隐写验证] 验证文件: {fName}", ConsoleColor.Gray, parentFileItem);
+                        if (VerifyIsRealArchive(f))
+                        {
+                            verifiedFiles.Add(f);
+                            AppendLog($"[线程 {taskId}] [隐写验证]   ✓ 通过: {fName}", ConsoleColor.Green, parentFileItem);
+                        }
+                        else
+                        {
+                            // 标准 7z l 验证失败 → -t# 误匹配垃圾，从磁盘删除
+                            AppendLog($"[线程 {taskId}] [隐写验证]   ✗ 垃圾文件，删除: {fName}", ConsoleColor.Yellow, parentFileItem);
+                            try { File.Delete(f); } catch { }
+                        }
+                    }
+                    allArchiveFiles = verifiedFiles;
+                    AppendLog($"[线程 {taskId}] [隐写验证] 过滤前: {beforeCount} → 过滤后: {allArchiveFiles.Count}", ConsoleColor.Cyan, parentFileItem);
+                }
 
                 // 过滤掉解压前已存在的文件，只保留新解压的文件
                 if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Count > 0)
@@ -2448,408 +2443,6 @@ namespace AutoUnpackTool
             catch (Exception ex)
             {
                 AppendLog($"[线程 {taskId}] 扫描解压文件失败: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        /// <summary>
-        /// 清理隐写文件解压后的非压缩包残留文件
-        /// </summary>
-        private async Task CleanSteganographyResidualFilesAsync(string outputDir, int taskId, HashSet<string>? existingFilesBeforeExtract = null)
-        {
-            AppendLog($"[线程 {taskId}] [DEBUG] CleanSteganographyResidualFilesAsync 被调用: outputDir={outputDir}", ConsoleColor.Gray);
-            
-            if (!Directory.Exists(outputDir))
-            {
-                AppendLog($"[线程 {taskId}] [DEBUG] 目录不存在，退出", ConsoleColor.Gray);
-                return;
-            }
-
-            try
-            {
-                AppendLog($"[线程 {taskId}] [隐写清理] 开始清理隐写文件残留: {outputDir}", ConsoleColor.Gray);
-                
-                // 使用 EnumerateFileSystemEntries 枚举所有条目（文件和目录），避免模式匹配问题
-                // .NET Core 3.0+ 中 Directory.GetFiles(path, "*.*") 不匹配无扩展名文件
-                // 只扫描顶层目录，避免递归到子目录删除最终产物
-                var allEntries = Directory.EnumerateFileSystemEntries(outputDir).ToList();
-                AppendLog($"[线程 {taskId}] [隐写清理] 枚举到 {allEntries.Count} 个条目", ConsoleColor.Gray);
-                
-                // 先打印所有条目内容
-                foreach (var entry in allEntries)
-                {
-                    bool isDir = Directory.Exists(entry);
-                    AppendLog($"[线程 {taskId}] [隐写清理]   条目: {(isDir ? "[DIR]" : "[FILE]")} {Path.GetFileName(entry)}", ConsoleColor.Gray);
-                }
-                
-                int cleanedCount = 0;
-                
-                foreach (var entry in allEntries)
-                {
-                    // 如果是目录，在后续的目录清理中处理
-                    if (Directory.Exists(entry))
-                        continue;
-                    
-                    // 应用残留文件规则匹配（与批量清理保持一致）
-                    string fileName = Path.GetFileName(entry);
-                    string extension = Path.GetExtension(entry);
-                    string nameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
-                    
-                    bool isResidual = string.IsNullOrEmpty(extension) ||
-                                      int.TryParse(nameWithoutExt, out _) ||
-                                      nameWithoutExt.Length <= 2;
-                    
-                    if (isResidual)
-                    {
-                        // 【关键修复】如果文件有扩展名且被识别为压缩包，不应作为残留清理
-                        // 例如：隐写容器解压出的 2.zip 虽然名称"2"匹配纯数字规则，但它是合法子压缩包，必须保留
-                        if (!string.IsNullOrEmpty(extension) && IsArchiveFile(entry, false))
-                        {
-                            AppendLog($"[线程 {taskId}] [隐写清理]   跳过压缩包（名称匹配残留规则但有扩展名）: {fileName}", ConsoleColor.Gray);
-                            continue;
-                        }
-                        
-                        // 残留文件规则匹配，直接清理（即使被 IsArchiveFile 魔术数误判为压缩包）
-                        AppendLog($"[线程 {taskId}] [隐写清理]   识别为残留文件: {fileName} (无扩展名/纯数字/短文件名)", ConsoleColor.Gray);
-                        if (await DeleteResidualFileWithRetryAsync(entry, taskId))
-                        {
-                            cleanedCount++;
-                        }
-                        continue;
-                    }
-                    
-                    // 非残留文件，检查是否跳过
-                    // 跳过压缩包文件（这些会被后续逻辑处理）
-                    if (IsArchiveFile(entry, false))
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理]   跳过压缩包: {Path.GetFileName(entry)}", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 跳过黑名单文件（会被黑名单逻辑处理）
-                    if (IsBlacklistedFile(entry, out _))
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理]   跳过黑名单: {Path.GetFileName(entry)}", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 如果不是残留文件规则匹配的文件，且解压前就已存在，则保留
-                    if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Contains(entry))
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理]   跳过解压前已存在的非残留文件: {fileName}", ConsoleColor.Gray);
-                        continue;
-                    }
-                }
-                
-                // 清理残留的非压缩包目录
-                // 只扫描顶层目录，避免递归到子目录删除最终产物目录
-                var allDirs = Directory.GetDirectories(outputDir, "*", SearchOption.TopDirectoryOnly)
-                    .OrderByDescending(d => d.Length); // 从最深层次开始删除
-                
-                AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allDirs.Count()} 个目录需要检查", ConsoleColor.Gray);
-                
-                foreach (var dir in allDirs)
-                {
-                    AppendLog($"[线程 {taskId}] [DEBUG] 检查目录: {dir}", ConsoleColor.Gray);
-                    
-                    // 【关键】跳过已标记为解压目录的节点（这些是合法产物目录，不是残留）
-                    if (_extractedDirectoryNodes.Contains(dir))
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理] 跳过解压目录节点: {Path.GetFileName(dir)}", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 跳过已存在的目录（解压前就有的）
-                    if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Any(f => f.StartsWith(dir + Path.DirectorySeparatorChar)))
-                    {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 目录是解压前就存在的，跳过: {Path.GetFileName(dir)}", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 跳过黑名单文件夹
-                    if (IsBlacklistedFile(dir, out string matchedPattern))
-                    {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 目录是黑名单，跳过隐写清理: {Path.GetFileName(dir)} (匹配模式: {matchedPattern})", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 检查目录内是否包含压缩包文件
-                    bool hasArchive = false;
-                    try
-                    {
-                        // 使用 "*" 确保能匹配无扩展名压缩包
-                        var dirFiles = Directory.GetFiles(dir, "*", SearchOption.TopDirectoryOnly);
-                        AppendLog($"[线程 {taskId}] [DEBUG] 目录 {Path.GetFileName(dir)} 中有 {dirFiles.Length} 个文件", ConsoleColor.Gray);
-                        
-                        foreach (var f in dirFiles)
-                        {
-                            if (IsArchiveFile(f, false))
-                            {
-                                hasArchive = true;
-                                AppendLog($"[线程 {taskId}] [DEBUG] 发现压缩包: {Path.GetFileName(f)}", ConsoleColor.Gray);
-                                break;
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 检查目录内容失败: {ex.Message}", ConsoleColor.Yellow);
-                    }
-                    
-                    // 如果包含压缩包，保留该目录
-                    if (hasArchive)
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理] 保留包含压缩包的目录: {Path.GetFileName(dir)}", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 这是纯残留目录，删除它
-                    try
-                    {
-                        AppendLog($"[线程 {taskId}] [DEBUG] 准备删除残留目录: {dir}", ConsoleColor.Gray);
-                        // 使用 Directory.Delete 递归删除
-                        Directory.Delete(dir, true);
-                        AppendLog($"[线程 {taskId}] [隐写清理] 已清理残留目录: {Path.GetFileName(dir)}", ConsoleColor.Gray);
-                        cleanedCount++;
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理] 清理目录失败: {Path.GetFileName(dir)} - {ex.Message}", ConsoleColor.Yellow);
-                        AppendLog($"[线程 {taskId}] [DEBUG] 异常详情: {ex.GetType().Name}: {ex.StackTrace}", ConsoleColor.Yellow);
-                    }
-                }
-                
-                if (cleanedCount > 0)
-                {
-                    AppendLog($"[线程 {taskId}] [隐写清理] 共清理 {cleanedCount} 个残留文件/目录", ConsoleColor.Green);
-                }
-                else
-                {
-                    AppendLog($"[线程 {taskId}] [隐写清理] 无需清理", ConsoleColor.Gray);
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[线程 {taskId}] [隐写清理] 扫描失败: {ex.Message}", ConsoleColor.Yellow);
-            }
-        }
-        
-        /// <summary>
-        /// 带重试的残留文件删除操作
-        /// </summary>
-        private async Task<bool> DeleteResidualFileWithRetryAsync(string filePath, int taskId)
-        {
-            const int maxRetries = 3;
-            const int retryDelayMs = 300;
-            
-            string fileName = Path.GetFileName(filePath);
-            
-            for (int retry = 0; retry < maxRetries; retry++)
-            {
-                try
-                {
-                    bool deleted = await SilentDeleteToRecycleBinAsync(filePath);
-                    if (deleted)
-                    {
-                        AppendLog($"[线程 {taskId}] [隐写清理] 已清理残留文件: {fileName}", ConsoleColor.Gray);
-                        return true;
-                    }
-                    else
-                    {
-                        // 删除失败（返回false），等待后重试
-                        if (retry < maxRetries - 1)
-                        {
-                            await Task.Delay(retryDelayMs);
-                        }
-                    }
-                }
-                catch (Exception ex) when (retry < maxRetries - 1)
-                {
-                    AppendLog($"[线程 {taskId}] [隐写清理] 清理重试 {retry + 1}/{maxRetries}: {fileName} - {ex.Message}", ConsoleColor.Yellow);
-                    await Task.Delay(retryDelayMs);
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"[线程 {taskId}] [隐写清理] 清理失败({maxRetries}次重试后): {fileName} - {ex.Message}", ConsoleColor.Yellow);
-                    return false;
-                }
-            }
-            return false;
-        }
-
-        /// <summary>
-        /// 【批量模式】清理隐写文件解压后的残留文件（用于扁平化处理前）
-        /// 注意：此方法只对标记为隐写文件解压的目录应用特殊清理规则
-        /// 清理规则（仅针对隐写文件解压目录）：
-        /// 1. 无扩展名的文件
-        /// 2. 纯数字文件名的文件（如 1、2、3 等）
-        /// 3. 短文件名（长度<=2）的文件
-        /// 4. 不包含压缩包的残留目录
-        /// </summary>
-        private async Task CleanSteganographyResidualFilesInBatchAsync(string rootDir)
-        {
-            if (!Directory.Exists(rootDir))
-            {
-                return;
-            }
-
-            try
-            {
-                // 【关键检查】只对标记为隐写文件解压的目录应用特殊清理规则
-                bool isStegoExtractedDir = _stegoExtractedDirectoryNodes.Contains(rootDir);
-                
-                if (!isStegoExtractedDir)
-                {
-                    AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(rootDir)} 不是隐写文件解压目录，跳过特殊清理", ConsoleColor.Gray);
-                    return;
-                }
-                
-                AppendLog($"[批量智能路径] [隐写残留清理] 开始清理隐写文件残留: {rootDir}", ConsoleColor.Cyan);
-                
-                // 使用 "*" 而非 "*.*" 枚举所有文件（包括无扩展名文件）
-                // .NET Core 3.0+ 中 "*.*" 不匹配无扩展名文件
-                // 只扫描顶层目录，避免递归到子目录删除最终产物
-                var allFiles = Directory.GetFiles(rootDir, "*", SearchOption.TopDirectoryOnly);
-                int cleanedCount = 0;
-                
-                foreach (var file in allFiles)
-                {
-                    string fileName = Path.GetFileName(file);
-                    string extension = Path.GetExtension(file);
-                    string nameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
-                    
-                    bool shouldDelete = false;
-                    string reason = "";
-                    
-                    // 规则1: 无扩展名的文件
-                    if (string.IsNullOrEmpty(extension))
-                    {
-                        shouldDelete = true;
-                        reason = "无扩展名";
-                    }
-                    // 规则2: 纯数字文件名
-                    else if (int.TryParse(nameWithoutExt, out _))
-                    {
-                        shouldDelete = true;
-                        reason = "纯数字文件名";
-                    }
-                    // 规则3: 短文件名（长度<=2）
-                    else if (nameWithoutExt.Length <= 2)
-                    {
-                        shouldDelete = true;
-                        reason = "短文件名";
-                    }
-                    
-                    if (shouldDelete)
-                    {
-                        // 【关键修复】如果文件有扩展名且被识别为压缩包，不应作为残留清理
-                        // 例如：隐写容器解压出的 2.zip 虽然名称"2"匹配纯数字规则，但它是合法子压缩包，必须保留
-                        if (!string.IsNullOrEmpty(extension) && IsArchiveFile(file, false))
-                        {
-                            AppendLog($"[批量智能路径] [隐写残留清理] 跳过压缩包（名称匹配残留规则但有扩展名）: {fileName}", ConsoleColor.Gray);
-                            continue;
-                        }
-                        
-                        // 残留文件规则匹配，直接清理（即使被 IsArchiveFile 魔术数误判为压缩包）
-                        try
-                        {
-                            bool deleted = await SilentDeleteToRecycleBinAsync(file);
-                            if (deleted)
-                            {
-                                AppendLog($"[批量智能路径] [隐写残留清理] 已清理: {fileName} ({reason})", ConsoleColor.Gray);
-                                cleanedCount++;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendLog($"[批量智能路径] [隐写残留清理] 清理失败: {fileName} - {ex.Message}", ConsoleColor.Yellow);
-                        }
-                    }
-                    else
-                    {
-                        // 非残留文件，检查是否跳过
-                        // 跳过压缩包文件（这些会被后续逻辑处理）
-                        if (IsArchiveFile(file, false))
-                            continue;
-                        
-                        // 跳过黑名单文件（会被黑名单逻辑处理）
-                        if (IsBlacklistedFile(file, out _))
-                            continue;
-                    }
-                }
-                
-                // 清理残留的非压缩包目录
-                // 只扫描顶层目录，避免递归到子目录删除最终产物目录
-                var allDirs = Directory.GetDirectories(rootDir, "*", SearchOption.TopDirectoryOnly)
-                    .OrderByDescending(d => d.Length); // 从最深层次开始删除
-                
-                foreach (var dir in allDirs)
-                {
-                    // 【关键】跳过已标记为解压目录的节点（这些是合法产物目录，不是残留）
-                    // 避免在 CleanupChildArchivesInTree 删除子压缩包后，误将产物目录删除
-                    if (_extractedDirectoryNodes.Contains(dir))
-                    {
-                        AppendLog($"[批量智能路径] [隐写残留清理] 跳过解压目录节点: {Path.GetFileName(dir)}", ConsoleColor.Gray);
-                        continue;
-                    }
-                    
-                    // 跳过黑名单文件夹
-                    if (IsBlacklistedFile(dir, out _))
-                        continue;
-                    
-                    // 检查目录内是否包含压缩包文件
-                    bool hasArchive = false;
-                    try
-                    {
-                        // 使用 EnumerateFileSystemEntries 确保枚举所有条目
-                        var dirEntries = Directory.EnumerateFileSystemEntries(dir);
-                        foreach (var entry in dirEntries)
-                        {
-                            // 如果是子目录，递归检查其中是否有压缩包
-                            if (Directory.Exists(entry))
-                            {
-                                if (DirectoryContainsArchiveRecursive(entry))
-                                {
-                                    hasArchive = true;
-                                    break;
-                                }
-                            }
-                            else if (IsArchiveFile(entry, false))
-                            {
-                                hasArchive = true;
-                                break;
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // 忽略错误
-                    }
-                    
-                    // 如果包含压缩包，保留该目录
-                    if (hasArchive)
-                        continue;
-                    
-                    // 这是纯残留目录，删除它
-                    try
-                    {
-                        Directory.Delete(dir, true);
-                        AppendLog($"[批量智能路径] [隐写残留清理] 已清理目录: {Path.GetFileName(dir)}", ConsoleColor.Gray);
-                        cleanedCount++;
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendLog($"[批量智能路径] [隐写残留清理] 清理目录失败: {Path.GetFileName(dir)} - {ex.Message}", ConsoleColor.Yellow);
-                    }
-                }
-                
-                if (cleanedCount > 0)
-                {
-                    AppendLog($"[批量智能路径] [隐写残留清理] 共清理 {cleanedCount} 个残留文件/目录", ConsoleColor.Green);
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[批量智能路径] [隐写残留清理] 失败: {ex.Message}", ConsoleColor.Yellow);
             }
         }
 
@@ -3408,23 +3001,16 @@ namespace AutoUnpackTool
             AppendLog($"[批量智能路径] [DEBUG] 步骤1: 清理黑名单文件", ConsoleColor.Gray);
             DeleteBlacklistedFilesUnderDirectory(rootDir);
         
-            // 【新增】步骤2: 清理隐写文件解压后的残留文件（无扩展名文件、纯数字文件名等）
-            AppendLog($"[批量智能路径] [DEBUG] 步骤2: 清理隐写残留文件", ConsoleColor.Gray);
-            await CleanSteganographyResidualFilesInBatchAsync(rootDir);
-        
-            // 步骤2: 跳过子压缩包清理（阶段1已经处理过，这里会误删未解压的子压缩包）
-            // await DeleteChildArchivesUnderDirectoryAsync(rootDir);  // 已禁用
-        
-            // 步骤3: 后序遍历：先处理深层嵌套，再处理浅层
-            AppendLog($"[批量智能路径] [DEBUG] 步骤3: 开始后序遍历", ConsoleColor.Gray);
+            // 步骤2: 后序遍历：先处理深层嵌套，再处理浅层
+            AppendLog($"[批量智能路径] [DEBUG] 步骤2: 开始后序遍历", ConsoleColor.Gray);
             ProcessDirectoryTreePostOrder(rootDir);
         
-            // 步骤4: 处理最外层目录（如果需要）
+            // 步骤3: 处理最外层目录（如果需要）
             // 当拖入的是文件夹且输出模式为ArchiveFolder时，检查是否需要扁平化最外层
             // rootDir 是解压文件夹（如 D:\写真\B-088\课件_003\课件_003）
             // 需要获取最外层文件夹（如 D:\写真\B-088\课件_003）
             string? topLevelFolder = Path.GetDirectoryName(rootDir);
-            AppendLog($"[批量智能路径] [DEBUG] 步骤4: topLevelFolder={topLevelFolder}", ConsoleColor.Gray);
+            AppendLog($"[批量智能路径] [DEBUG] 步骤3: topLevelFolder={topLevelFolder}", ConsoleColor.Gray);
                     
             if (!string.IsNullOrEmpty(topLevelFolder) && Directory.Exists(topLevelFolder))
             {
@@ -3688,30 +3274,6 @@ namespace AutoUnpackTool
         /// <summary>
         /// 递归检查目录中是否包含压缩包文件
         /// </summary>
-        private bool DirectoryContainsArchiveRecursive(string dirPath)
-        {
-            try
-            {
-                foreach (var entry in Directory.EnumerateFileSystemEntries(dirPath))
-                {
-                    if (Directory.Exists(entry))
-                    {
-                        if (DirectoryContainsArchiveRecursive(entry))
-                            return true;
-                    }
-                    else if (IsArchiveFile(entry, false))
-                    {
-                        return true;
-                    }
-                }
-            }
-            catch
-            {
-                // 忽略访问错误
-            }
-            return false;
-        }
-
         /// <summary>
         /// 判断目录是否是压缩包解压出来的
         /// 通过检查目录下是否有压缩包解压的典型特征来判断
@@ -3819,17 +3381,6 @@ namespace AutoUnpackTool
                 }
 
                 // 触发条件：恰好一个子目录且没有非压缩包文件
-                // 【修复】对于隐写文件解压目录，如果存在任何文件（含压缩包），跳过扁平化
-                // 因为隐写残留文件（如被误判为压缩包的无扩展名文件）不应触发扁平化到上层
-                if (_stegoExtractedDirectoryNodes.Contains(dirPath))
-                {
-                    if (allFiles.Length > 0)
-                    {
-                        AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 隐写根目录存在 {allFiles.Length} 个文件，跳过扁平化", ConsoleColor.Gray);
-                        return;
-                    }
-                }
-                
                 if (subDirs.Length != 1 || nonArchiveFiles.Length > 0)
                 {
                     if (subDirs.Length != 1)
@@ -4562,24 +4113,31 @@ namespace AutoUnpackTool
             return IsStegoFileBy7ZipProbe(filePath);
         }
 
-        private bool IsStegoFileBy7ZipProbe(string filePath)
+        /// <summary>
+        /// 从 7z l -t# -slt 输出中检测隐藏压缩包的具体类型（如 zip/7z/rar/tar）
+        /// 同时解析出存档内包含的真实文件列表（白名单），用于过滤 -t# 提取的误匹配垃圾
+        /// 返回 null 表示非隐写文件或无法确定类型
+        /// 结果会被缓存，同一文件只探测一次
+        /// </summary>
+        private string? DetectStegoArchiveType(string filePath)
         {
             if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                return false;
+                return null;
 
-            if (_stegoProbeCache.TryGetValue(filePath, out bool cached))
-                return cached;
+            if (_stegoArchiveTypeCache.TryGetValue(filePath, out string? cachedType))
+                return cachedType;
 
-            bool detected = false;
+            string? detectedType = null;
+            HashSet<string> validFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
                 if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
-                    return false;
+                    return null;
 
                 var startInfo = new ProcessStartInfo
                 {
                     FileName = _settings.SevenZipPath,
-                    Arguments = $"l -t# -sccUTF-8 \"{filePath}\"",
+                    Arguments = $"l -t# -slt -sccUTF-8 \"{filePath}\"",
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -4597,24 +4155,177 @@ namespace AutoUnpackTool
                 {
                     try { process.Kill(); } catch { }
                     AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 探测超时，跳过", ConsoleColor.Gray);
-                    detected = false;
                 }
                 else if (process.ExitCode == 0)
                 {
-                    string lower = (output + Environment.NewLine + error).ToLowerInvariant();
-                    detected = lower.Contains(".zip") ||
-                               lower.Contains(".7z") ||
-                               lower.Contains(".rar") ||
-                               lower.Contains(".tar") ||
-                               lower.Contains("listing archive");
+                    string combined = output + Environment.NewLine + error;
+                    string lower = combined.ToLowerInvariant();
+                    
+                    // 解析 "Type = zip" 行获取具体压缩格式
+                    detectedType = ParseArchiveTypeFromOutput(combined);
+                    
+                    // 如果无法解析具体类型，使用 # 作为回退（提取时会用 -t# 哈希扫描）
+                    if (detectedType == null)
+                    {
+                        bool isArchive = lower.Contains(".zip") ||
+                                         lower.Contains(".7z") ||
+                                         lower.Contains(".rar") ||
+                                         lower.Contains(".tar") ||
+                                         lower.Contains("listing archive");
+                        if (isArchive)
+                        {
+                            detectedType = "#";
+                        }
+                    }
+                    
+                    // 从 -slt 输出解析真实文件列表（白名单）
+                    if (detectedType != null)
+                    {
+                        validFiles = ParseStegoFileListFromSltOutput(combined, filePath);
+                        AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 解析到 {validFiles.Count} 个白名单文件", ConsoleColor.Gray);
+                    }
                 }
             }
             catch (Exception ex)
             {
                 AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: {ex.Message}", ConsoleColor.Gray);
-                detected = false;
             }
 
+            _stegoArchiveTypeCache[filePath] = detectedType;
+            _stegoArchiveValidFilesCache[filePath] = validFiles;
+            return detectedType;
+        }
+
+        /// <summary>
+        /// 从 7z l -t# -slt 输出中解析真实包含的文件名列表（白名单）
+        /// -slt 格式每行是 "Key = Value"，文件的 Path= 行即文件名
+        /// 跳过第一个 Path=（存档自身路径），后续的 Path= 均为存档内文件
+        /// </summary>
+        private static HashSet<string> ParseStegoFileListFromSltOutput(string combined, string archivePath)
+        {
+            var fileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool firstPathFound = false;
+            string archiveFileName = Path.GetFileName(archivePath);
+            
+            foreach (var line in combined.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string trimmed = line.Trim();
+                if (!trimmed.StartsWith("Path = ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                
+                string pathValue = trimmed.Substring("Path = ".Length).Trim();
+                
+                // 跳过第一个 Path（存档自身路径）
+                if (!firstPathFound)
+                {
+                    firstPathFound = true;
+                    continue;
+                }
+                
+                // 取纯文件名
+                string fileName = Path.GetFileName(pathValue);
+                if (!string.IsNullOrEmpty(fileName))
+                {
+                    fileNames.Add(fileName);
+                }
+            }
+            
+            return fileNames;
+        }
+
+        /// <summary>
+        /// 获取隐写文件内包含的真实文件白名单（已缓存）
+        /// </summary>
+        private HashSet<string>? GetStegoArchiveValidFiles(string filePath)
+        {
+            if (_stegoArchiveValidFilesCache.TryGetValue(filePath, out var files))
+                return files;
+            return null;
+        }
+
+        /// <summary>
+        /// 用标准 7z l（不带 -t#）验证文件是否为真正的压缩包
+        /// -t# 哈希扫描可能将媒体文件的二进制数据误识别为压缩包签名，
+        /// 产生假阳性垃圾文件。标准 7z l 从文件头开始解析，不会误匹配。
+        /// 返回 true 表示该文件是可通过标准方式列出内容的真正压缩包。
+        /// </summary>
+        private bool VerifyIsRealArchive(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+                return false;
+
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
+                    return false;
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = _settings.SevenZipPath,
+                    Arguments = $"l -sccUTF-8 \"{filePath}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    StandardOutputEncoding = System.Text.Encoding.UTF8,
+                    StandardErrorEncoding = System.Text.Encoding.UTF8
+                };
+
+                using var process = new Process { StartInfo = startInfo };
+                process.Start();
+                process.StandardOutput.ReadToEnd();
+                process.StandardError.ReadToEnd();
+
+                if (!process.WaitForExit(15000))
+                {
+                    try { process.Kill(); } catch { }
+                    return false;
+                }
+
+                // 退出码 0 表示成功列出内容 → 真正的压缩包
+                return process.ExitCode == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 从 7z l -t# 输出中解析 "Type = xxx" 行，提取压缩格式
+        /// </summary>
+        private static string? ParseArchiveTypeFromOutput(string output)
+        {
+            // 匹配 "Type = zip" 或 "Type = 7z" 等
+            var match = System.Text.RegularExpressions.Regex.Match(
+                output, @"Type\s*=\s*(\w+)", 
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            
+            if (match.Success)
+            {
+                string type = match.Groups[1].Value.ToLowerInvariant();
+                // 只返回已知支持的格式
+                if (type == "zip" || type == "7z" || type == "rar" || type == "tar" ||
+                    type == "gzip" || type == "gz" || type == "bzip2" || type == "bz2" ||
+                    type == "xz" || type == "lzma" || type == "cab" || type == "arj" ||
+                    type == "z" || type == "lzh" || type == "iso" || type == "wim")
+                {
+                    return type;
+                }
+            }
+            return null;
+        }
+
+        private bool IsStegoFileBy7ZipProbe(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+                return false;
+
+            if (_stegoProbeCache.TryGetValue(filePath, out bool cached))
+                return cached;
+
+            string? detectedType = DetectStegoArchiveType(filePath);
+            bool detected = detectedType != null;
             _stegoProbeCache[filePath] = detected;
             return detected;
         }

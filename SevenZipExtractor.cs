@@ -214,7 +214,7 @@ namespace AutoUnpackTool
             bool showCliWindow = false,
             CancellationToken cancellationToken = default,
             int extractionTimeout = 3600,
-            bool useHashTypeMode = false)
+            string? stegoArchiveType = null)
         {
             return await Task.Run(() =>
             {
@@ -234,12 +234,13 @@ namespace AutoUnpackTool
                         Directory.CreateDirectory(outputDir);
                     }
 
-                    // 注意：-t# 参数用于隐写模式（hash type mode），它会将视频容器当作压缩包处理
-                    // 使用 -x 命令解压到指定目录
+                    // 注意：隐写模式下使用具体类型（如 -tzip/-t7z）而非 -t#
+                    // -t# 是哈希扫描模式，可能误匹配媒体文件中非压缩数据的字节签名，产生垃圾残留文件
+                    // 使用从 "7z l -t#" 输出中检测到的具体类型，只解析目标压缩格式
                     var arguments = $"x \"{archivePath}\" -o\"{outputDir}\" -y -sccUTF-8";
-                    if (useHashTypeMode)
+                    if (!string.IsNullOrEmpty(stegoArchiveType))
                     {
-                        arguments += " -t#";
+                        arguments += $" -t{stegoArchiveType}";
                     }
                     
                     if (!string.IsNullOrEmpty(password))
