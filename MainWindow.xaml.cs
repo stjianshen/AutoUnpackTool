@@ -1836,14 +1836,13 @@ namespace AutoUnpackTool
 
         /// <summary>
         /// 顶级解压链完成时，分三个阶段顺序执行：
-        /// 阶段1：清理所有子压缩包（确保目录干净后再扁平化）
-        /// 阶段2：批量智能路径处理（扁平化）
-        /// 阶段3：清理顶级原压缩包（含分卷）+ 遗留空目录 + 更新状态
+        /// 阶段1：清理所有子压缩包（确保目录内干净）
+        /// 阶段2：清理顶级原压缩包（先删归档，让父目录变干净，方便后续扁平化）
+        /// 阶段3：批量智能路径处理（扁平化）+ 遗留空目录 + 更新状态
         /// </summary>
         private async Task FinalizeTopLevelExtractAndSmartPathAsync(string topArchivePath)
         {
             AppendLog($"[阶段1] 开始清理子压缩包...", ConsoleColor.Cyan);
-            // 阶段1：清理所有子压缩包
             try
             {
                 await CleanupChildArchivesInTree();
@@ -1854,37 +1853,64 @@ namespace AutoUnpackTool
                 AppendLog($"[阶段1] 清理子压缩包失败: {ex.Message}", ConsoleColor.Red);
             }
         
-            AppendLog($"[阶段2] 开始批量智能路径处理...", ConsoleColor.Cyan);
-            // 阶段2：批量智能路径处理（扁平化）
-            // 【关键修复】必须等待扁平化完成，才能继续阶段3
-            try
-            {
-                await ProcessBatchSmartPathSynchronous(topArchivePath);
-                AppendLog($"[阶段2] 批量智能路径处理完成", ConsoleColor.Cyan);
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[阶段2] 批量智能路径失败: {ex.Message}", ConsoleColor.Red);
-            }
-        
-            AppendLog($"[阶段3] 开始清理顶级原压缩包: {Path.GetFileName(topArchivePath)}", ConsoleColor.Cyan);
-            // 阶段3：清理顶级原压缩包（含分卷）+ 遗留空目录
+            AppendLog($"[阶段2] 开始清理顶级原压缩包: {Path.GetFileName(topArchivePath)}", ConsoleColor.Cyan);
+            // 阶段2：清理顶级原压缩包（含分卷）
+            // 提前清理让目录变干净，扁平化时不会被归档文件阻塞
             try
             {
                 if (_settings.FileAfterExtract != FileAction.Keep)
                 {
-                    AppendLog($"[阶段3] 等待文件解锁并清理...", ConsoleColor.Cyan);
+                    AppendLog($"[阶段2] 等待文件解锁并清理...", ConsoleColor.Cyan);
                     await HandleOriginalFile(topArchivePath);
-                    AppendLog($"[阶段3] 顶级原压缩包清理完成", ConsoleColor.Cyan);
+                    AppendLog($"[阶段2] 顶级原压缩包清理完成", ConsoleColor.Cyan);
                 }
                 else
                 {
-                    AppendLog($"[阶段3] 配置为保留原文件，跳过清理", ConsoleColor.Cyan);
+                    AppendLog($"[阶段2] 配置为保留原文件，跳过清理", ConsoleColor.Cyan);
                 }
             }
             catch (Exception ex)
             {
-                AppendLog($"[阶段3] 处理原文件时出错: {ex.Message}", ConsoleColor.Red);
+                AppendLog($"[阶段2] 处理原文件时出错: {ex.Message}", ConsoleColor.Red);
+            }
+        
+            AppendLog($"[阶段3] 开始批量智能路径处理...", ConsoleColor.Cyan);
+            // 阶段3：批量智能路径处理（扁平化）
+            try
+            {
+                await ProcessBatchSmartPathSynchronous(topArchivePath);
+                AppendLog($"[阶段3] 批量智能路径处理完成", ConsoleColor.Cyan);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[阶段3] 批量智能路径失败: {ex.Message}", ConsoleColor.Red);
+            }
+        
+            // 阶段4: 检查归档父目录是否需要扁平化
+            // 拖入的文件夹不在 _extractedDirectoryNodes 中，阶段3不会处理它。
+            // 但归档清理后（阶段2），父目录可能变得只需1个子目录，此时应扁平化。
+            // 优化：仅当父目录恰好有1个子目录时才处理，避免无意义的遍历。
+            string archiveParentDir = Path.GetDirectoryName(topArchivePath);
+            if (!string.IsNullOrEmpty(archiveParentDir) && Directory.Exists(archiveParentDir))
+            {
+                var parentSubDirs = Directory.GetDirectories(archiveParentDir);
+                if (parentSubDirs.Length == 1)
+                {
+                    AppendLog($"[阶段4] 归档父目录仅有1个子目录，检查是否需要扁平化: {archiveParentDir}", ConsoleColor.Cyan);
+                    try
+                    {
+                        await Task.Run(() => ProcessSmartPathBatchAsync(archiveParentDir));
+                        AppendLog($"[阶段4] 归档父目录处理完成", ConsoleColor.Cyan);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog($"[阶段4] 归档父目录处理失败: {ex.Message}", ConsoleColor.Red);
+                    }
+                }
+                else
+                {
+                    AppendLog($"[阶段4] 归档父目录有 {parentSubDirs.Length} 个子目录，无需扁平化，跳过: {archiveParentDir}", ConsoleColor.Gray);
+                }
             }
         
             try
@@ -2886,22 +2912,32 @@ namespace AutoUnpackTool
                 return;
             }
         
-            // 【关键修复】遍历所有解压目录，而不是只处理顶级压缩包的输出目录
-            // 这样可以确保子压缩包的解压目录也能被扁平化处理
-            var extractedDirs = _extractedDirectoryNodes.ToList();
-            AppendLog($"[同步批量智能路径] [DEBUG] 找到 {extractedDirs.Count} 个解压目录节点", ConsoleColor.Gray);
-            
-            // 打印所有解压目录，方便调试
-            foreach (var dir in extractedDirs)
+            var allExtractedDirs = _extractedDirectoryNodes.ToList();
+            AppendLog($"[同步批量智能路径] [DEBUG] 共 {allExtractedDirs.Count} 个解压目录节点", ConsoleColor.Gray);
+            foreach (var dir in allExtractedDirs)
             {
                 AppendLog($"[同步批量智能路径] [DEBUG]   - {dir}", ConsoleColor.Gray);
             }
+
+            // 找出最顶层解压目录：父目录不在 _extractedDirectoryNodes 中的才是顶层
+            // 后序遍历会自然递归覆盖所有子孙目录，无需逐个处理
+            var topLevelDirs = allExtractedDirs
+                .Where(dir =>
+                {
+                    string? parent = Path.GetDirectoryName(dir);
+                    return parent == null || !_extractedDirectoryNodes.Contains(parent);
+                })
+                .ToList();
+
+            AppendLog($"[同步批量智能路径] [DEBUG] 其中 {topLevelDirs.Count} 个为最顶层: {string.Join(", ", topLevelDirs.Select(d => Path.GetFileName(d)))}", ConsoleColor.Gray);
             
             // 清空已处理标记（每次批量处理都是独立的）
             _processedFlattenDirs.Clear();
             
             int processedCount = 0;
-            foreach (var outputDir in extractedDirs)
+            string archiveDir = Path.GetDirectoryName(topArchivePath) ?? string.Empty;
+            
+            foreach (var outputDir in topLevelDirs)
             {
                 if (!Directory.Exists(outputDir))
                 {
@@ -2909,35 +2945,21 @@ namespace AutoUnpackTool
                     continue;
                 }
             
-                // 对于 ArchiveDir 模式（压到当前目录），不进行扁平化处理
-                string archiveDir = Path.GetDirectoryName(topArchivePath) ?? string.Empty;
-                
-                // 检查该目录是否是 ArchiveDir 模式（即 outputDir == archiveDir）
+                // ArchiveDir 模式（解压到当前目录），不进行扁平化处理
                 if (outputDir.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
                 {
                     AppendLog($"[同步批量智能路径] [DEBUG] 目录是 ArchiveDir 模式，跳过扁平化: {outputDir}", ConsoleColor.Gray);
-                    AppendLog($"[同步批量智能路径] [DEBUG]   topArchivePath={topArchivePath}, archiveDir={archiveDir}", ConsoleColor.Gray);
-                    continue;
-                }
-                
-                // 检查是否已经被处理过（防止重复处理）
-                if (_processedFlattenDirs.Contains(outputDir))
-                {
-                    AppendLog($"[同步批量智能路径] [DEBUG] 目录已处理过，跳过: {outputDir}", ConsoleColor.Gray);
                     continue;
                 }
             
                 AppendLog($"[同步批量智能路径] 开始处理: {outputDir}", ConsoleColor.Cyan);
             
-                // 同步处理这个觧压生成的文件夹（等待完成）
                 await Task.Run(() => ProcessSmartPathBatchAsync(outputDir));
-                
-                // 标记为已处理
                 _processedFlattenDirs.Add(outputDir);
                 processedCount++;
             }
         
-            AppendLog($"[同步批量智能路径] ✓ 共处理 {processedCount}/{extractedDirs.Count} 个目录", ConsoleColor.Green);
+            AppendLog($"[同步批量智能路径] ✓ 共处理 {processedCount}/{topLevelDirs.Count} 个顶层目录", ConsoleColor.Green);
         }
 
         /// <summary>
@@ -2960,7 +2982,54 @@ namespace AutoUnpackTool
 
                 // 获取最终扁平化后的路径
                 string outputDir = GetOutputDirectory(topArchivePath);
-                string? finalPath = FindFinalFlattenedPath(outputDir);
+                AppendLog($"[状态更新] [DEBUG] outputDir(计算值)={outputDir}, 存在={Directory.Exists(outputDir)}", ConsoleColor.Gray);
+                
+                // 【关键修复】outputDir 可能在阶段4父目录扁平化后被移动
+                // _extractedDirectoryNodes 中已更新到新路径，需要从中查找实际路径
+                string resolvedDir = outputDir;
+                if (!Directory.Exists(outputDir))
+                {
+                    // 目录不存在，可能被父目录扁平化移动了
+                    // 在 _extractedDirectoryNodes 中按目录名查找被移动后的实际路径
+                    string dirName = Path.GetFileName(outputDir);
+                    var movedDirs = _extractedDirectoryNodes
+                        .Where(d => Path.GetFileName(d).Equals(dirName, StringComparison.OrdinalIgnoreCase)
+                                 && !d.Equals(outputDir, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    
+                    if (movedDirs.Count > 0)
+                    {
+                        // 优先选择路径最短的（最接近根目录的，即被提升最多的）
+                        resolvedDir = movedDirs.OrderBy(d => d.Length).First();
+                        AppendLog($"[状态更新] [DEBUG] outputDir 不存在，从 _extractedDirectoryNodes 追踪到: {resolvedDir}", ConsoleColor.Gray);
+                    }
+                    else
+                    {
+                        AppendLog($"[状态更新] [DEBUG] outputDir 不存在且未在 _extractedDirectoryNodes 中找到同名目录", ConsoleColor.Yellow);
+                    }
+                }
+                else
+                {
+                    // 目录存在，但检查 _extractedDirectoryNodes 是否有同名但不同路径的目录
+                    // （父目录被扁平化后，同名目录在原路径仍存在但 _extractedDirectoryNodes 已更新）
+                    string dirName = Path.GetFileName(outputDir);
+                    var movedDirs = _extractedDirectoryNodes
+                        .Where(d => Path.GetFileName(d).Equals(dirName, StringComparison.OrdinalIgnoreCase)
+                                 && !d.Equals(outputDir, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    
+                    if (movedDirs.Count > 0)
+                    {
+                        // 同名目录存在于不同路径，说明父目录扁平化已移动了它
+                        // 原路径 outputDir 虽有同名目录但那是旧位置的残留或新创建的同名目录
+                        // 使用 _extractedDirectoryNodes 中的新路径
+                        resolvedDir = movedDirs.OrderBy(d => d.Length).First();
+                        AppendLog($"[状态更新] [DEBUG] _extractedDirectoryNodes 中存在同名但路径不同的目录（父目录扁平化？），使用: {resolvedDir} (旧: {outputDir})", ConsoleColor.Gray);
+                    }
+                }
+                
+                string? finalPath = FindFinalFlattenedPath(resolvedDir);
+                AppendLog($"[状态更新] [DEBUG] FindFinalFlattenedPath({resolvedDir}) = {finalPath}", ConsoleColor.Gray);
 
                 Dispatcher.Invoke(() =>
                 {
@@ -3001,21 +3070,20 @@ namespace AutoUnpackTool
             AppendLog($"[批量智能路径] [DEBUG] 步骤1: 清理黑名单文件", ConsoleColor.Gray);
             DeleteBlacklistedFilesUnderDirectory(rootDir);
         
-            // 步骤2: 后序遍历：先处理深层嵌套，再处理浅层
-            AppendLog($"[批量智能路径] [DEBUG] 步骤2: 开始后序遍历", ConsoleColor.Gray);
+            // 步骤2: 后序遍历——从叶子节点向上逐级扁平化
+            // 只处理解压树中的目录（_extractedDirectoryNodes），非解压目录跳过
+            // 后序遍历自然覆盖所有层级（包括最外层），无需额外的"最外层"检查
+            AppendLog($"[批量智能路径] [DEBUG] 步骤2: 开始后序遍历, rootDir={rootDir}", ConsoleColor.Gray);
             ProcessDirectoryTreePostOrder(rootDir);
         
-            // 步骤3: 处理最外层目录（如果需要）
-            // 当拖入的是文件夹且输出模式为ArchiveFolder时，检查是否需要扁平化最外层
-            // rootDir 是解压文件夹（如 D:\写真\B-088\课件_003\课件_003）
-            // 需要获取最外层文件夹（如 D:\写真\B-088\课件_003）
-            string? topLevelFolder = Path.GetDirectoryName(rootDir);
-            AppendLog($"[批量智能路径] [DEBUG] 步骤3: topLevelFolder={topLevelFolder}", ConsoleColor.Gray);
-                    
-            if (!string.IsNullOrEmpty(topLevelFolder) && Directory.Exists(topLevelFolder))
+            // 步骤3: 根目录兜底检查——拖入的文件夹本身不在 _extractedDirectoryNodes 中，
+            // 后序遍历会跳过它。但如果它恰好只有一个子目录且无其他非压缩包文件，仍需扁平化。
+            string normalizedRoot = Path.GetFullPath(rootDir).TrimEnd(Path.DirectorySeparatorChar);
+            if (Directory.Exists(rootDir) && !_processedFlattenDirs.Contains(normalizedRoot))
             {
-                AppendLog($"[批量智能路径] [DEBUG] 开始处理最外层目录", ConsoleColor.Gray);
-                ProcessTopLevelFolderIfNeeded(topLevelFolder);
+                AppendLog($"[批量智能路径] [DEBUG] 步骤3: 检查根目录是否需要扁平化: {rootDir}", ConsoleColor.Gray);
+                ProcessSingleDirectoryIfNeeded(rootDir);
+                _processedFlattenDirs.Add(normalizedRoot);
             }
         
             AppendLog($"[批量智能路径] ✓ 处理完成: {Path.GetFileName(rootDir)}", ConsoleColor.Green);
@@ -3127,6 +3195,19 @@ namespace AutoUnpackTool
                     string? parentDir = Path.GetDirectoryName(rootDir);
                     if (string.IsNullOrEmpty(parentDir) || !Directory.Exists(parentDir))
                     {
+                        // 父目录也不存在（被最外层扁平化删除了），在祖目录中查找被移动的同名目录
+                        string? grandParent = Path.GetDirectoryName(parentDir);
+                        if (!string.IsNullOrEmpty(grandParent) && Directory.Exists(grandParent))
+                        {
+                            string dirName = Path.GetFileName(rootDir);
+                            string? candidatePath = Path.Combine(grandParent, dirName);
+                            AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 尝试在祖目录查找被移动的目录 {candidatePath}", ConsoleColor.Gray);
+                            if (Directory.Exists(candidatePath))
+                            {
+                                AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 找到被最外层扁平化移动的目录 {candidatePath}", ConsoleColor.Gray);
+                                return FindFinalFlattenedPath(candidatePath);
+                            }
+                        }
                         AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 父目录不存在，返回 rootDir {rootDir}", ConsoleColor.Gray);
                         return rootDir;
                     }
@@ -3143,21 +3224,21 @@ namespace AutoUnpackTool
                     return rootDir;
                 }
                 
-                // rootDir 存在，递归查找其下最深层的标记节点
-                string? deepest = FindDeepestMarkedNode(rootDir);
-                if (deepest != null)
-                {
-                    AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 递归找到最深层的标记节点 {deepest}", ConsoleColor.Gray);
-                    return deepest;
-                }
-                    
+                // rootDir 存在，先检查子目录数量判断是否被扁平化
                 var subDirsInRoot = Directory.GetDirectories(rootDir);
                 
                 AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: {rootDir}, 子目录数={subDirsInRoot.Length}", ConsoleColor.Gray);
                 
                 if (subDirsInRoot.Length == 1)
                 {
-                    // 只有一个子目录，说明已扁平化，返回该子目录
+                    // 只有一个子目录，可能已扁平化，递归查找最深层的标记节点确认最终路径
+                    string? deepest = FindDeepestMarkedNode(rootDir);
+                    if (deepest != null)
+                    {
+                        AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 递归找到最深层的标记节点 {deepest}", ConsoleColor.Gray);
+                        return deepest;
+                    }
+                    // 没有标记节点，返回唯一的子目录
                     AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 返回子目录 {subDirsInRoot[0]}", ConsoleColor.Gray);
                     return subDirsInRoot[0];
                 }
@@ -3169,25 +3250,9 @@ namespace AutoUnpackTool
                 }
                 else
                 {
-                    // 有多个子目录，递归查找最深层的标记节点
-                    string? deepestNode = FindDeepestMarkedNode(rootDir);
-                    if (deepestNode != null)
-                    {
-                        AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 找到最深层的标记节点 {deepestNode}", ConsoleColor.Gray);
-                        return deepestNode;
-                    }
-                    
-                    // 如果没有找到标记的节点，返回第一个子目录（如果有）或 rootDir
-                    if (subDirsInRoot.Length > 0)
-                    {
-                        AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 返回第一个子目录 {subDirsInRoot[0]}", ConsoleColor.Gray);
-                        return subDirsInRoot[0];
-                    }
-                    else
-                    {
-                        AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 返回 rootDir {rootDir}", ConsoleColor.Gray);
-                        return rootDir;
-                    }
+                    // 有多个子目录，说明当前层级未发生扁平化，返回 rootDir 本身
+                    AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 有多个子目录({subDirsInRoot.Length})，未扁平化，返回 rootDir {rootDir}", ConsoleColor.Gray);
+                    return rootDir;
                 }
             }
             catch (Exception ex)
@@ -3412,15 +3477,17 @@ namespace AutoUnpackTool
         /// <summary>
         /// 处理最外层目录：如果拖入的是文件夹，且解压后最外层目录只包含一个子目录，则扁平化
         /// </summary>
-        private void ProcessTopLevelFolderIfNeeded(string rootDir)
+        private string? ProcessTopLevelFolderIfNeeded(string rootDir)
         {
             try
             {
+                string? resultPath = null;
+                
                 // 再次检查目录是否存在（可能内层扁平化已经改变了结构）
                 if (!Directory.Exists(rootDir))
                 {
                     AppendLog($"[批量智能路径] [最外层检查] 目录已不存在，跳过: {rootDir}", ConsoleColor.Gray);
-                    return;
+                    return null;
                 }
 
                 // 检查最外层目录是否只有一个子目录
@@ -3438,7 +3505,7 @@ namespace AutoUnpackTool
                         AppendLog($"[批量智能路径] [最外层检查] 子目录数量不为1 ({subDirs.Length})，不处理最外层", ConsoleColor.Gray);
                     if (nonArchiveFiles.Length > 0)
                         AppendLog($"[批量智能路径] [最外层检查] 存在 {nonArchiveFiles.Length} 个非压缩包文件，不处理最外层", ConsoleColor.Gray);
-                    return;
+                    return null;
                 }
 
                 // 此时应该只有 1 个子目录和若干压缩包文件
@@ -3451,7 +3518,7 @@ namespace AutoUnpackTool
                 if (string.IsNullOrEmpty(parentDirFullPath))
                 {
                     AppendLog($"[批量智能路径] [最外层扁平化] 无法获取父目录路径，跳过处理", ConsoleColor.Yellow);
-                    return;
+                    return null;
                 }
 
                 AppendLog($"[批量智能路径] [最外层扁平化] 检测到可扁平化: {parentDirName} -> {subDirName}", ConsoleColor.Cyan);
@@ -3473,6 +3540,14 @@ namespace AutoUnpackTool
                 // 移动子目录到父目录的同级
                 Directory.Move(singleSubDir, newPath);
                 AppendLog($"[批量智能路径] [最外层扁平化] 已移动: {subDirName} -> {Path.GetFileName(newPath)}", ConsoleColor.Gray);
+
+                // 【关键】同步更新 _extractedDirectoryNodes，确保后续后序遍历能找到新路径
+                if (_extractedDirectoryNodes.Contains(singleSubDir))
+                {
+                    _extractedDirectoryNodes.Remove(singleSubDir);
+                    _extractedDirectoryNodes.Add(newPath);
+                    AppendLog($"[批量智能路径] [最外层扁平化] 已同步 _extractedDirectoryNodes: {singleSubDir} -> {newPath}", ConsoleColor.Gray);
+                }
 
                 // 删除最外层目录（压缩包会被保留，因为已经移动到 newPath 的父目录了）
                 // 注意：不能直接递归删除，因为压缩包还在里面
@@ -3531,8 +3606,19 @@ namespace AutoUnpackTool
                     {
                         if (Directory.Exists(finalPath))
                         {
-                            Directory.Delete(finalPath, true);
-                            AppendLog($"[批量智能路径] [最外层扁平化] 已删除已存在的最终目录: {subDirName}", ConsoleColor.Gray);
+                            // 【安全检查】只删除已知的解压节点目录，避免误删用户数据
+                            if (_extractedDirectoryNodes.Contains(finalPath))
+                            {
+                                Directory.Delete(finalPath, true);
+                                AppendLog($"[批量智能路径] [最外层扁平化] 已删除已存在的最终目录: {subDirName}", ConsoleColor.Gray);
+                            }
+                            else
+                            {
+                                // 目标目录非解压节点，使用GUID前缀避免冲突
+                                string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{subDirName}";
+                                finalPath = Path.Combine(parentDirFullPath, safeName);
+                                AppendLog($"[批量智能路径] [最外层扁平化] ⚠ 目标目录已存在且非解压节点，使用安全名称: {safeName}", ConsoleColor.Yellow);
+                            }
                         }
                         
                         Directory.Move(newPath, finalPath);
@@ -3546,10 +3632,13 @@ namespace AutoUnpackTool
                 }
                 
                 AppendLog($"[批量智能路径] [最外层扁平化] ✓ 扁平化完成: {Path.GetFileName(newPath)}", ConsoleColor.Green);
+                resultPath = newPath;
+                return resultPath;
             }
             catch (Exception ex)
             {
                 AppendLog($"[批量智能路径] [最外层扁平化] 处理失败: {ex.Message}", ConsoleColor.Red);
+                return null;
             }
         }
 
@@ -3729,10 +3818,23 @@ namespace AutoUnpackTool
                 // 步骤3: 重命名为最终名称
                 string finalPath = Path.Combine(parentDirPath, finalName);
                 
+                // 【安全删除检查】目标目录已存在时，只删除已知的解压节点目录
+                // 避免静默覆盖非扁平化产生的用户原始目录
                 if (Directory.Exists(finalPath))
                 {
-                    Directory.Delete(finalPath, true);
-                    AppendLog($"[批量智能路径]   已删除已存在的目录: {finalName}", ConsoleColor.Gray);
+                    if (_extractedDirectoryNodes.Contains(finalPath))
+                    {
+                        // 目标是已知的解压节点，安全删除并替换
+                        Directory.Delete(finalPath, true);
+                        AppendLog($"[批量智能路径]   已替换已存在的解压节点目录: {finalName}", ConsoleColor.Gray);
+                    }
+                    else
+                    {
+                        // 目标是非解压节点的目录，不能删除，使用GUID前缀避免冲突
+                        string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{finalName}";
+                        finalPath = Path.Combine(parentDirPath, safeName);
+                        AppendLog($"[批量智能路径] ⚠ 目标目录已存在且非解压节点，使用安全名称: {safeName}", ConsoleColor.Yellow);
+                    }
                 }
 
                 // 添加重试机制，防止文件占用导致卡住
@@ -3745,14 +3847,21 @@ namespace AutoUnpackTool
                     {
                         Directory.Move(tempPath, finalPath);
                         moveSuccess = true;
-                        AppendLog($"[批量智能路径]   ✓ 扁平化完成: {finalName}", ConsoleColor.Green);
+                        AppendLog($"[批量智能路径]   ✓ 扁平化完成: {Path.GetFileName(finalPath)}", ConsoleColor.Green);
                         
-                        // 更新解压节点标记：将临时路径替换为最终路径
+                        // 更新解压节点标记：将临时路径替换为最终路径（避免重复条目）
                         if (_extractedDirectoryNodes.Contains(tempPath))
                         {
                             _extractedDirectoryNodes.Remove(tempPath);
-                            _extractedDirectoryNodes.Add(finalPath);
-                            AppendLog($"[批量智能路径] [DEBUG] 更新解压节点标记: {tempPath} -> {finalPath}", ConsoleColor.Gray);
+                            if (!_extractedDirectoryNodes.Contains(finalPath))
+                            {
+                                _extractedDirectoryNodes.Add(finalPath);
+                                AppendLog($"[批量智能路径] [DEBUG] 更新解压节点标记: {tempPath} -> {finalPath}", ConsoleColor.Gray);
+                            }
+                            else
+                            {
+                                AppendLog($"[批量智能路径] [DEBUG] 解压节点标记已存在，跳过重复添加: {finalPath}", ConsoleColor.Gray);
+                            }
                         }
                     }
                     catch (IOException ioEx) when (retryCount < maxRetries - 1)
@@ -3784,16 +3893,7 @@ namespace AutoUnpackTool
                     return;
                 }
 
-                // 步骤4: 扁平化后，重新处理新生成的目录（可能仍满足扁平化条件）
-                if (Directory.Exists(finalPath))
-                {
-                    // 清除旧目录的已处理标记（因为目录结构已经改变）
-                    string normalizedOldPath = Path.GetFullPath(parentDir).TrimEnd(Path.DirectorySeparatorChar);
-                    _processedFlattenDirs.Remove(normalizedOldPath);
-                    
-                    AppendLog($"[批量智能路径] [DEBUG] 扁平化后重新处理: {finalName}", ConsoleColor.Gray);
-                    ProcessDirectoryTreePostOrder(finalPath, true);  // 标记为解压树中的节点
-                }
+                // 【已移除步骤4】后序遍历本身就会自然上溯处理父目录，无需额外递归重新处理
             }
             catch (Exception ex)
             {
