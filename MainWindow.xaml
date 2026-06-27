@@ -118,7 +118,10 @@
                     <Border Grid.Row="0" Background="#F0F8FF" BorderBrush="#4682B4" BorderThickness="1" Margin="5" Padding="10" CornerRadius="3">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="最终路径:" FontWeight="Bold" Foreground="#4682B4" Margin="0,0,10,0"/>
-                            <TextBlock x:Name="TxtFinalPath" Text="无" Foreground="#333333" TextWrapping="Wrap"/>
+                            <TextBox x:Name="TxtFinalPath" Text="无" Foreground="#333333" 
+                                     BorderThickness="0" Background="Transparent" IsReadOnly="True"
+                                     TextWrapping="Wrap" VerticalAlignment="Center"
+                                     Cursor="Arrow"/>
                         </StackPanel>
                     </Border>
                     
