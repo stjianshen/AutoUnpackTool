@@ -14,7 +14,6 @@ namespace AutoUnpackTool
         private ObservableCollection<PasswordItem> _passwordList = new ObservableCollection<PasswordItem>();
         private ObservableCollection<PasswordItem> _filteredPasswordList = new ObservableCollection<PasswordItem>();
         private AppSettings _settings;
-        private bool _isDirty = false;
         private string _searchText = "";
 
         public PasswordManagerDialog(AppSettings settings)
@@ -203,7 +202,7 @@ namespace AutoUnpackTool
                 }
 
                 _passwordList.Remove(item);
-                _isDirty = true;
+                
             }
 
             // 如果有永久密码被删除，立即保存到配置文件（带备份）
@@ -341,7 +340,7 @@ namespace AutoUnpackTool
             }
 
             ReindexPasswords();
-            _isDirty = true;
+            
 
             // 清空输入框
             TxtNewPassword.Clear();
@@ -369,7 +368,7 @@ namespace AutoUnpackTool
                 _passwordList.Remove(selected);
                 ReindexPasswords();
                 ApplySearchFilter(); // 重新应用过滤以刷新显示
-                _isDirty = true;
+                
 
                 MessageBox.Show("密码已删除！", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
             }
@@ -388,7 +387,7 @@ namespace AutoUnpackTool
                 {
                     _passwordList.Move(currentIndex, currentIndex - 1);
                     ReindexPasswords();
-                    _isDirty = true;
+                    
                 }
             }
         }
@@ -402,7 +401,7 @@ namespace AutoUnpackTool
                 {
                     _passwordList.Move(currentIndex, currentIndex + 1);
                     ReindexPasswords();
-                    _isDirty = true;
+                    
                 }
             }
         }
@@ -479,7 +478,7 @@ namespace AutoUnpackTool
 
                 if (loadedCount > 0)
                 {
-                    _isDirty = true;
+                    
                     Console.WriteLine($"从文件加载 {loadedCount} 个密码，跳过重复 {skippedCount} 个");
                 }
             }
@@ -544,7 +543,7 @@ namespace AutoUnpackTool
 
                 // 重新加载密码列表以更新UI
                 LoadPasswords();
-                _isDirty = true;
+                
 
                 string message = importedCount > 0
                     ? $"导入成功！\n\n新增密码: {importedCount} 个\n更新密码: {skippedCount} 个\n配置文件中总密码数: {_settings.PermanentPasswords.Count} 个\n\n密码已永久保存到配置文件，下次启动自动加载。"
