@@ -232,12 +232,24 @@ namespace AutoUnpackTool
                     if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
                     {
                         AppendLog("虽然没有压缩文件，但将对拖入的文件夹进行智能路径处理", ConsoleColor.Cyan);
-                        foreach (var folder in _droppedFolders)
-                        {
-                            _ = Task.Run(() => ProcessSmartPathBatchAsync(folder));
-                        }
-                        // 处理完后清空记录
+                        var folders = _droppedFolders.ToList();
                         _droppedFolders.Clear();
+                        
+                        _ = Task.Run(async () =>
+                        {
+                            foreach (var folder in folders)
+                            {
+                                await ProcessSmartPathBatchAsync(folder);
+                                
+                                // 更新最终路径显示
+                                string? finalPath = FindFinalFlattenedPath(folder);
+                                Dispatcher.Invoke(() =>
+                                {
+                                    TxtFinalPath.Text = finalPath ?? folder;
+                                    AppendLog($"[智能路径] 文件夹最终路径: {TxtFinalPath.Text}", ConsoleColor.Green);
+                                });
+                            }
+                        });
                     }
                 }
             }
@@ -632,6 +644,27 @@ namespace AutoUnpackTool
                 else
                 {
                     AppendLog("已关闭强制解压模式：恢复正常的压缩文件检测", ConsoleColor.Cyan);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 跳过黑名单处理复选框状态变化事件
+        /// </summary>
+        private void ChkSkipBlacklist_Changed(object sender, RoutedEventArgs e)
+        {
+            if (ChkSkipBlacklist.IsChecked.HasValue)
+            {
+                _settings.SkipBlacklist = ChkSkipBlacklist.IsChecked.Value;
+                _settings.Save();
+                
+                if (_settings.SkipBlacklist)
+                {
+                    AppendLog("已启用跳过黑名单：黑名单匹配的文件将不会被删除", ConsoleColor.Yellow);
+                }
+                else
+                {
+                    AppendLog("已关闭跳过黑名单：恢复正常的黑名单处理", ConsoleColor.Cyan);
                 }
             }
         }
@@ -1583,6 +1616,14 @@ namespace AutoUnpackTool
                                     {
                                         AppendLog($"[智能路径] 处理拖入的文件夹: {folder}", ConsoleColor.Cyan);
                                         await ProcessSmartPathBatchAsync(folder);
+                                        
+                                        // 更新最终路径显示
+                                        string? finalPath = FindFinalFlattenedPath(folder);
+                                        Dispatcher.Invoke(() =>
+                                        {
+                                            TxtFinalPath.Text = finalPath ?? folder;
+                                            AppendLog($"[智能路径] 文件夹最终路径: {TxtFinalPath.Text}", ConsoleColor.Green);
+                                        });
                                     }
                                     catch (Exception ex)
                                     {
@@ -1784,7 +1825,15 @@ namespace AutoUnpackTool
                 try
                 {
                     // 子压缩包不受解压后原文件处理设置影响，一律直接删除
-                    await DeleteFilePermanentlyAsync(item.FilePath);
+                    if (item.VolumeInfo?.HasVolumeList == true)
+                    {
+                        // 分卷压缩包：删除所有分卷
+                        await DeleteAllVolumes(item.VolumeInfo);
+                    }
+                    else
+                    {
+                        await DeleteFilePermanentlyAsync(item.FilePath);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -2221,45 +2270,44 @@ namespace AutoUnpackTool
                     return;
                 }
             
-                // 递归查找输出目录中解压出来的新压缩文件
-                // 只扫描压缩包扩展名和分卷压缩格式，不扫描其他文件
+                // 先收集输出目录中所有文件，过滤掉解压前已存在的文件，只对新解压的文件做压缩包检测
                 var archiveExtensions = _settings.GetArchiveExtensions();
                 var allArchiveFiles = new List<string>();
-                
-                // 1. 扫描具有压缩文件扩展名的文件
-                foreach (var ext in archiveExtensions)
-                {
-                    // ext 可能是 ".rar", ".zip" 等格式
-                    string searchPattern = ext.StartsWith(".") ? $"*{ext}" : $"*.{ext}";
-                    try
-                    {
-                        var files = Directory.GetFiles(outputDir, searchPattern, SearchOption.AllDirectories);
-                        allArchiveFiles.AddRange(files);
-                    }
-                    catch
-                    {
-                        // 忽略访问权限等问题
-                    }
-                }
-                
-                // 2. 对所有其他文件使用魔术数检测（不依赖扩展名）
+
+                // 获取输出目录中所有文件
                 var allFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories);
-                foreach (var file in allFiles)
+
+                // 【关键优化】先过滤掉解压前已存在的文件，只保留新解压的文件
+                // 这样在 ArchiveDir 模式下不会误扫描整个源目录
+                List<string> filesToScan;
+                if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Count > 0)
                 {
-                    // 跳过已通过扩展名匹配的文件
-                    if (allArchiveFiles.Contains(file))
+                    filesToScan = allFiles.Where(f => !existingFilesBeforeExtract.Contains(f)).ToList();
+                    AppendLog($"[线程 {taskId}] [DEBUG] 输出目录总文件: {allFiles.Length}, 新解压文件: {filesToScan.Count}", ConsoleColor.Magenta, parentFileItem);
+                }
+                else
+                {
+                    filesToScan = allFiles.ToList();
+                }
+
+                // 只对新解压的文件进行压缩包检测
+                foreach (var file in filesToScan)
+                {
+                    // 1. 先检查扩展名（快速路径）
+                    string ext = Path.GetExtension(file).ToLowerInvariant();
+                    if (archiveExtensions.Contains(ext) || IsMultiVolumeArchive(file))
+                    {
+                        allArchiveFiles.Add(file);
                         continue;
-                        
-                    // 使用魔术数检测是否为压缩包
+                    }
+
+                    // 2. 使用魔术数检测（不依赖扩展名，仅在非扩展名匹配时使用）
                     // 注意：解压后发现的文件不受强制模式影响，始终进行正常检测
                     if (IsArchiveFile(file, false, isDroppedFile: false))
                     {
                         allArchiveFiles.Add(file);
                     }
                 }
-                
-                // 去重
-                allArchiveFiles = allArchiveFiles.Distinct().ToList();
 
                 // 【隐写垃圾过滤】-t# 哈希扫描产生的文件用标准 7z l（不带 -t#）逐文件验证
                 // 真正的压缩包通得过标准检测，-t# 误匹配的垃圾文件通不过
@@ -2285,14 +2333,6 @@ namespace AutoUnpackTool
                     }
                     allArchiveFiles = verifiedFiles;
                     AppendLog($"[线程 {taskId}] [隐写验证] 过滤前: {beforeCount} → 过滤后: {allArchiveFiles.Count}", ConsoleColor.Cyan, parentFileItem);
-                }
-
-                // 过滤掉解压前已存在的文件，只保留新解压的文件
-                if (existingFilesBeforeExtract != null && existingFilesBeforeExtract.Count > 0)
-                {
-                    var newlyExtractedFiles = allArchiveFiles.Where(f => !existingFilesBeforeExtract.Contains(f)).ToList();
-                    AppendLog($"[线程 {taskId}] [DEBUG] 过滤前: {allArchiveFiles.Count} 个, 过滤后: {newlyExtractedFiles.Count} 个新文件", ConsoleColor.Magenta, parentFileItem);
-                    allArchiveFiles = newlyExtractedFiles;
                 }
 
                 AppendLog($"[线程 {taskId}] [DEBUG] 找到 {allArchiveFiles.Count} 个候选压缩文件", ConsoleColor.Magenta, parentFileItem);
@@ -2727,9 +2767,9 @@ namespace AutoUnpackTool
             // 添加调试日志
             AppendLog($"[批量智能路径] 检查触发条件: EnableSmartPathProcessing={_settings.EnableSmartPathProcessing}, OutputMode={_settings.OutputMode}", ConsoleColor.Gray);
             
-            if (!_settings.EnableSmartPathProcessing || _settings.OutputMode != OutputMode.ArchiveFolder)
+            if (!_settings.EnableSmartPathProcessing)
             {
-                AppendLog($"[批量智能路径] 条件不满足，跳过处理", ConsoleColor.Gray);
+                AppendLog($"[批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Gray);
                 return;
             }
 
@@ -2781,6 +2821,13 @@ namespace AutoUnpackTool
                     if (extractedFolder.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
                     {
                         AppendLog($"[批量智能路径] 顶级项 {item.FileName} 使用 ArchiveDir 模式，跳过扁平化", ConsoleColor.Gray);
+                        continue;
+                    }
+                    
+                    // SpecificDir 模式（统一输出到指定目录），不进行扁平化处理
+                    if (_settings.OutputMode == OutputMode.SpecificDir)
+                    {
+                        AppendLog($"[批量智能路径] 顶级项 {item.FileName} 使用 SpecificDir 模式，跳过扁平化", ConsoleColor.Gray);
                         continue;
                     }
                     
@@ -2909,9 +2956,9 @@ namespace AutoUnpackTool
             AppendLog($"[同步批量智能路径] [DEBUG] 开始检查条件...", ConsoleColor.Gray);
             AppendLog($"[同步批量智能路径] [DEBUG] topArchivePath={topArchivePath}", ConsoleColor.Gray);
                     
-            if (!_settings.EnableSmartPathProcessing || _settings.OutputMode != OutputMode.ArchiveFolder)
+            if (!_settings.EnableSmartPathProcessing)
             {
-                AppendLog($"[同步批量智能路径] 条件不满足，跳过处理 (EnableSmartPathProcessing={_settings.EnableSmartPathProcessing}, OutputMode={_settings.OutputMode})", ConsoleColor.Yellow);
+                AppendLog($"[同步批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Yellow);
                 return;
             }
         
@@ -2952,6 +2999,14 @@ namespace AutoUnpackTool
                 if (outputDir.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
                 {
                     AppendLog($"[同步批量智能路径] [DEBUG] 目录是 ArchiveDir 模式，跳过扁平化: {outputDir}", ConsoleColor.Gray);
+                    continue;
+                }
+            
+                // SpecificDir 模式（统一输出到指定目录），不进行扁平化处理
+                // 所有压缩包输出到同一目录，扁平化会误操作其他压缩包的内容
+                if (_settings.OutputMode == OutputMode.SpecificDir)
+                {
+                    AppendLog($"[同步批量智能路径] [DEBUG] 目录是 SpecificDir 模式，跳过扁平化: {outputDir}", ConsoleColor.Gray);
                     continue;
                 }
             
@@ -3209,6 +3264,14 @@ namespace AutoUnpackTool
                             {
                                 AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 找到被最外层扁平化移动的目录 {candidatePath}", ConsoleColor.Gray);
                                 return FindFinalFlattenedPath(candidatePath);
+                            }
+                            
+                            // 【修复】同名目录未找到（可能被扁平化时改名），尝试在祖目录中递归查找标记节点
+                            string? deepestInGrandParent = FindDeepestMarkedNode(grandParent);
+                            if (deepestInGrandParent != null)
+                            {
+                                AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 在祖目录找到最深层的标记节点 {deepestInGrandParent}", ConsoleColor.Gray);
+                                return deepestInGrandParent;
                             }
                         }
                         AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 父目录不存在，返回 rootDir {rootDir}", ConsoleColor.Gray);
