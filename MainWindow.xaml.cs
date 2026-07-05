@@ -149,6 +149,9 @@ namespace AutoUnpackTool
             // 初始化强制解压模式复选框状态
             ChkForceExtractMode.IsChecked = _settings.ForceExtractMode;
             
+            // 初始化跳过黑名单复选框状态
+            ChkSkipBlacklist.IsChecked = _settings.SkipBlacklist;
+            
             // 初始化最大解压层数下拉框
             InitMaxExtractDepthComboBox();
         }
@@ -4106,6 +4109,10 @@ namespace AutoUnpackTool
         private bool IsBlacklistedFile(string filePath, out string matchedPattern)
         {
             matchedPattern = string.Empty;
+
+            // 跳过黑名单处理：直接返回不匹配
+            if (_settings.SkipBlacklist)
+                return false;
 
             // 获取黑名单模式列表
             var patterns = _settings.GetBlacklistPatterns();

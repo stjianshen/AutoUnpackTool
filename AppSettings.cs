@@ -173,6 +173,12 @@ namespace AutoUnpackTool
         public bool ForceExtractMode { get; set; } = false;
 
         /// <summary>
+        /// 跳过黑名单处理:不检查也不删除黑名单匹配的文件
+        /// 适用于需要保留黑名单文件的特殊场景
+        /// </summary>
+        public bool SkipBlacklist { get; set; } = false;
+
+        /// <summary>
         /// 最大解压层数（从拖入的文件开始算起，0表示不限制）
         /// 默认值为0（不限制层数，保持原有行为）
         /// </summary>
