@@ -98,7 +98,7 @@
                         <!-- FileItem 模板 -->
                         <HierarchicalDataTemplate DataType="{x:Type local:FileItem}" ItemsSource="{Binding Children}">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="{Binding FileName}" Width="300" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding DisplayName}" Width="300" TextTrimming="CharacterEllipsis"/>
                                 <TextBlock Text="{Binding Status}" Margin="10,0,0,0" Foreground="Gray"/>
                             </StackPanel>
                         </HierarchicalDataTemplate>

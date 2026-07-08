@@ -258,7 +258,7 @@ namespace AutoUnpackTool
         /// <summary>
         /// 添加单个文件到列表
         /// </summary>
-        private void AddFileToList(string filePath, ref int addedCount, List<FileItem>? newFileItems = null)
+        private void AddFileToList(string filePath, ref int addedCount, List<FileItem>? newFileItems = null, string? sourceFolderName = null)
         {
             // 检查是否已存在
             if (_fileList.Any(f => f.FilePath == filePath))
@@ -270,7 +270,8 @@ namespace AutoUnpackTool
                 FileName = fileInfo.Name,
                 FilePath = filePath,
                 Status = "等待处理",
-                FileSize = fileInfo.Length
+                FileSize = fileInfo.Length,
+                SourceFolderName = sourceFolderName
             };
             _fileList.Add(fileItem);
             addedCount++;
@@ -357,6 +358,9 @@ namespace AutoUnpackTool
         {
             try
             {
+                // 获取源文件夹名称，用于 UI 显示
+                string folderName = Path.GetFileName(directoryPath);
+                
                 // 获取文件夹中的所有文件（包括子文件夹）
                 string[] files = Directory.GetFiles(directoryPath, "*.*", SearchOption.AllDirectories);
                 
@@ -424,7 +428,8 @@ namespace AutoUnpackTool
                                     Status = volumeInfo.IsMultiVolume
                                         ? $"等待处理 (分卷: {volumeInfo.VolumeCount})"
                                         : $"等待处理 (分卷主文件)",
-                                    FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length)
+                                    FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length),
+                                    SourceFolderName = folderName
                                 };
                                 
                                 // 存储分卷信息
@@ -449,7 +454,7 @@ namespace AutoUnpackTool
                                 // 不是真正的分卷，当作普通文件处理
                                 if (!processedVolumes.Contains(archiveFile))
                                 {
-                                    AddFileToList(archiveFile, ref addedCount, newFileItems);
+                                    AddFileToList(archiveFile, ref addedCount, newFileItems, folderName);
                                     processedVolumes.Add(archiveFile);
                                 }
                             }
@@ -459,7 +464,7 @@ namespace AutoUnpackTool
                             // 普通压缩文件
                             if (!processedVolumes.Contains(archiveFile))
                             {
-                                AddFileToList(archiveFile, ref addedCount, newFileItems);
+                                AddFileToList(archiveFile, ref addedCount, newFileItems, folderName);
                                 processedVolumes.Add(archiveFile);
                             }
                         }
@@ -2995,10 +3000,34 @@ namespace AutoUnpackTool
                     continue;
                 }
             
-                // ArchiveDir 模式（解压到当前目录），不进行扁平化处理
+                // ArchiveDir 模式（解压到当前目录），根目录不扁平化，但子压缩包的输出目录仍需处理
                 if (outputDir.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
                 {
-                    AppendLog($"[同步批量智能路径] [DEBUG] 目录是 ArchiveDir 模式，跳过扁平化: {outputDir}", ConsoleColor.Gray);
+                    AppendLog($"[同步批量智能路径] [DEBUG] 目录是 ArchiveDir 模式，根目录跳过扁平化: {outputDir}", ConsoleColor.Gray);
+                    
+                    // 查找 archiveDir 的直接子目录中属于 _extractedDirectoryNodes 的（即子压缩包解压目录）
+                    var childExtractedDirs = allExtractedDirs
+                        .Where(dir =>
+                        {
+                            string? parent = Path.GetDirectoryName(dir);
+                            return parent != null && parent.Equals(outputDir, StringComparison.OrdinalIgnoreCase);
+                        })
+                        .ToList();
+                    
+                    if (childExtractedDirs.Count > 0)
+                    {
+                        AppendLog($"[同步批量智能路径] ArchiveDir 根目录下有 {childExtractedDirs.Count} 个标记子目录需要扁平化: {string.Join(", ", childExtractedDirs.Select(d => Path.GetFileName(d)))}", ConsoleColor.Cyan);
+                        foreach (var childDir in childExtractedDirs)
+                        {
+                            if (Directory.Exists(childDir))
+                            {
+                                AppendLog($"[同步批量智能路径] 开始处理子目录: {childDir}", ConsoleColor.Cyan);
+                                await Task.Run(() => ProcessSmartPathBatchAsync(childDir));
+                                _processedFlattenDirs.Add(childDir);
+                                processedCount++;
+                            }
+                        }
+                    }
                     continue;
                 }
             
@@ -3179,27 +3208,26 @@ namespace AutoUnpackTool
 
                 foreach (var item in relatedItems)
                 {
-                    // 只更新顶级项或状态中包含“解压成功”的项
+                    // 只更新顶级项或状态中包含"解压成功"的项
                     if (item.Parent == null || item.Status.Contains("解压成功"))
                     {
                         var passwordInfo = item.FoundPassword != null 
                             ? $" (密码: {item.FoundPassword})" 
                             : " (无密码)";
-                        
-                        // 记录最终路径到节点
-                        item.FinalOutputPath = finalPath;
-                                                
+                                        
                         Dispatcher.Invoke(() =>
                         {
+                            // 【修复】FinalOutputPath 需要在 UI 线程设置（触发 OnPropertyChanged 通知）
+                            item.FinalOutputPath = finalPath;
                             item.Status = $"解压完成-扁平化处理完成{passwordInfo}";
-                            
+                                            
                             // 如果当前选中的是该节点，立即更新最终路径显示
                             if (LstFiles.SelectedItem is FileItem selectedItem && selectedItem == item)
                             {
                                 TxtFinalPath.Text = finalPath ?? "无";
                             }
                         });
-                                                
+                                                                
                         AppendLog($"[{item.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green, item);
                     }
                 }
@@ -5597,7 +5625,7 @@ namespace AutoUnpackTool
                 }
                 
                 // 清空最终路径显示
-                Dispatcher.Invoke(() => TxtFinalPath.Text = "无");
+                TxtFinalPath.Text = "无";
             }
             else if (selectedItem is FileItem fileItem)
             {
@@ -5607,22 +5635,44 @@ namespace AutoUnpackTool
                 // 调试：打印日志统计
                 System.Diagnostics.Debug.WriteLine($"[文件节点日志统计] {fileItem.FileName} 收集到 {logsToShow.Count} 条日志");
                 
-                // 显示最终路径
-                Dispatcher.Invoke(() =>
-                {
-                    if (!string.IsNullOrEmpty(fileItem.FinalOutputPath))
-                    {
-                        TxtFinalPath.Text = fileItem.FinalOutputPath;
-                    }
-                    else
-                    {
-                        TxtFinalPath.Text = "无";
-                    }
-                });
+                // 显示最终路径：优先使用节点的 FinalOutputPath，其次递归查找子节点中顶级项的路径
+                string? pathToShow = ResolveFinalPathForDisplay(fileItem);
+                TxtFinalPath.Text = pathToShow ?? "无";
+                
+                System.Diagnostics.Debug.WriteLine($"[文件节点路径] {fileItem.FileName}: FinalOutputPath={fileItem.FinalOutputPath}, 显示={TxtFinalPath.Text}");
+            }
+            else
+            {
+                // 选中项为 null 或其他类型，清空显示
+                TxtFinalPath.Text = "无";
             }
             
             // 显示日志(不清空,直接重新渲染)
             DisplayFilteredLogs(logsToShow, clearFirst: true);
+        }
+
+        /// <summary>
+        /// 为选中的文件节点解析最终路径显示
+        /// 如果是顶级节点(没有 Parent)，直接返回 FinalOutputPath
+        /// 如果是子节点，沿父链向上查找顶级节点的 FinalOutputPath
+        /// </summary>
+        private string? ResolveFinalPathForDisplay(FileItem fileItem)
+        {
+            // 如果当前节点就有 FinalOutputPath，直接使用
+            if (!string.IsNullOrEmpty(fileItem.FinalOutputPath))
+                return fileItem.FinalOutputPath;
+            
+            // 沿父链向上查找顶级节点的 FinalOutputPath
+            var current = fileItem.Parent;
+            while (current != null)
+            {
+                if (!string.IsNullOrEmpty(current.FinalOutputPath))
+                    return current.FinalOutputPath;
+                current = current.Parent;
+            }
+            
+            // 如果当前节点是顶级节点（Parent 为 null），返回 null（表示无路径）
+            return null;
         }
 
         /// <summary>
@@ -5713,6 +5763,7 @@ namespace AutoUnpackTool
             { 
                 _fileName = value; 
                 OnPropertyChanged(nameof(FileName));
+                OnPropertyChanged(nameof(DisplayName));
             } 
         }
         
@@ -5756,6 +5807,26 @@ namespace AutoUnpackTool
             } 
         }
         
+        /// <summary>
+        /// 当 FileItem 源于文件夹拖入时，记录源文件夹名称用于 UI 显示
+        /// </summary>
+        private string? _sourceFolderName = null;
+        public string? SourceFolderName 
+        { 
+            get => _sourceFolderName; 
+            set 
+            { 
+                _sourceFolderName = value; 
+                OnPropertyChanged(nameof(SourceFolderName));
+                OnPropertyChanged(nameof(DisplayName));
+            } 
+        }
+        
+        /// <summary>
+        /// 用于 UI 显示的名称：如果是从文件夹拖入的，显示文件夹名；否则显示文件名
+        /// </summary>
+        public string DisplayName => SourceFolderName ?? FileName;
+        
         public ArchiveVolumeInfo? VolumeInfo { get; set; }
         
         // 新增：父子关系支持
@@ -5779,10 +5850,23 @@ namespace AutoUnpackTool
         private bool _isMarkedComplete = false;      // 是否已标记为完成（防止重复上报）
         private bool _selfExtractSuccess = false;    // 自身压是否成功
                 
+        private string? _finalOutputPath = null;
+        
         /// <summary>
         /// 扁平化处理后的最终路径（用于在日志区域上方显示）
         /// </summary>
-        public string? FinalOutputPath { get; set; }
+        public string? FinalOutputPath 
+        { 
+            get => _finalOutputPath; 
+            set 
+            { 
+                if (_finalOutputPath != value)
+                {
+                    _finalOutputPath = value; 
+                    OnPropertyChanged(nameof(FinalOutputPath));
+                }
+            } 
+        }
         
         /// <summary>
         /// 设置自身解压结果
