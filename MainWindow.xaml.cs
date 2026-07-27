@@ -1943,30 +1943,94 @@ namespace AutoUnpackTool
                 AppendLog($"[阶段3] 批量智能路径失败: {ex.Message}", ConsoleColor.Red);
             }
         
-            // 阶段4: 检查归档父目录是否需要扁平化
+            // 阶段4: 检查归档父目录是否需要扁平化（合并唯一子目录）
             // 拖入的文件夹不在 _extractedDirectoryNodes 中，阶段3不会处理它。
-            // 但归档清理后（阶段2），父目录可能变得只需1个子目录，此时应扁平化。
-            // 优化：仅当父目录恰好有1个子目录时才处理，避免无意义的遍历。
-            string archiveParentDir = Path.GetDirectoryName(topArchivePath);
+            // 但归档清理后（阶段2），父目录可能变得只需1个子目录，此时应将子目录内容合并入父目录。
+            // 【修复】不再调用 ProcessSmartPathBatchAsync（它会向上扁平化到祖目录），
+            // 改为就地合并：将唯一子目录的内容提升到 archiveParentDir 内，不越过 root 节点。
+            // 优化：仅当父目录恰好有1个子目录且无非压缩包文件时才处理，避免无意义的遍历。
+            string? archiveParentDir = Path.GetDirectoryName(topArchivePath);
             if (!string.IsNullOrEmpty(archiveParentDir) && Directory.Exists(archiveParentDir))
             {
                 var parentSubDirs = Directory.GetDirectories(archiveParentDir);
-                if (parentSubDirs.Length == 1)
+                var parentFiles = Directory.GetFiles(archiveParentDir);
+                var parentNonArchiveFiles = parentFiles.Where(f => !IsArchiveFile(f)).ToArray();
+                
+                if (parentSubDirs.Length == 1 && parentNonArchiveFiles.Length == 0)
                 {
-                    AppendLog($"[阶段4] 归档父目录仅有1个子目录，检查是否需要扁平化: {archiveParentDir}", ConsoleColor.Cyan);
-                    try
+                    string soleSubDir = parentSubDirs[0];
+                    
+                    // 如果唯一的子目录是阶段3智能路径处理的产物，说明阶段3已经做了正确的扁平化，
+                    // 不应再合并，否则会丢失有意义的名字（如将 [しゅにち関数...] 合并入父目录 137）
+                    if (_extractedDirectoryNodes.Contains(soleSubDir))
                     {
-                        await Task.Run(() => ProcessSmartPathBatchAsync(archiveParentDir));
-                        AppendLog($"[阶段4] 归档父目录处理完成", ConsoleColor.Cyan);
+                        AppendLog($"[阶段4] 归档父目录仅有1个子目录 '{Path.GetFileName(soleSubDir)}'，但它是阶段3智能路径处理的产物，跳过合并保留其名称", ConsoleColor.Gray);
+                    }
+                    else
+                    {
+                        AppendLog($"[阶段4] 归档父目录仅有1个子目录 '{Path.GetFileName(soleSubDir)}' 且无其他非压缩包文件，将子目录内容合并入父目录: {archiveParentDir}", ConsoleColor.Cyan);
+                        try
+                        {
+                        await Task.Run(() =>
+                        {
+                            // 将子目录的所有内容移动到父目录
+                            foreach (var entry in Directory.EnumerateFileSystemEntries(soleSubDir))
+                            {
+                                string entryName = Path.GetFileName(entry);
+                                string destPath = Path.Combine(archiveParentDir, entryName);
+                                
+                                if (Directory.Exists(entry))
+                                {
+                                    // 如果目标已存在且是解压节点，先删除再移动
+                                    if (Directory.Exists(destPath) && _extractedDirectoryNodes.Contains(destPath))
+                                    {
+                                        Directory.Delete(destPath, true);
+                                        AppendLog($"[阶段4]   已删除已存在的解压节点目录: {entryName}", ConsoleColor.Gray);
+                                    }
+                                    Directory.Move(entry, destPath);
+                                    AppendLog($"[阶段4]   已移动目录: {entryName} -> {archiveParentDir}", ConsoleColor.Gray);
+                                    
+                                    // 同步更新 _extractedDirectoryNodes
+                                    if (_extractedDirectoryNodes.Contains(entry))
+                                    {
+                                        _extractedDirectoryNodes.Remove(entry);
+                                        _extractedDirectoryNodes.Add(destPath);
+                                    }
+                                }
+                                else
+                                {
+                                    // 如果目标文件已存在，覆盖
+                                    if (File.Exists(destPath))
+                                    {
+                                        File.Delete(destPath);
+                                    }
+                                    File.Move(entry, destPath);
+                                    AppendLog($"[阶段4]   已移动文件: {entryName}", ConsoleColor.Gray);
+                                }
+                            }
+                            
+                            // 删除已清空的子目录
+                            if (Directory.Exists(soleSubDir))
+                            {
+                                Directory.Delete(soleSubDir);
+                                AppendLog($"[阶段4]   已删除空子目录: {Path.GetFileName(soleSubDir)}", ConsoleColor.Gray);
+                            }
+                        });
+                        AppendLog($"[阶段4] 归档父目录合并完成: {archiveParentDir}", ConsoleColor.Cyan);
                     }
                     catch (Exception ex)
                     {
-                        AppendLog($"[阶段4] 归档父目录处理失败: {ex.Message}", ConsoleColor.Red);
+                        AppendLog($"[阶段4] 归档父目录合并失败: {ex.Message}", ConsoleColor.Red);
                     }
+                    }
+                }
+                else if (parentSubDirs.Length == 0)
+                {
+                    AppendLog($"[阶段4] 归档父目录无子目录，跳过: {archiveParentDir}", ConsoleColor.Gray);
                 }
                 else
                 {
-                    AppendLog($"[阶段4] 归档父目录有 {parentSubDirs.Length} 个子目录，无需扁平化，跳过: {archiveParentDir}", ConsoleColor.Gray);
+                    AppendLog($"[阶段4] 归档父目录有 {parentSubDirs.Length} 个子目录或 {parentNonArchiveFiles.Length} 个非压缩包文件，无需合并，跳过: {archiveParentDir}", ConsoleColor.Gray);
                 }
             }
         
@@ -2966,9 +3030,16 @@ namespace AutoUnpackTool
                 AppendLog($"[同步批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Yellow);
                 return;
             }
-        
-            var allExtractedDirs = _extractedDirectoryNodes.ToList();
-            AppendLog($"[同步批量智能路径] [DEBUG] 共 {allExtractedDirs.Count} 个解压目录节点", ConsoleColor.Gray);
+
+            // 【修复】只处理当前批次相关的解压目录，避免跨批次影响到不相关的目录
+            // archiveDir 是 topArchivePath 的父目录，只有该目录下的解压节点才属于当前批次
+            string archiveDir = Path.GetDirectoryName(topArchivePath) ?? string.Empty;
+            
+            var allExtractedDirs = _extractedDirectoryNodes
+                .Where(dir => dir.Equals(archiveDir, StringComparison.OrdinalIgnoreCase)
+                              || dir.StartsWith(archiveDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            AppendLog($"[同步批量智能路径] [DEBUG] 共 {allExtractedDirs.Count} 个解压目录节点（已过滤，仅当前批次）", ConsoleColor.Gray);
             foreach (var dir in allExtractedDirs)
             {
                 AppendLog($"[同步批量智能路径] [DEBUG]   - {dir}", ConsoleColor.Gray);
@@ -2990,7 +3061,6 @@ namespace AutoUnpackTool
             _processedFlattenDirs.Clear();
             
             int processedCount = 0;
-            string archiveDir = Path.GetDirectoryName(topArchivePath) ?? string.Empty;
             
             foreach (var outputDir in topLevelDirs)
             {
@@ -3858,6 +3928,30 @@ namespace AutoUnpackTool
                 {
                     AppendLog($"[批量智能路径] ✗ 移动失败，跳过扁平化: {Path.GetFileName(childDir)}", ConsoleColor.Red);
                     return;
+                }
+
+                // 步骤1.5: 清理父目录中残留的压缩包文件，避免阻塞后续的目录删除
+                // 场景：子压缩包（如 .rar）解压后，CleanupChildArchivesInTree 因文件锁定等原因未能删除，
+                // 残留的压缩包会导致 Directory.Delete 失败，从而使扁平化被跳过
+                var residualFiles = Directory.GetFiles(parentDir);
+                foreach (var file in residualFiles)
+                {
+                    try
+                    {
+                        if (IsArchiveFile(file))
+                        {
+                            File.Delete(file);
+                            AppendLog($"[批量智能路径]   删除残留压缩包: {Path.GetFileName(file)}", ConsoleColor.Gray);
+                        }
+                        else
+                        {
+                            AppendLog($"[批量智能路径]   跳过非压缩包残留文件: {Path.GetFileName(file)}", ConsoleColor.Yellow);
+                        }
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        AppendLog($"[批量智能路径]   删除残留文件失败: {Path.GetFileName(file)} - {cleanupEx.Message}", ConsoleColor.Yellow);
+                    }
                 }
 
                 // 步骤2: 删除空的父目录（可能因残留文件而失败，必须恢复临时目录）
@@ -5071,7 +5165,16 @@ namespace AutoUnpackTool
             // 6. 普通压缩包：去掉后缀（支持复合后缀）
             // xxx.7z -> xxx
             // xxx.tar.zst -> xxx
-            return NormalizeArchiveLikeName(fileName);
+            string normalized = NormalizeArchiveLikeName(fileName);
+            
+            // 7. 如果 NormalizeArchiveLikeName 未能去除扩展名（如 .exe 等非标准压缩格式），
+            //    使用 Path.GetFileNameWithoutExtension 兜底去除
+            if (normalized.IndexOf('.') > 0 && normalized == fileName)
+            {
+                return Path.GetFileNameWithoutExtension(fileName);
+            }
+            
+            return normalized;
         }
 
         /// <summary>
