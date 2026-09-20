@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -70,14 +70,30 @@ namespace AutoUnpackTool
         private List<FileItem> _topLevelItems = new();
         
         // 记录所有解压产生的目录节点（用于扁平化时只处理解压的目录）
-        private HashSet<string> _extractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
+        // 【并发修复】ConcurrentDictionary 保证解压线程 Add 与收尾线程遍历/移除的线程安全
+        // （值无意义，仅用作线程安全集合的占位）
+        private readonly ConcurrentDictionary<string, byte> _extractedDirectoryNodes = new(StringComparer.OrdinalIgnoreCase);
+        
+        // 记录扁平化结果映射：被扁平化删除的解压目录 -> 内容最终所在路径（用于最终路径追踪）
+        private Dictionary<string, string> _flattenedFinalPathMap = new(StringComparer.OrdinalIgnoreCase);
         
         // 记录拖入的文件夹（用于后续智能路径处理，即使没有压缩包）
         private HashSet<string> _droppedFolders = new(StringComparer.OrdinalIgnoreCase);
         
         // 记录已处理的扁平化目录（防止重复处理导致死循环）
         private HashSet<string> _processedFlattenDirs = new(StringComparer.OrdinalIgnoreCase);
-        
+
+        // 【并发修复】收尾流程串行化锁：多个顶级文件并发完成时，收尾（清理+智能路径扁平化）必须串行执行，
+        // 否则并发移动同一目录树会导致移动中断、目录冲突时生成 GUID 新目录、图片分散到多个文件夹。
+        private readonly SemaphoreSlim _smartPathFinalizeLock = new(1, 1);
+
+        // 【并发修复】防止同一顶级文件被重复触发收尾（完成回调可能从多条路径触发，如叶子收尾与父链上报）
+        private readonly HashSet<string> _finalizingTopArchives = new(StringComparer.OrdinalIgnoreCase);
+
+        // 【并发修复】保护 _isTesting/_isExtracting 的 check-then-act：多个后台线程（解压线程唤醒、监控线程重启）
+        // 可能同时看到 false 而启动重复线程组，必须原子地检查并设置
+        private readonly object _threadStateLock = new();
+
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
         // 缓存隐写文件检测到的具体压缩类型（如 zip/7z/rar），null 表示非隐写或未检测到类型
         private readonly ConcurrentDictionary<string, string?> _stegoArchiveTypeCache = new(StringComparer.OrdinalIgnoreCase);
@@ -237,17 +253,26 @@ namespace AutoUnpackTool
                         
                         _ = Task.Run(async () =>
                         {
-                            foreach (var folder in folders)
+                            // 【并发修复】持锁串行执行，避免与解压收尾流程并发移动同一目录树
+                            await _smartPathFinalizeLock.WaitAsync();
+                            try
                             {
-                                await ProcessSmartPathBatchAsync(folder);
-                                
-                                // 更新最终路径显示
-                                string? finalPath = FindFinalFlattenedPath(folder);
-                                Dispatcher.Invoke(() =>
+                                foreach (var folder in folders)
                                 {
-                                    TxtFinalPath.Text = finalPath ?? folder;
-                                    AppendLog($"[智能路径] 文件夹最终路径: {TxtFinalPath.Text}", ConsoleColor.Green);
-                                });
+                                    await ProcessSmartPathBatchAsync(folder);
+                                    
+                                    // 更新最终路径显示
+                                    string? finalPath = FindFinalFlattenedPath(folder);
+                                    Dispatcher.Invoke(() =>
+                                    {
+                                        TxtFinalPath.Text = finalPath ?? folder;
+                                        AppendLog($"[智能路径] 文件夹最终路径: {TxtFinalPath.Text}", ConsoleColor.Green);
+                                    });
+                                }
+                            }
+                            finally
+                            {
+                                _smartPathFinalizeLock.Release();
                             }
                         });
                     }
@@ -758,6 +783,7 @@ namespace AutoUnpackTool
             _extractQueue = new ConcurrentQueue<FileItem>();
             _topLevelItems.Clear();
             _extractedDirectoryNodes.Clear();  // 清空觧压目录标记
+            _flattenedFinalPathMap.Clear();    // 清空扁平化结果映射
             _stegoProbeCache.Clear();
             _stegoArchiveTypeCache.Clear();
             _stegoArchiveValidFilesCache.Clear();
@@ -1037,10 +1063,15 @@ namespace AutoUnpackTool
         /// </summary>
         private async void StartTestThread()
         {
-            if (_isTesting)
-                return;
+            // 【并发修复】check-then-act 原子化：解压线程唤醒与监控线程重启可能并发调用，
+            // 无锁时两个线程可同时看到 _isTesting==false 而启动重复测试线程
+            lock (_threadStateLock)
+            {
+                if (_isTesting)
+                    return;
 
-            _isTesting = true;
+                _isTesting = true;
+            }
             var tokenSource = new CancellationTokenSource();
             _testCancellationTokenSource = tokenSource;
             var token = tokenSource.Token;
@@ -1087,6 +1118,7 @@ namespace AutoUnpackTool
                         }
                         catch (Exception ex)
                         {
+                            DiagLog($"[DIAG] 测试文件异常: {fileItem.FileName}: {ex.GetType().Name}: {ex.Message}");
                             Dispatcher.Invoke(() => fileItem.Status = $"测试异常: {ex.Message}");
                             AppendLog($"[{fileItem.FileName}] 测试异常: {ex.Message}", ConsoleColor.Red);
                         }
@@ -1096,12 +1128,12 @@ namespace AutoUnpackTool
                         // 队列为空，等待信号或超时
                         AppendLog("[测试线程] 队列为空，等待新任务...", ConsoleColor.Gray);
                         
-                        // 等待信号（最多等待60秒）或取消请求
+                        // 等待信号（最多等待10秒）或取消请求
                         bool signaled = false;
                         try
                         {
                             signaled = await Task.Run(() => 
-                                _pendingQueueSignal.Wait(TimeSpan.FromSeconds(60), token), token);
+                                _pendingQueueSignal.Wait(TimeSpan.FromSeconds(10), token), token);
                         }
                         catch (OperationCanceledException)
                         {
@@ -1122,6 +1154,12 @@ namespace AutoUnpackTool
                                 AppendLog($"[测试线程] 超时但队列仍有{_pendingQueue.Count}个任务，继续处理...", ConsoleColor.Yellow);
                             }
                         }
+                        else if (_pendingQueue.IsEmpty && !_isExtracting && _extractQueue.IsEmpty)
+                        {
+                            // 被信号唤醒但队列为空、解压线程已退出：整个流程已结束，直接退出
+                            AppendLog("[测试线程] 队列为空且解压线程已退出，测试线程完成", ConsoleColor.Gray);
+                            break;
+                        }
                         
                         // 重置信号，准备下一次等待
                         _pendingQueueSignal.Reset();
@@ -1134,6 +1172,7 @@ namespace AutoUnpackTool
             }
             catch (Exception ex)
             {
+                DiagLog($"[DIAG] 测试线程宿主异常: {ex.GetType().Name}: {ex.Message}");
                 AppendLog($"\n测试线程出错: {ex.Message}", ConsoleColor.Red);
             }
             finally
@@ -1344,10 +1383,15 @@ namespace AutoUnpackTool
         /// </summary>
         private async void StartExtractThread()
         {
-            if (_isExtracting)
-                return;
+            // 【并发修复】check-then-act 原子化：测试线程唤醒与监控线程重启可能并发调用，
+            // 无锁时两个线程可同时看到 _isExtracting==false 而启动重复解压线程组
+            lock (_threadStateLock)
+            {
+                if (_isExtracting)
+                    return;
 
-            _isExtracting = true;
+                _isExtracting = true;
+            }
             var tokenSource = new CancellationTokenSource();
             _extractCancellationTokenSource = tokenSource;
             var token = tokenSource.Token;
@@ -1413,12 +1457,12 @@ namespace AutoUnpackTool
                                 // 队列为空，等待信号或超时
                                 AppendLog($"[解压线程 {taskId}] 队列为空，等待新任务...", ConsoleColor.Gray);
                                 
-                                // 等待信号（最多等待30秒）或取消请求
+                                // 等待信号（最多等待5秒）或取消请求
                                 bool signaled = false;
                                 try
                                 {
                                     signaled = await Task.Run(() => 
-                                        _extractQueueSignal.Wait(TimeSpan.FromSeconds(30), token), token);
+                                        _extractQueueSignal.Wait(TimeSpan.FromSeconds(5), token), token);
                                 }
                                 catch (OperationCanceledException)
                                 {
@@ -1457,6 +1501,7 @@ namespace AutoUnpackTool
             }
             catch (Exception ex)
             {
+                DiagLog($"[DIAG] 解压线程宿主异常: {ex.GetType().Name}: {ex.Message}");
                 AppendLog($"\n解压线程出错: {ex.Message}", ConsoleColor.Red);
             }
             finally
@@ -1466,6 +1511,10 @@ namespace AutoUnpackTool
                 {
                     _isExtracting = false;
                     _isPaused = false; // 重置暂停标志
+
+                    // 解压线程全部退出后唤醒测试线程，避免其空等到超时才退出
+                    _pendingQueueSignal.Set();
+
                     _extractCancellationTokenSource?.Dispose();
                     _extractCancellationTokenSource = null;
                     UpdateUiState();
@@ -1502,14 +1551,18 @@ namespace AutoUnpackTool
                     var extractTask = _extractCompletionSource.Task;
                     
                     // 等待完成（带超时）
+                    // 【BUG修复】WhenAny 返回的是被传入的原始任务之一；此前比较 testTask/extractTask
+                    // 永远不相等（即使线程已退出），导致任务完成被误判为超时，只能靠 15 秒空轮询退出
+                    var allTasksTask = Task.WhenAll(testTask, extractTask);
                     var completedTask = await Task.WhenAny(
-                        Task.WhenAll(testTask, extractTask),
+                        allTasksTask,
                         Task.Delay(5000) // 5秒超时
                     );
                     
                     // 如果是因为超时而非任务完成
-                    if (completedTask != testTask && completedTask != extractTask)
+                    if (completedTask != allTasksTask)
                     {
+                        DiagLog($"[DIAG] 监控超时轮询: _isTesting={_isTesting}, _isExtracting={_isExtracting}, 待处理={_pendingQueue.Count}, 待解压={_extractQueue.Count}");
                         // 检查是否应该退出
                         if (!_isTesting && !_isExtracting && _extractQueue.IsEmpty && _pendingQueue.IsEmpty)
                         {
@@ -1593,7 +1646,9 @@ namespace AutoUnpackTool
                 // 所有处理流程完成
                 if (_globalCancellationTokenSource?.Token.IsCancellationRequested != true)
                 {
+                    DiagLog("[DIAG] 监控循环退出，即将打印完成日志");
                     AppendLog($"\n========== 所有处理流程完成 ==========", ConsoleColor.Green);
+                    DiagLog("[DIAG] 完成日志已打印");
                     
                     // 更新状态栏为“未开始”
                     Dispatcher.Invoke(() =>
@@ -1613,41 +1668,51 @@ namespace AutoUnpackTool
                         
                         _ = Task.Run(async () =>
                         {
-                            foreach (var folder in folders)
+                            // 【并发修复】持锁串行执行，避免与解压收尾流程并发移动同一目录树
+                            await _smartPathFinalizeLock.WaitAsync();
+                            try
                             {
-                                if (Directory.Exists(folder))
+                                foreach (var folder in folders)
                                 {
-                                    try
+                                    if (Directory.Exists(folder))
                                     {
-                                        AppendLog($"[智能路径] 处理拖入的文件夹: {folder}", ConsoleColor.Cyan);
-                                        await ProcessSmartPathBatchAsync(folder);
-                                        
-                                        // 更新最终路径显示
-                                        string? finalPath = FindFinalFlattenedPath(folder);
-                                        Dispatcher.Invoke(() =>
+                                        try
                                         {
-                                            TxtFinalPath.Text = finalPath ?? folder;
-                                            AppendLog($"[智能路径] 文件夹最终路径: {TxtFinalPath.Text}", ConsoleColor.Green);
-                                        });
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        AppendLog($"[智能路径] 处理文件夹失败 {folder}: {ex.Message}", ConsoleColor.Red);
+                                            AppendLog($"[智能路径] 处理拖入的文件夹: {folder}", ConsoleColor.Cyan);
+                                            await ProcessSmartPathBatchAsync(folder);
+                                            
+                                            // 更新最终路径显示
+                                            string? finalPath = FindFinalFlattenedPath(folder);
+                                            Dispatcher.Invoke(() =>
+                                            {
+                                                TxtFinalPath.Text = finalPath ?? folder;
+                                                AppendLog($"[智能路径] 文件夹最终路径: {TxtFinalPath.Text}", ConsoleColor.Green);
+                                            });
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            AppendLog($"[智能路径] 处理文件夹失败 {folder}: {ex.Message}", ConsoleColor.Red);
+                                        }
                                     }
                                 }
+                                
+                                // 智能路径处理完成后，更新状态
+                                Dispatcher.Invoke(() =>
+                                {
+                                    AppendLog($"[智能路径] 所有拖入文件夹处理完成", ConsoleColor.Green);
+                                });
                             }
-                            
-                            // 智能路径处理完成后，更新状态
-                            Dispatcher.Invoke(() =>
+                            finally
                             {
-                                AppendLog($"[智能路径] 所有拖入文件夹处理完成", ConsoleColor.Green);
-                            });
+                                _smartPathFinalizeLock.Release();
+                            }
                         });
                     }
                 }
             }
             catch (Exception ex)
             {
+                DiagLog($"[DIAG] 监控流程异常: {ex.GetType().Name}: {ex.Message}");
                 AppendLog($"监控流程出错: {ex.Message}", ConsoleColor.Red);
             }
             finally
@@ -1675,6 +1740,48 @@ namespace AutoUnpackTool
             }
             
             return allItems;
+        }
+
+        /// <summary>
+        /// 【并发修复】在 UI 线程上获取全树快照（递归收集所有节点，含子节点）。
+        /// ObservableCollection 非线程安全：后台线程（收尾/清理）直接遍历会与 UI 线程的增删并发冲突。
+        /// </summary>
+        private List<FileItem> SnapshotAllItems()
+        {
+            if (Dispatcher.CheckAccess())
+                return CollectAllFileItems(_fileList);
+
+            List<FileItem> snapshot = new();
+            Dispatcher.Invoke(() => snapshot = CollectAllFileItems(_fileList));
+            return snapshot;
+        }
+
+        /// <summary>
+        /// 【并发修复】在 UI 线程上获取顶级列表快照（不含子节点）。
+        /// 用于后台线程需要按顶级项过滤的场景。
+        /// </summary>
+        private List<FileItem> SnapshotTopLevelItems()
+        {
+            if (Dispatcher.CheckAccess())
+                return _fileList.ToList();
+
+            List<FileItem> snapshot = new();
+            Dispatcher.Invoke(() => snapshot = _fileList.ToList());
+            return snapshot;
+        }
+
+        /// <summary>
+        /// 【并发修复】在 UI 线程上执行树查找（FindFileItemInTree 递归遍历 ObservableCollection Children，
+        /// 必须在 UI 线程上调用才能避免与 UI 线程的增删并发冲突）。
+        /// </summary>
+        private FileItem? FindFileItemInTreeThreadSafe(string filePath)
+        {
+            if (Dispatcher.CheckAccess())
+                return FindFileItemInTree(filePath);
+
+            FileItem? result = null;
+            Dispatcher.Invoke(() => result = FindFileItemInTree(filePath));
+            return result;
         }
 
         /// <summary>
@@ -1805,7 +1912,7 @@ namespace AutoUnpackTool
             await WaitForAllChildrenExtractComplete();
             AppendLog($"  所有子压缩包已解压完成", ConsoleColor.Gray);
             
-            var allItems = CollectAllFileItems(_fileList);
+            var allItems = SnapshotAllItems();
             foreach (var item in allItems)
             {
                 if (item.Parent == null)
@@ -1859,7 +1966,7 @@ namespace AutoUnpackTool
             int waitedMs = 0;
             while (waitedMs < maxWaitSeconds * 1000)
             {
-                var allItems = CollectAllFileItems(_fileList);
+                var allItems = SnapshotAllItems();
                 bool allChildrenDone = true;
                 
                 foreach (var item in allItems)
@@ -1899,6 +2006,44 @@ namespace AutoUnpackTool
         /// </summary>
         private async Task FinalizeTopLevelExtractAndSmartPathAsync(string topArchivePath)
         {
+            DiagLog($"[DIAG] Finalize 入口: {topArchivePath}");
+            // 【并发修复】同一顶级文件的收尾只执行一次：
+            // 完成回调可能从多条路径触发（顶级叶子收尾 / 子节点完成父链上报），
+            // 重复执行会在已扁平化的目录上再次移动/合并，产生 GUID 新目录和图片分散。
+            lock (_finalizingTopArchives)
+            {
+                if (!_finalizingTopArchives.Add(topArchivePath))
+                {
+                    AppendLog($"[收尾] {Path.GetFileName(topArchivePath)} 已在收尾流程中，跳过重复触发", ConsoleColor.Yellow);
+                    return;
+                }
+            }
+
+            // 【并发修复】收尾流程全程持锁串行执行：多个顶级文件并发完成时，
+            // 阶段1-4 涉及共享集合（_extractedDirectoryNodes/_processedFlattenDirs）与目录移动，
+            // 并发执行会互相干扰：移动中断（图片没移动完成）、目录冲突生成 GUID 新目录。
+            await _smartPathFinalizeLock.WaitAsync();
+            DiagLog("[DIAG] Finalize 已获取收尾锁");
+            try
+            {
+                await FinalizeTopLevelExtractAndSmartPathCoreAsync(topArchivePath);
+            }
+            finally
+            {
+                _smartPathFinalizeLock.Release();
+                lock (_finalizingTopArchives)
+                {
+                    _finalizingTopArchives.Remove(topArchivePath);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 顶级解压链收尾的核心实现（调用方已持有 _smartPathFinalizeLock 串行化锁，保证不会并发执行）
+        /// </summary>
+        private async Task FinalizeTopLevelExtractAndSmartPathCoreAsync(string topArchivePath)
+        {
+            DiagLog($"[DIAG] FinalizeCore 入口: {topArchivePath}");
             AppendLog($"[阶段1] 开始清理子压缩包...", ConsoleColor.Cyan);
             try
             {
@@ -1907,6 +2052,7 @@ namespace AutoUnpackTool
             }
             catch (Exception ex)
             {
+                DiagLog($"[DIAG] 阶段1异常: {ex.GetType().Name}: {ex.Message}");
                 AppendLog($"[阶段1] 清理子压缩包失败: {ex.Message}", ConsoleColor.Red);
             }
         
@@ -1935,7 +2081,9 @@ namespace AutoUnpackTool
             // 阶段3：批量智能路径处理（扁平化）
             try
             {
+                DiagLog("[DIAG] 阶段3 ProcessBatchSmartPathSynchronous 开始");
                 await ProcessBatchSmartPathSynchronous(topArchivePath);
+                DiagLog("[DIAG] 阶段3 ProcessBatchSmartPathSynchronous 完成");
                 AppendLog($"[阶段3] 批量智能路径处理完成", ConsoleColor.Cyan);
             }
             catch (Exception ex)
@@ -1962,7 +2110,7 @@ namespace AutoUnpackTool
                     
                     // 如果唯一的子目录是阶段3智能路径处理的产物，说明阶段3已经做了正确的扁平化，
                     // 不应再合并，否则会丢失有意义的名字（如将 [しゅにち関数...] 合并入父目录 137）
-                    if (_extractedDirectoryNodes.Contains(soleSubDir))
+                    if (_extractedDirectoryNodes.ContainsKey(soleSubDir))
                     {
                         AppendLog($"[阶段4] 归档父目录仅有1个子目录 '{Path.GetFileName(soleSubDir)}'，但它是阶段3智能路径处理的产物，跳过合并保留其名称", ConsoleColor.Gray);
                     }
@@ -1982,7 +2130,7 @@ namespace AutoUnpackTool
                                 if (Directory.Exists(entry))
                                 {
                                     // 如果目标已存在且是解压节点，先删除再移动
-                                    if (Directory.Exists(destPath) && _extractedDirectoryNodes.Contains(destPath))
+                                    if (Directory.Exists(destPath) && _extractedDirectoryNodes.ContainsKey(destPath))
                                     {
                                         Directory.Delete(destPath, true);
                                         AppendLog($"[阶段4]   已删除已存在的解压节点目录: {entryName}", ConsoleColor.Gray);
@@ -1991,10 +2139,10 @@ namespace AutoUnpackTool
                                     AppendLog($"[阶段4]   已移动目录: {entryName} -> {archiveParentDir}", ConsoleColor.Gray);
                                     
                                     // 同步更新 _extractedDirectoryNodes
-                                    if (_extractedDirectoryNodes.Contains(entry))
+                                    if (_extractedDirectoryNodes.ContainsKey(entry))
                                     {
-                                        _extractedDirectoryNodes.Remove(entry);
-                                        _extractedDirectoryNodes.Add(destPath);
+                                        _extractedDirectoryNodes.TryRemove(entry, out _);
+                                        _extractedDirectoryNodes.TryAdd(destPath, 0);
                                     }
                                 }
                                 else
@@ -2144,7 +2292,7 @@ namespace AutoUnpackTool
                     },
                     showCliWindow: _settings.ShowCliWindow,
                     cancellationToken: token,
-                    stegoArchiveType: isStego ? "#" : null);
+                    stegoArchiveType: isStego ? (detectedType ?? "#") : null);
 
                 if (result.Success)
                 {
@@ -2163,7 +2311,7 @@ namespace AutoUnpackTool
                     AppendLog($"[线程 {taskId}] [DEBUG] 检查解压目录是否存在: {outputDir}, 存在={Directory.Exists(outputDir)}", ConsoleColor.Gray, fileItem);
                     if (Directory.Exists(outputDir))
                     {
-                        _extractedDirectoryNodes.Add(outputDir);
+                        _extractedDirectoryNodes.TryAdd(outputDir, 0);
                         AppendLog($"[线程 {taskId}] {fileItem.FileName}: 已标记压目录节点 {outputDir}", ConsoleColor.Gray, fileItem);
                     }
                     else
@@ -2188,20 +2336,40 @@ namespace AutoUnpackTool
                     // -t# 可能产生非存档垃圾，这些不会被加入队列，直接删除即可
                     if (isStego)
                     {
-                        try
+                        // 真实类型确认时，容器内白名单文件（如封面图）是真实内容，
+                        // 不属于 -t# 碎片残留，不应删除
+                        string? stegoType = DetectStegoArchiveType(fileItem.FilePath);
+                        bool stegoTypeTrusted = !string.IsNullOrEmpty(stegoType) && stegoType != "#";
+                        HashSet<string>? whitelist = stegoTypeTrusted
+                            ? GetStegoArchiveValidFiles(fileItem.FilePath)
+                            : null;
+
+                        // 仅当真实类型确认且白名单非空时才清理：
+                        // 类型回退为 #（无法确定真实格式）时，-t# 提取产物无法区分
+                        // 误匹配碎片与真实内容文件，删除有丢失产物风险，一律保留
+                        if (whitelist != null && whitelist.Count > 0)
                         {
-                            var topFiles = Directory.GetFiles(outputDir, "*", SearchOption.TopDirectoryOnly);
-                            foreach (var f in topFiles)
+                            try
                             {
-                                if (!IsArchiveFile(f, false, isDroppedFile: false))
+                                var topFiles = Directory.GetFiles(outputDir, "*", SearchOption.TopDirectoryOnly);
+                                foreach (var f in topFiles)
                                 {
                                     string fName = Path.GetFileName(f);
-                                    AppendLog($"[线程 {taskId}] [残留清理] 删除非压缩包残留: {fName}", ConsoleColor.Yellow, fileItem);
-                                    try { File.Delete(f); } catch { }
+                                    if (whitelist.Contains(fName))
+                                        continue;
+                                    if (!IsArchiveFile(f, false, isDroppedFile: false))
+                                    {
+                                        AppendLog($"[线程 {taskId}] [残留清理] 删除非压缩包残留: {fName}", ConsoleColor.Yellow, fileItem);
+                                        try { File.Delete(f); } catch { }
+                                    }
                                 }
                             }
+                            catch { }
                         }
-                        catch { }
+                        else
+                        {
+                            AppendLog($"[线程 {taskId}] [残留清理] 跳过：隐写类型未确认({stegoType ?? "null"})，保留全部提取产物", ConsoleColor.Yellow, fileItem);
+                        }
                     }
                     
                     // 修改：根据是否有子节点来决定显示状态
@@ -2297,7 +2465,9 @@ namespace AutoUnpackTool
             {
                 leafItem.Status = $"觧压成功{passwordInfo}";
             });
+            DiagLog($"[DIAG] FinishLeaf 2441 前: {leafItem.FileName}");
             AppendLog($"[{leafItem.FileName}] 叶子节点觧压完成: {leafItem.Status}", ConsoleColor.Green, leafItem);
+            DiagLog($"[DIAG] FinishLeaf 2441 后: {leafItem.FileName}, Parent={(leafItem.Parent?.FileName ?? "NULL")}");
             
             if (leafItem.Parent == null)
             {
@@ -2382,12 +2552,29 @@ namespace AutoUnpackTool
                 // 真正的压缩包通得过标准检测，-t# 误匹配的垃圾文件通不过
                 if (parentFileItem != null && IsStegoDetectionActiveForFile(parentFileItem.FilePath))
                 {
+                    // 白名单：探测阶段已确认容器内真实文件列表，命中白名单的直接通过，
+                    // 避免标准验证对完整文件产生误伤（仅真实类型确认后启用）
+                    string? stegoType = DetectStegoArchiveType(parentFileItem.FilePath);
+                    bool stegoTypeTrusted = !string.IsNullOrEmpty(stegoType) && stegoType != "#";
+                    HashSet<string>? whitelist = stegoTypeTrusted
+                        ? GetStegoArchiveValidFiles(parentFileItem.FilePath)
+                        : null;
+                    // 仅当真实类型确认且白名单非空时，验证失败的文件才允许删除；
+                    // 否则无法区分 -t# 误匹配碎片与真实内容，删除会丢失产物
+                    bool canDeleteJunk = whitelist != null && whitelist.Count > 0;
+
                     var beforeCount = allArchiveFiles.Count;
                     var verifiedFiles = new List<string>();
                     foreach (var f in allArchiveFiles)
                     {
                         string fName = Path.GetFileName(f);
                         AppendLog($"[线程 {taskId}] [隐写验证] 验证文件: {fName}", ConsoleColor.Gray, parentFileItem);
+                        if (whitelist != null && whitelist.Count > 0 && whitelist.Contains(fName))
+                        {
+                            verifiedFiles.Add(f);
+                            AppendLog($"[线程 {taskId}] [隐写验证]   ✓ 白名单通过: {fName}", ConsoleColor.Green, parentFileItem);
+                            continue;
+                        }
                         if (VerifyIsRealArchive(f))
                         {
                             verifiedFiles.Add(f);
@@ -2395,9 +2582,17 @@ namespace AutoUnpackTool
                         }
                         else
                         {
-                            // 标准 7z l 验证失败 → -t# 误匹配垃圾，从磁盘删除
-                            AppendLog($"[线程 {taskId}] [隐写验证]   ✗ 垃圾文件，删除: {fName}", ConsoleColor.Yellow, parentFileItem);
-                            try { File.Delete(f); } catch { }
+                            if (canDeleteJunk)
+                            {
+                                // 标准 7z l 验证失败 → -t# 误匹配垃圾，从磁盘删除
+                                AppendLog($"[线程 {taskId}] [隐写验证]   ✗ 垃圾文件，删除: {fName}", ConsoleColor.Yellow, parentFileItem);
+                                try { File.Delete(f); } catch { }
+                            }
+                            else
+                            {
+                                // 隐写类型未确认，无法判定是否为垃圾，保留文件避免丢失产物
+                                AppendLog($"[线程 {taskId}] [隐写验证]   ⚠ 类型未确认，保留文件（不入队）: {fName}", ConsoleColor.Yellow, parentFileItem);
+                            }
                         }
                     }
                     allArchiveFiles = verifiedFiles;
@@ -2639,9 +2834,13 @@ namespace AutoUnpackTool
                 return;  // 没有父节点，不需要上报
 
             // 标记父节点的一个子节点完成
+            DiagLog($"[DIAG] UpdateParent 入口: child={childItem.FileName}, parent={parentItem.FileName}");
             bool allCompleted = parentItem.MarkChildComplete();
+            DiagLog($"[DIAG] MarkChildComplete 完成: {parentItem.FileName}, allCompleted={allCompleted}");
             
+            DiagLog($"[DIAG] UpdateParent 2798 前: {parentItem.FileName}");
             AppendLog($"[{parentItem.FileName}] 子节点完成进度: {parentItem.GetProgressInfo()}", ConsoleColor.Gray);
+            DiagLog($"[DIAG] UpdateParent 2798 后: {parentItem.FileName}");
 
             // 如果所有子节点都已完成，更新父节点状态并继续向上上报
             if (allCompleted)
@@ -2792,7 +2991,7 @@ namespace AutoUnpackTool
             AppendLog($"[任务 {taskId}] 开始批量智能路径处理...", ConsoleColor.Cyan);
 
             // 收集该任务涉及的所有解压生成的文件夹
-            var allItems = CollectAllFileItems(_fileList);
+            var allItems = SnapshotAllItems();
             var taskExtractedFolders = new HashSet<string>();
 
             foreach (var item in allItems)
@@ -2911,10 +3110,22 @@ namespace AutoUnpackTool
                 AppendLog($"[批量智能路径] 找到 {extractedFolders.Count} 个解压文件夹待处理", ConsoleColor.Cyan);
 
                 // 对每个解压生成的文件夹执行批量扁平化（fire-and-forget）
-                foreach (var extractedFolder in extractedFolders)
+                // 【并发修复】持锁串行执行，避免与 FinalizeTopLevelExtractAndSmartPathAsync 的收尾并发移动同一目录树
+                _ = Task.Run(async () =>
                 {
-                    _ = Task.Run(() => ProcessSmartPathBatchAsync(extractedFolder));
-                }
+                    await _smartPathFinalizeLock.WaitAsync();
+                    try
+                    {
+                        foreach (var extractedFolder in extractedFolders)
+                        {
+                            await ProcessSmartPathBatchAsync(extractedFolder);
+                        }
+                    }
+                    finally
+                    {
+                        _smartPathFinalizeLock.Release();
+                    }
+                });
             }
         }
 
@@ -3031,13 +3242,26 @@ namespace AutoUnpackTool
                 return;
             }
 
-            // 【修复】只处理当前批次相关的解压目录，避免跨批次影响到不相关的目录
-            // archiveDir 是 topArchivePath 的父目录，只有该目录下的解压节点才属于当前批次
+            // 【并发修复】只处理当前顶级文件的输出目录树，避免同一父目录下多个顶级文件并发收尾时
+            // 互相处理对方的目录（会导致移动冲突、GUID 新目录、图片分散）。
+            // 用 GetOutputDirectory(topArchivePath) 作为树根：
+            // - ArchiveFolder 模式：根 = 当前文件的同名输出文件夹，只包含本文件的解压节点
+            // - ArchiveDir 模式：根 = 父目录（与旧逻辑一致，行下方有专门的跳过扁平化保护）
+            // - SpecificDir 模式：根 = 统一输出目录（行下方有跳过保护）
             string archiveDir = Path.GetDirectoryName(topArchivePath) ?? string.Empty;
+            string ownOutputDir = GetOutputDirectory(topArchivePath);
+
+            // 【并发修复】排除正在解压/测试密码的文件对应的输出目录：收尾与解压线程之间没有锁，
+            // ArchiveDir 模式下其他文件的中间层目录可能在快照范围内，移动正在被解压写入的目录会失败。
+            var busyDirs = SnapshotAllItems()
+                .Where(f => f.Status.Contains("正在解压") || f.Status.Contains("正在测试密码"))
+                .Select(f => GetOutputDirectory(f.FilePath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             
-            var allExtractedDirs = _extractedDirectoryNodes
-                .Where(dir => dir.Equals(archiveDir, StringComparison.OrdinalIgnoreCase)
-                              || dir.StartsWith(archiveDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            var allExtractedDirs = _extractedDirectoryNodes.Keys
+                .Where(dir => (dir.Equals(ownOutputDir, StringComparison.OrdinalIgnoreCase)
+                               || dir.StartsWith(ownOutputDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                              && !busyDirs.Contains(dir))
                 .ToList();
             AppendLog($"[同步批量智能路径] [DEBUG] 共 {allExtractedDirs.Count} 个解压目录节点（已过滤，仅当前批次）", ConsoleColor.Gray);
             foreach (var dir in allExtractedDirs)
@@ -3045,13 +3269,18 @@ namespace AutoUnpackTool
                 AppendLog($"[同步批量智能路径] [DEBUG]   - {dir}", ConsoleColor.Gray);
             }
 
-            // 找出最顶层解压目录：父目录不在 _extractedDirectoryNodes 中的才是顶层
+            // 找出最顶层解压目录：父目录不在当前批次解压目录中的才是顶层
+            // 【修复】跨批次标记污染：_extractedDirectoryNodes 全局累积、批次完成后不清理，
+            // 上一批次残留的父目录标记（如隐写容器 mp4 的输出目录）会让本批次真正的顶层目录
+            // （如重新拖入的 2.zip 输出目录）被误判为非顶层，导致扁平化遍历整体跳过（阶段3空转）。
+            // 改为仅与当前批次过滤后的集合（allExtractedDirs）比较，父子关系只在批内判定。
             // 后序遍历会自然递归覆盖所有子孙目录，无需逐个处理
+            var batchDirSet = allExtractedDirs.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var topLevelDirs = allExtractedDirs
                 .Where(dir =>
                 {
                     string? parent = Path.GetDirectoryName(dir);
-                    return parent == null || !_extractedDirectoryNodes.Contains(parent);
+                    return parent == null || !batchDirSet.Contains(parent);
                 })
                 .ToList();
 
@@ -3126,7 +3355,7 @@ namespace AutoUnpackTool
         {
             try
             {
-                var topLevelItem = FindFileItemInTree(topArchivePath);
+                var topLevelItem = FindFileItemInTreeThreadSafe(topArchivePath);
                 if (topLevelItem == null)
                 {
                     AppendLog($"[状态更新] 未找到顶级FileItem: {Path.GetFileName(topArchivePath)}", ConsoleColor.Yellow);
@@ -3138,55 +3367,12 @@ namespace AutoUnpackTool
                     : " (无密码)";
 
                 // 获取最终扁平化后的路径
+                // 直接使用 FindFinalFlattenedPath，它内部已处理目录不存在/被扁平化重命名等所有情况
                 string outputDir = GetOutputDirectory(topArchivePath);
                 AppendLog($"[状态更新] [DEBUG] outputDir(计算值)={outputDir}, 存在={Directory.Exists(outputDir)}", ConsoleColor.Gray);
                 
-                // 【关键修复】outputDir 可能在阶段4父目录扁平化后被移动
-                // _extractedDirectoryNodes 中已更新到新路径，需要从中查找实际路径
-                string resolvedDir = outputDir;
-                if (!Directory.Exists(outputDir))
-                {
-                    // 目录不存在，可能被父目录扁平化移动了
-                    // 在 _extractedDirectoryNodes 中按目录名查找被移动后的实际路径
-                    string dirName = Path.GetFileName(outputDir);
-                    var movedDirs = _extractedDirectoryNodes
-                        .Where(d => Path.GetFileName(d).Equals(dirName, StringComparison.OrdinalIgnoreCase)
-                                 && !d.Equals(outputDir, StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                    
-                    if (movedDirs.Count > 0)
-                    {
-                        // 优先选择路径最短的（最接近根目录的，即被提升最多的）
-                        resolvedDir = movedDirs.OrderBy(d => d.Length).First();
-                        AppendLog($"[状态更新] [DEBUG] outputDir 不存在，从 _extractedDirectoryNodes 追踪到: {resolvedDir}", ConsoleColor.Gray);
-                    }
-                    else
-                    {
-                        AppendLog($"[状态更新] [DEBUG] outputDir 不存在且未在 _extractedDirectoryNodes 中找到同名目录", ConsoleColor.Yellow);
-                    }
-                }
-                else
-                {
-                    // 目录存在，但检查 _extractedDirectoryNodes 是否有同名但不同路径的目录
-                    // （父目录被扁平化后，同名目录在原路径仍存在但 _extractedDirectoryNodes 已更新）
-                    string dirName = Path.GetFileName(outputDir);
-                    var movedDirs = _extractedDirectoryNodes
-                        .Where(d => Path.GetFileName(d).Equals(dirName, StringComparison.OrdinalIgnoreCase)
-                                 && !d.Equals(outputDir, StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                    
-                    if (movedDirs.Count > 0)
-                    {
-                        // 同名目录存在于不同路径，说明父目录扁平化已移动了它
-                        // 原路径 outputDir 虽有同名目录但那是旧位置的残留或新创建的同名目录
-                        // 使用 _extractedDirectoryNodes 中的新路径
-                        resolvedDir = movedDirs.OrderBy(d => d.Length).First();
-                        AppendLog($"[状态更新] [DEBUG] _extractedDirectoryNodes 中存在同名但路径不同的目录（父目录扁平化？），使用: {resolvedDir} (旧: {outputDir})", ConsoleColor.Gray);
-                    }
-                }
-                
-                string? finalPath = FindFinalFlattenedPath(resolvedDir);
-                AppendLog($"[状态更新] [DEBUG] FindFinalFlattenedPath({resolvedDir}) = {finalPath}", ConsoleColor.Gray);
+                string? finalPath = FindFinalFlattenedPath(outputDir);
+                AppendLog($"[状态更新] [DEBUG] FindFinalFlattenedPath({outputDir}) = {finalPath}", ConsoleColor.Gray);
 
                 Dispatcher.Invoke(() =>
                 {
@@ -3231,7 +3417,7 @@ namespace AutoUnpackTool
             // 只处理解压树中的目录（_extractedDirectoryNodes），非解压目录跳过
             // 后序遍历自然覆盖所有层级（包括最外层），无需额外的"最外层"检查
             AppendLog($"[批量智能路径] [DEBUG] 步骤2: 开始后序遍历, rootDir={rootDir}", ConsoleColor.Gray);
-            ProcessDirectoryTreePostOrder(rootDir);
+            ProcessDirectoryTreePostOrder(rootDir, isInExtractedTree: false);
         
             // 步骤3: 根目录兜底检查——拖入的文件夹本身不在 _extractedDirectoryNodes 中，
             // 后序遍历会跳过它。但如果它恰好只有一个子目录且无其他非压缩包文件，仍需扁平化。
@@ -3257,7 +3443,7 @@ namespace AutoUnpackTool
             try
             {
                 // 找到所有输出目录在 rootDir 下的 FileItem
-                var relatedItems = _fileList.Where(item => 
+                var relatedItems = SnapshotTopLevelItems().Where(item => 
                 {
                     string outputPath = GetOutputDirectory(item.FilePath);
                     return outputPath.Equals(rootDir, StringComparison.OrdinalIgnoreCase) ||
@@ -3278,8 +3464,9 @@ namespace AutoUnpackTool
 
                 foreach (var item in relatedItems)
                 {
-                    // 只更新顶级项或状态中包含"解压成功"的项
-                    if (item.Parent == null || item.Status.Contains("解压成功"))
+                    // 【修复】跳过顶级项（Parent == null）——这些会由 UpdateTopLevelItemCompletedStatus 统一处理
+                    // 只更新非顶级项中状态包含"解压成功"的子压缩包节点
+                    if (item.Parent != null && item.Status.Contains("解压成功"))
                     {
                         var passwordInfo = item.FoundPassword != null 
                             ? $" (密码: {item.FoundPassword})" 
@@ -3319,7 +3506,7 @@ namespace AutoUnpackTool
             var subDirs = Directory.GetDirectories(dir);
             foreach (var subDir in subDirs)
             {
-                if (_extractedDirectoryNodes.Contains(subDir))
+                if (_extractedDirectoryNodes.ContainsKey(subDir))
                 {
                     // 递归查找更深层标记节点
                     string? deeper = FindDeepestMarkedNode(subDir);
@@ -3342,6 +3529,13 @@ namespace AutoUnpackTool
             
             try
             {
+                // 【修复】优先查询扁平化结果映射：rootDir 可能在扁平化中被删除，映射直接指向内容最终位置
+                if (_flattenedFinalPathMap.TryGetValue(rootDir, out string? mappedPath) && Directory.Exists(mappedPath))
+                {
+                    AppendLog($"[批量智能路径] [DEBUG] FindFinalFlattenedPath: 命中扁平化映射 {rootDir} -> {mappedPath}", ConsoleColor.Gray);
+                    return mappedPath;
+                }
+                
                 // 如果 rootDir 不存在，说明扁平化时它被删除了
                 // 需要查找扁平化后的实际目录（在父目录下查找被标记的解压节点）
                 if (!Directory.Exists(rootDir))
@@ -3452,9 +3646,9 @@ namespace AutoUnpackTool
                 AppendLog($"[批量智能路径] [DEBUG] 开始遍历目录: {dirPath}", ConsoleColor.Gray);
 
                 // 检查当前目录是否是被标记的解压目录节点，或者在解压树中
-                bool isExtractedNode = isInExtractedTree || _extractedDirectoryNodes.Contains(dirPath);
+                bool isExtractedNode = isInExtractedTree || _extractedDirectoryNodes.ContainsKey(dirPath);
                 
-                AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: isInExtractedTree={isInExtractedTree}, 在标记节点中={_extractedDirectoryNodes.Contains(dirPath)}, isExtractedNode={isExtractedNode}", ConsoleColor.Gray);
+                AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: isInExtractedTree={isInExtractedTree}, 在标记节点中={_extractedDirectoryNodes.ContainsKey(dirPath)}, isExtractedNode={isExtractedNode}", ConsoleColor.Gray);
                 
                 // 1. 先递归处理所有子目录（深度优先）- 如果在解压树中，子目录也继承这个状态
                 var subDirs = Directory.GetDirectories(dirPath);
@@ -3609,6 +3803,24 @@ namespace AutoUnpackTool
                     AppendLog($"[批量智能路径] [DEBUG-文件列表] {fileName}: {(isArchive ? "压缩包" : "非压缩包")}", ConsoleColor.Gray);
                 }
 
+                // 【修复：同名嵌套优先】压缩包内顶层文件夹与输出目录同名时（如 [GalACG]EX592878201 内
+                // 含同名顶层文件夹），即使父目录存在非压缩包文件也必须就地合并消除冗余嵌套。
+                // 就地合并只上移子目录内容、不移动父目录本身，安全无歧义；
+                // 同名文件/目录冲突由 MergeSingleSubDirInPlace 内部的安全策略处理（不覆盖丢失数据）。
+                if (subDirs.Length == 1)
+                {
+                    string singleSubDir = subDirs[0];
+                    string subDirName = Path.GetFileName(singleSubDir);
+                    string parentDirName = Path.GetFileName(dirPath);
+
+                    if (string.Equals(subDirName, parentDirName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        AppendLog($"[批量智能路径] 检测到同名嵌套（{parentDirName} -> {subDirName}），执行就地合并消除嵌套", ConsoleColor.Cyan);
+                        MergeSingleSubDirInPlace(dirPath, singleSubDir);
+                        return;
+                    }
+                }
+
                 // 触发条件：恰好一个子目录且没有非压缩包文件
                 if (subDirs.Length != 1 || nonArchiveFiles.Length > 0)
                 {
@@ -3619,18 +3831,24 @@ namespace AutoUnpackTool
                     return;
                 }
 
-                string singleSubDir = subDirs[0];
-                string subDirName = Path.GetFileName(singleSubDir);
-                string parentDirName = Path.GetFileName(dirPath);
+                string singleSubDir2 = subDirs[0];
+                string subDirName2 = Path.GetFileName(singleSubDir2);
+                string parentDirName2 = Path.GetFileName(dirPath);
 
-                AppendLog($"[批量智能路径] 检测到可扁平化: {parentDirName} -> {subDirName}", ConsoleColor.Gray);
+                AppendLog($"[批量智能路径] 检测到可扁平化: {parentDirName2} -> {subDirName2}", ConsoleColor.Gray);
+
+                // 顶层拖入的文件夹与普通解压层级一视同仁：都通过 DetermineFolderName 对比父目录名
+                // 与子目录名（含日文 +100 分、长名 +50 分），胜出者成为最终文件夹名。
+                // - 子目录名胜出（如 [坂本商店...] 胜过 187）：拖入的文件夹被删除，内容目录提升到其父目录下
+                // - 父目录名胜出（如 188 胜过 11n）：效果等同就地合并，内容摊平在拖入的文件夹中
+                // FlattenDirectory 内含完整的失败恢复逻辑（残留清理/删除失败回滚/重命名失败回滚），不会丢产物。
 
                 // 根据配置决定最终名称
-                string finalFolderName = DetermineFolderName(parentDirName, subDirName);
+                string finalFolderName = DetermineFolderName(parentDirName2, subDirName2);
                 AppendLog($"[批量智能路径] [DEBUG] 最终文件夹名: {finalFolderName}", ConsoleColor.Gray);
 
                 // 执行扁平化：将子目录内容提升到父目录
-                FlattenDirectory(dirPath, singleSubDir, finalFolderName);
+                FlattenDirectory(dirPath, singleSubDir2, finalFolderName);
             }
             catch (Exception ex)
             {
@@ -3639,8 +3857,121 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
+        /// 将唯一子目录的内容就地合并进 dirPath（不移动 dirPath 本身、不改名）。
+        /// 用于子目录与 dirPath 同名的情况（压缩包内顶层文件夹与输出目录同名导致的嵌套）。
+        /// 合并完成后删除已清空的子目录，并同步更新 _extractedDirectoryNodes 标记。
+        /// </summary>
+        private void MergeSingleSubDirInPlace(string dirPath, string singleSubDir)
+        {
+            try
+            {
+                string dirName = Path.GetFileName(dirPath);
+                string subDirName = Path.GetFileName(singleSubDir);
+                AppendLog($"[批量智能路径] 就地合并: {dirName} <- {subDirName}", ConsoleColor.Cyan);
+
+                int movedCount = 0;
+                // 【修复】先物化条目列表，避免合并过程中移动/删除目录打断惰性枚举
+                foreach (var entry in Directory.EnumerateFileSystemEntries(singleSubDir).ToArray())
+                {
+                    string entryName = Path.GetFileName(entry);
+                    string destPath = Path.Combine(dirPath, entryName);
+
+                    if (Directory.Exists(entry))
+                    {
+                        // 【修复】条目目录名与 dirPath 同名（三层同名嵌套 A\A\A）时，
+                        // destPath 就是正在遍历的 singleSubDir 本身：绝不能删除它
+                        // （会把尚未处理的条目一并递归删除，导致图片丢失）。
+                        // 改为递归就地合并该目录的内容，摊平嵌套。
+                        if (string.Equals(destPath, singleSubDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            AppendLog($"[批量智能路径]   同名嵌套目录，递归合并: {entryName}", ConsoleColor.Gray);
+                            MergeSingleSubDirInPlace(dirPath, entry);
+                            continue;
+                        }
+
+                        if (Directory.Exists(destPath))
+                        {
+                            if (_extractedDirectoryNodes.ContainsKey(destPath))
+                            {
+                                // 目标是已标记的解压节点目录，安全删除后替换
+                                Directory.Delete(destPath, true);
+                                AppendLog($"[批量智能路径]   已替换已存在的解压节点目录: {entryName}", ConsoleColor.Gray);
+                            }
+                            else
+                            {
+                                // 目标是非解压节点的目录，不能删除，使用GUID前缀避免冲突
+                                string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{entryName}";
+                                destPath = Path.Combine(dirPath, safeName);
+                                AppendLog($"[批量智能路径] ⚠ 目标目录已存在且非解压节点，使用安全名称: {safeName}", ConsoleColor.Yellow);
+                            }
+                        }
+                        Directory.Move(entry, destPath);
+                        AppendLog($"[批量智能路径]   已移动目录: {entryName}", ConsoleColor.Gray);
+
+                        // 同步更新解压节点标记
+                        if (_extractedDirectoryNodes.ContainsKey(entry))
+                        {
+                            _extractedDirectoryNodes.TryRemove(entry, out _);
+                            if (!_extractedDirectoryNodes.ContainsKey(destPath))
+                                _extractedDirectoryNodes.TryAdd(destPath, 0);
+                        }
+                    }
+                    else
+                    {
+                        // 【修复】同名文件不再直接删除覆盖（两个版本内容可能不同，直接删会丢图片）：
+                        // 大小相同视为重复文件，跳过移动保留 dirPath 版本；
+                        // 大小不同说明内容不同，子目录版本用安全名称保留两份。
+                        if (File.Exists(destPath))
+                        {
+                            bool isDuplicate = false;
+                            try
+                            {
+                                var destLen = new FileInfo(destPath).Length;
+                                var srcLen = new FileInfo(entry).Length;
+                                isDuplicate = destLen == srcLen;
+                            }
+                            catch { /* 信息读取失败按非重复处理，用安全名保留两份 */ }
+
+                            if (isDuplicate)
+                            {
+                                AppendLog($"[批量智能路径]   跳过重复文件（同名同大小）: {entryName}", ConsoleColor.Gray);
+                                continue;
+                            }
+                            string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{entryName}";
+                            destPath = Path.Combine(dirPath, safeName);
+                            AppendLog($"[批量智能路径] ⚠ 同名文件大小不同，使用安全名称保留: {entryName} -> {safeName}", ConsoleColor.Yellow);
+                        }
+                        File.Move(entry, destPath);
+                        AppendLog($"[批量智能路径]   已移动文件: {entryName}", ConsoleColor.Gray);
+                    }
+                    movedCount++;
+                }
+
+                // 删除已清空的子目录
+                if (Directory.Exists(singleSubDir))
+                {
+                    Directory.Delete(singleSubDir);
+                    AppendLog($"[批量智能路径]   已删除空子目录: {subDirName}", ConsoleColor.Gray);
+                }
+
+                // 子目录本身已删除，从解压节点标记中移除
+                if (_extractedDirectoryNodes.ContainsKey(singleSubDir))
+                {
+                    _extractedDirectoryNodes.TryRemove(singleSubDir, out _);
+                }
+
+                AppendLog($"[批量智能路径] ✓ 就地合并完成: {dirName} (共移动 {movedCount} 项)", ConsoleColor.Green);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[批量智能路径] 就地合并失败 {dirPath}: {ex.Message}", ConsoleColor.Red);
+            }
+        }
+
+        /// <summary>
         /// 处理最外层目录：如果拖入的是文件夹，且解压后最外层目录只包含一个子目录，则扁平化
         /// </summary>
+
         private string? ProcessTopLevelFolderIfNeeded(string rootDir)
         {
             try
@@ -3706,10 +4037,10 @@ namespace AutoUnpackTool
                 AppendLog($"[批量智能路径] [最外层扁平化] 已移动: {subDirName} -> {Path.GetFileName(newPath)}", ConsoleColor.Gray);
 
                 // 【关键】同步更新 _extractedDirectoryNodes，确保后续后序遍历能找到新路径
-                if (_extractedDirectoryNodes.Contains(singleSubDir))
+                if (_extractedDirectoryNodes.ContainsKey(singleSubDir))
                 {
-                    _extractedDirectoryNodes.Remove(singleSubDir);
-                    _extractedDirectoryNodes.Add(newPath);
+                    _extractedDirectoryNodes.TryRemove(singleSubDir, out _);
+                    _extractedDirectoryNodes.TryAdd(newPath, 0);
                     AppendLog($"[批量智能路径] [最外层扁平化] 已同步 _extractedDirectoryNodes: {singleSubDir} -> {newPath}", ConsoleColor.Gray);
                 }
 
@@ -3771,7 +4102,7 @@ namespace AutoUnpackTool
                         if (Directory.Exists(finalPath))
                         {
                             // 【安全检查】只删除已知的解压节点目录，避免误删用户数据
-                            if (_extractedDirectoryNodes.Contains(finalPath))
+                            if (_extractedDirectoryNodes.ContainsKey(finalPath))
                             {
                                 Directory.Delete(finalPath, true);
                                 AppendLog($"[批量智能路径] [最外层扁平化] 已删除已存在的最终目录: {subDirName}", ConsoleColor.Gray);
@@ -3909,10 +4240,10 @@ namespace AutoUnpackTool
                         AppendLog($"[批量智能路径]   已移动: {Path.GetFileName(childDir)} -> {tempName}", ConsoleColor.Gray);
                         
                         // 更新解压节点标记：将旧路径替换为新路径
-                        if (_extractedDirectoryNodes.Contains(childDir))
+                        if (_extractedDirectoryNodes.ContainsKey(childDir))
                         {
-                            _extractedDirectoryNodes.Remove(childDir);
-                            _extractedDirectoryNodes.Add(tempPath);
+                            _extractedDirectoryNodes.TryRemove(childDir, out _);
+                            _extractedDirectoryNodes.TryAdd(tempPath, 0);
                             AppendLog($"[批量智能路径] [DEBUG] 更新解压节点标记: {childDir} -> {tempPath}", ConsoleColor.Gray);
                         }
                     }
@@ -3961,6 +4292,9 @@ namespace AutoUnpackTool
                     {
                         Directory.Delete(parentDir);
                         AppendLog($"[批量智能路径]   已删除空目录: {Path.GetFileName(parentDir)}", ConsoleColor.Gray);
+                        
+                        // 【修复】清理死标记：目录已删除，从解压节点集合中移除，避免后续路径追踪被死路径干扰
+                        _extractedDirectoryNodes.TryRemove(parentDir, out _);
                     }
                     catch (Exception deleteEx)
                     {
@@ -3987,10 +4321,10 @@ namespace AutoUnpackTool
                                 AppendLog($"[批量智能路径]   已恢复临时目录到原始位置（父目录非空）", ConsoleColor.Yellow);
                                 
                                 // 还原解压节点标记
-                                if (_extractedDirectoryNodes.Contains(tempPath))
+                                if (_extractedDirectoryNodes.ContainsKey(tempPath))
                                 {
-                                    _extractedDirectoryNodes.Remove(tempPath);
-                                    _extractedDirectoryNodes.Add(childDir);
+                                    _extractedDirectoryNodes.TryRemove(tempPath, out _);
+                                    _extractedDirectoryNodes.TryAdd(childDir, 0);
                                 }
                             }
                         }
@@ -4010,7 +4344,7 @@ namespace AutoUnpackTool
                 // 避免静默覆盖非扁平化产生的用户原始目录
                 if (Directory.Exists(finalPath))
                 {
-                    if (_extractedDirectoryNodes.Contains(finalPath))
+                    if (_extractedDirectoryNodes.ContainsKey(finalPath))
                     {
                         // 目标是已知的解压节点，安全删除并替换
                         Directory.Delete(finalPath, true);
@@ -4038,12 +4372,12 @@ namespace AutoUnpackTool
                         AppendLog($"[批量智能路径]   ✓ 扁平化完成: {Path.GetFileName(finalPath)}", ConsoleColor.Green);
                         
                         // 更新解压节点标记：将临时路径替换为最终路径（避免重复条目）
-                        if (_extractedDirectoryNodes.Contains(tempPath))
+                        if (_extractedDirectoryNodes.ContainsKey(tempPath))
                         {
-                            _extractedDirectoryNodes.Remove(tempPath);
-                            if (!_extractedDirectoryNodes.Contains(finalPath))
+                            _extractedDirectoryNodes.TryRemove(tempPath, out _);
+                            if (!_extractedDirectoryNodes.ContainsKey(finalPath))
                             {
-                                _extractedDirectoryNodes.Add(finalPath);
+                                _extractedDirectoryNodes.TryAdd(finalPath, 0);
                                 AppendLog($"[批量智能路径] [DEBUG] 更新解压节点标记: {tempPath} -> {finalPath}", ConsoleColor.Gray);
                             }
                             else
@@ -4051,6 +4385,19 @@ namespace AutoUnpackTool
                                 AppendLog($"[批量智能路径] [DEBUG] 解压节点标记已存在，跳过重复添加: {finalPath}", ConsoleColor.Gray);
                             }
                         }
+                        
+                        // 【修复】记录扁平化结果映射：parentDir 已被删除，其内容最终位于 finalPath
+                        // 同时链式更新：之前映射到 childDir/tempPath 的条目也指向 finalPath（覆盖多层嵌套扁平化）
+                        foreach (var key in new List<string>(_flattenedFinalPathMap.Keys))
+                        {
+                            if (string.Equals(_flattenedFinalPathMap[key], childDir, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(_flattenedFinalPathMap[key], tempPath, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _flattenedFinalPathMap[key] = finalPath;
+                            }
+                        }
+                        _flattenedFinalPathMap[parentDir] = finalPath;
+                        AppendLog($"[批量智能路径] [DEBUG] 记录扁平化映射: {parentDir} -> {finalPath}", ConsoleColor.Gray);
                     }
                     catch (IOException ioEx) when (retryCount < maxRetries - 1)
                     {
@@ -4453,10 +4800,27 @@ namespace AutoUnpackTool
                     string combined = output + Environment.NewLine + error;
                     string lower = combined.ToLowerInvariant();
                     
-                    // 解析 "Type = zip" 行获取具体压缩格式
+                    // 解析 "Type = xxx" 行获取具体压缩格式
+                    // -t# 输出的顶层 Type 恒为 "#"，解析不到真实格式时会返回 null
                     detectedType = ParseArchiveTypeFromOutput(combined);
                     
-                    // 如果无法解析具体类型，使用 # 作为回退（提取时会用 -t# 哈希扫描）
+                    // -t# 拿不到真实格式时，用标准 7z l（不带 -t#）再探测一次：
+                    // 对 7z 包伪装成视频、zip 追加在视频尾部等场景，标准探测能拿到真实类型，
+                    // 提取时才不会用 -t# 把嵌套压缩包拆成碎片
+                    if (detectedType == null)
+                    {
+                        var stdProbe = ProbeArchiveByStandardList(filePath);
+                        detectedType = stdProbe.Type;
+                        validFiles = stdProbe.ValidFiles;
+                        AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 标准探测{(detectedType != null ? $"解析到类型 {detectedType}" : "失败")}", ConsoleColor.Gray);
+                    }
+                    else
+                    {
+                        // 从 -t# 输出解析真实文件列表（白名单）
+                        validFiles = ParseStegoFileListFromSltOutput(combined, filePath);
+                    }
+                    
+                    // 标准探测也失败时，使用 # 作为回退（提取时会用 -t# 哈希扫描）
                     if (detectedType == null)
                     {
                         bool isArchive = lower.Contains(".zip") ||
@@ -4467,13 +4831,12 @@ namespace AutoUnpackTool
                         if (isArchive)
                         {
                             detectedType = "#";
+                            validFiles = ParseStegoFileListFromSltOutput(combined, filePath);
                         }
                     }
                     
-                    // 从 -slt 输出解析真实文件列表（白名单）
                     if (detectedType != null)
                     {
-                        validFiles = ParseStegoFileListFromSltOutput(combined, filePath);
                         AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 解析到 {validFiles.Count} 个白名单文件", ConsoleColor.Gray);
                     }
                 }
@@ -4486,6 +4849,60 @@ namespace AutoUnpackTool
             _stegoArchiveTypeCache[filePath] = detectedType;
             _stegoArchiveValidFilesCache[filePath] = validFiles;
             return detectedType;
+        }
+
+        /// <summary>
+        /// 用标准 7z l -slt（不带 -t#）探测真实压缩格式及真实文件列表。
+        /// -t# 哈希扫描的顶层 Type 恒为 "#"，且会把固实压缩流中的字节签名
+        /// 误识别为嵌套压缩包碎片（把完整 zip 拆碎）；
+        /// 标准探测从文件头/尾部解析，对 7z 包伪装成视频、zip 追加在视频尾部
+        /// 等场景能返回真实类型和真实文件列表。
+        /// </summary>
+        private (string? Type, HashSet<string> ValidFiles) ProbeArchiveByStandardList(string filePath)
+        {
+            var empty = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
+                    return (null, empty);
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = _settings.SevenZipPath,
+                    Arguments = $"l -slt -sccUTF-8 \"{filePath}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    StandardOutputEncoding = System.Text.Encoding.UTF8,
+                    StandardErrorEncoding = System.Text.Encoding.UTF8
+                };
+
+                using var process = new Process { StartInfo = startInfo };
+                process.Start();
+                string output = process.StandardOutput.ReadToEnd();
+                string error = process.StandardError.ReadToEnd();
+
+                if (!process.WaitForExit(15000))
+                {
+                    try { process.Kill(); } catch { }
+                    return (null, empty);
+                }
+
+                if (process.ExitCode != 0)
+                    return (null, empty);
+
+                string combined = output + Environment.NewLine + error;
+                string? type = ParseArchiveTypeFromOutput(combined);
+                if (type == null)
+                    return (null, empty);
+
+                return (type, ParseStegoFileListFromSltOutput(combined, filePath));
+            }
+            catch
+            {
+                return (null, empty);
+            }
         }
 
         /// <summary>
@@ -4584,18 +5001,29 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 从 7z l -t# 输出中解析 "Type = xxx" 行，提取压缩格式
+        /// 从 7z l -slt 输出中解析第一条 "Type = xxx" 行，提取压缩格式
+        /// 逐行解析，只取顶层容器的类型（-slt 输出中顶层 Type 行在最前）
         /// </summary>
         private static string? ParseArchiveTypeFromOutput(string output)
         {
-            // 匹配 "Type = zip" 或 "Type = 7z" 等
-            var match = System.Text.RegularExpressions.Regex.Match(
-                output, @"Type\s*=\s*(\w+)", 
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            
-            if (match.Success)
+            if (string.IsNullOrWhiteSpace(output))
+                return null;
+
+            // 注意：不能用跨行正则匹配。 -t# 输出中条目存在空 "Type = " 行，
+            // 正则的 \s* 会吞掉换行符，把下一行的键名（如 Comment）误当作类型值，
+            // 导致解析出的类型无效（如 "comment"）而回退到 -t# 提取。
+            foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                string type = match.Groups[1].Value.ToLowerInvariant();
+                string trimmed = line.Trim();
+                if (!trimmed.StartsWith("Type = ", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string type = trimmed.Substring("Type = ".Length).Trim().ToLowerInvariant();
+
+                // -t# 哈希扫描模式的占位类型，不是真实格式，交由调用方回退处理
+                if (type == "#")
+                    return null;
+
                 // 只返回已知支持的格式
                 if (type == "zip" || type == "7z" || type == "rar" || type == "tar" ||
                     type == "gzip" || type == "gz" || type == "bzip2" || type == "bz2" ||
@@ -4604,6 +5032,9 @@ namespace AutoUnpackTool
                 {
                     return type;
                 }
+
+                // 顶层类型不是已知格式，后面的条目 Type 行不作数
+                return null;
             }
             return null;
         }
@@ -5814,6 +6245,21 @@ namespace AutoUnpackTool
             }
             
             return false;
+        }
+
+        /// <summary>
+        /// [DIAG] 文件诊断日志：直接写文件，绕过 UI。
+        /// Dispatcher.Invoke 挂起时 AppendLog 会静默阻塞，诊断轨迹必须落盘才能定位中断点。
+        /// </summary>
+        private void DiagLog(string message)
+        {
+            try
+            {
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "diag_trace.log"),
+                    $"[{DateTime.Now:HH:mm:ss.fff}] [TID:{Environment.CurrentManagedThreadId}] {message}\r\n");
+            }
+            catch { }
         }
 
         private void AppendLog(string message, ConsoleColor color, FileItem? targetNode = null)
