@@ -28,18 +28,20 @@
 
         <!-- 工具栏 -->
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
-            <Button x:Name="BtnAddRule" Content="添加规则" Width="90" Height="30" Click="BtnAddRule_Click" Margin="0,0,8,0"/>
+            <Button x:Name="BtnAddRule" Content="添加规则" Width="90" Height="30" Command="{Binding AddRuleCommand}" Margin="0,0,8,0"/>
             <Button x:Name="BtnDeleteRule" Content="删除选中" Width="90" Height="30" Click="BtnDeleteRule_Click" Margin="0,0,8,0"/>
-            <Button x:Name="BtnMoveUp" Content="↑ 上移" Width="80" Height="30" Click="BtnMoveUp_Click" Margin="0,0,8,0"/>
-            <Button x:Name="BtnMoveDown" Content="↓ 下移" Width="80" Height="30" Click="BtnMoveDown_Click" Margin="0,0,8,0"/>
-            <Button x:Name="BtnInsertSamples" Content="插入示例规则" Width="110" Height="30" Click="BtnInsertSamples_Click" Background="LightYellow" Margin="0,0,8,0"/>
-            <Button x:Name="BtnClearRules" Content="清空全部" Width="90" Height="30" Click="BtnClearRules_Click" Background="#FFCC99"/>
-            <TextBlock x:Name="TxtRuleSummary" Text="共 0 条规则" VerticalAlignment="Center" Margin="12,0,0,0" Foreground="Gray" FontSize="11"/>
+            <Button x:Name="BtnMoveUp" Content="↑ 上移" Width="80" Height="30" Command="{Binding MoveUpCommand}" Margin="0,0,8,0"/>
+            <Button x:Name="BtnMoveDown" Content="↓ 下移" Width="80" Height="30" Command="{Binding MoveDownCommand}" Margin="0,0,8,0"/>
+            <Button x:Name="BtnInsertSamples" Content="插入示例规则" Width="110" Height="30" Command="{Binding InsertSamplesCommand}" Background="LightYellow" Margin="0,0,8,0"/>
+            <Button x:Name="BtnClearRules" Content="清空全部" Width="90" Height="30" Command="{Binding ClearRulesCommand}" Background="#FFCC99"/>
+            <TextBlock x:Name="TxtRuleSummary" Text="{Binding RuleSummary, Mode=OneWay}" VerticalAlignment="Center" Margin="12,0,0,0" Foreground="Gray" FontSize="11"/>
         </StackPanel>
 
         <!-- 规则表格：一行一格 -->
         <GroupBox Grid.Row="2" Header="黑名单规则（双击单元格编辑，行顺序即匹配优先级）" Margin="0,0,0,10">
             <DataGrid x:Name="DgRules"
+                                  ItemsSource="{Binding Rules}"
+                                  SelectedItem="{Binding SelectedRule, Mode=TwoWay}"
                       AutoGenerateColumns="False"
                       CanUserAddRows="False"
                       CanUserDeleteRows="False"
@@ -93,17 +95,34 @@
 
                 <TextBlock Grid.Row="0" Grid.Column="0" Text="测试文件名:" VerticalAlignment="Center" Margin="0,0,8,0"/>
                 <TextBox x:Name="TxtTestFileName" Grid.Row="0" Grid.Column="1" Height="28" VerticalContentAlignment="Center"
-                         TextChanged="TxtTestFileName_TextChanged"/>
+                         Text="{Binding TestFileName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
                 <TextBlock x:Name="TxtTestResult" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2"
-                           Text="输入文件名试一下" Foreground="Gray" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                           Text="{Binding TestResult, Mode=OneWay}" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Foreground" Value="Gray"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding TestResultColor}" Value="SeaGreen">
+                                    <Setter Property="Foreground" Value="SeaGreen"/>
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding TestResultColor}" Value="Red">
+                                    <Setter Property="Foreground" Value="Red"/>
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding TestResultColor}" Value="DarkOrange">
+                                    <Setter Property="Foreground" Value="DarkOrange"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
             </Grid>
         </GroupBox>
 
         <!-- 底部按钮 -->
         <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="BtnSave" Content="确定" Width="100" Height="30" Click="BtnSave_Click" Margin="0,0,10,0"/>
-            <Button x:Name="BtnCancel" Content="取消" Width="100" Height="30" Click="BtnCancel_Click"/>
+            <Button x:Name="BtnSave" Content="确定" Width="100" Height="30" Command="{Binding SaveCommand}" Margin="0,0,10,0"/>
+            <Button x:Name="BtnCancel" Content="取消" Width="100" Height="30" Command="{Binding CancelCommand}"/>
         </StackPanel>
     </Grid>
 </Window>

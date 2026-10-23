@@ -20,8 +20,9 @@
             <StackPanel Grid.Row="0" Margin="0,0,0,15">
                 <TextBlock Text="配置文件路径:" FontWeight="Bold" Margin="0,0,0,5"/>
                 <StackPanel Orientation="Horizontal">
-                    <TextBox x:Name="TxtConfigPath" Width="420" Height="30" VerticalContentAlignment="Center" IsReadOnly="True" Background="LightGray" Margin="0,0,10,0"/>
-                    <Button x:Name="BtnOpenConfigFolder" Content="打开文件夹" Width="100" Height="30" Click="BtnOpenConfigFolder_Click"/>
+                    <TextBox x:Name="TxtConfigPath" Width="420" Height="30" VerticalContentAlignment="Center" IsReadOnly="True" Background="LightGray" Margin="0,0,10,0"
+                             Text="{Binding ConfigPath, Mode=OneWay}"/>
+                    <Button x:Name="BtnOpenConfigFolder" Content="打开文件夹" Width="100" Height="30" Command="{Binding OpenConfigFolderCommand}"/>
                 </StackPanel>
             </StackPanel>
 
@@ -29,8 +30,9 @@
             <StackPanel Grid.Row="1" Margin="0,0,0,15">
                 <TextBlock Text="解压软件路径 (7z.exe):" FontWeight="Bold" Margin="0,0,0,5"/>
                 <StackPanel Orientation="Horizontal">
-                    <TextBox x:Name="TxtSevenZipPath" Width="420" Height="30" VerticalContentAlignment="Center" Margin="0,0,10,0"/>
-                    <Button x:Name="BtnBrowse7z" Content="浏览..." Width="100" Height="30" Click="BtnBrowse7z_Click"/>
+                    <TextBox x:Name="TxtSevenZipPath" Width="420" Height="30" VerticalContentAlignment="Center" Margin="0,0,10,0"
+                             Text="{Binding SevenZipPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                    <Button x:Name="BtnBrowse7z" Content="浏览..." Width="100" Height="30" Command="{Binding BrowseSevenZipCommand}"/>
                 </StackPanel>
                 <TextBlock Text="提示：请找到7-Zip安装目录下的 7z.exe 文件" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
             </StackPanel>
@@ -41,9 +43,12 @@
                     <!-- 解压后文件处理方式 -->
                     <StackPanel Margin="0,0,0,15">
                         <TextBlock Text="解压后原文件处理:" FontWeight="Bold" Margin="0,0,0,5"/>
-                        <RadioButton x:Name="RdoKeepOriginal" Content="保留原文件" GroupName="FileAction" IsChecked="True" Margin="0,0,0,5"/>
-                        <RadioButton x:Name="RdoMoveToRecycleBin" Content="移动到回收站" GroupName="FileAction" Margin="0,0,0,5"/>
-                        <RadioButton x:Name="RdoDeleteOriginal" Content="直接删除" GroupName="FileAction"/>
+                        <RadioButton x:Name="RdoKeepOriginal" Content="保留原文件" GroupName="FileAction" Margin="0,0,0,5"
+                                     IsChecked="{Binding KeepOriginal, Mode=TwoWay}"/>
+                        <RadioButton x:Name="RdoMoveToRecycleBin" Content="移动到回收站" GroupName="FileAction" Margin="0,0,0,5"
+                                     IsChecked="{Binding MoveToRecycleBin, Mode=TwoWay}"/>
+                        <RadioButton x:Name="RdoDeleteOriginal" Content="直接删除" GroupName="FileAction"
+                                     IsChecked="{Binding DeleteOriginal, Mode=TwoWay}"/>
                         <TextBlock Margin="0,8,0,0" FontSize="11" Foreground="Gray"
                                    Text="提示：子压缩包解压后自动删除，仅保留最终产物。该设置仅影响拖入的顶级文件。"/>
                     </StackPanel>
@@ -51,17 +56,21 @@
                     <!-- 解压模式 -->
                     <StackPanel Margin="0,0,0,15">
                         <TextBlock Text="解压模式:" FontWeight="Bold" Margin="0,0,0,5"/>
-                        <RadioButton x:Name="RdoManualExtract" Content="手动解压（测试密码后手动确认）" GroupName="ExtractMode" IsChecked="True" Margin="0,0,0,5"/>
-                        <RadioButton x:Name="RdoAutoExtract" Content="自动解压（测试密码后自动解压）" GroupName="ExtractMode" Margin="0,0,0,5"/>
+                        <RadioButton x:Name="RdoManualExtract" Content="手动解压（测试密码后手动确认）" GroupName="ExtractMode" Margin="0,0,0,5"
+                                     IsChecked="{Binding ManualExtract, Mode=TwoWay}"/>
+                        <RadioButton x:Name="RdoAutoExtract" Content="自动解压（测试密码后自动解压）" GroupName="ExtractMode" Margin="0,0,0,5"
+                                     IsChecked="{Binding AutoExtract, Mode=TwoWay}"/>
                     </StackPanel>
 
                     <!-- 线程数设置 -->
                     <StackPanel Margin="0,0,0,15">
                         <TextBlock Text="并发线程数:" FontWeight="Bold" Margin="0,0,0,5"/>
                         <StackPanel Orientation="Horizontal">
-                            <Slider x:Name="SliderThreads" Width="350" Minimum="1" Maximum="8" Value="2" 
-                                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
-                            <TextBlock x:Name="TxtThreadsCount" Text="2" Width="30" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                            <Slider x:Name="SliderThreads" Width="350" Minimum="1" Maximum="8"
+                                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"
+                                    Value="{Binding ThreadCountValue, Mode=TwoWay}"/>
+                            <TextBlock x:Name="TxtThreadsCount" Width="30" Margin="10,0,0,0" VerticalAlignment="Center"
+                                       Text="{Binding ThreadCountText, Mode=OneWay}"/>
                         </StackPanel>
                     </StackPanel>
                 </StackPanel>
@@ -72,20 +81,25 @@
                 <StackPanel Margin="10,10,0,0">
                     <!-- 显示CLI窗口 -->
                     <StackPanel Margin="0,0,0,15">
-                        <CheckBox x:Name="ChkShowCliWindow" Content="显示 7z 命令行窗口（用于调试）" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ChkShowCliWindow" Content="显示 7z 命令行窗口（用于调试）" VerticalAlignment="Center"
+                                  IsChecked="{Binding ShowCliWindow, Mode=TwoWay}"/>
                         <TextBlock Text="提示：开启后会显示7z.exe的控制台窗口，关闭则隐藏窗口" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
                     </StackPanel>
 
                     <!-- 智能路径处理 -->
                     <StackPanel Margin="0,0,0,15">
-                        <CheckBox x:Name="ChkSmartPathProcessing" Content="启用智能路径处理（自动扁平化多层嵌套文件夹）" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ChkSmartPathProcessing" Content="启用智能路径处理（自动扁平化多层嵌套文件夹）" VerticalAlignment="Center"
+                                  IsChecked="{Binding SmartPathProcessing, Mode=TwoWay}"/>
                         <TextBlock Text="提示：解压后如果存在多层嵌套且内容单一，会自动将深层文件夹移动到顶层并清理空目录" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
                         
                         <!-- 智能路径处理模式 -->
-                        <StackPanel x:Name="PnlSmartPathMode" Margin="20,10,0,0" Visibility="Collapsed">
+                        <StackPanel x:Name="PnlSmartPathMode" Margin="20,10,0,0"
+                                    Visibility="{Binding IsSmartPathModeVisible, Converter={StaticResource BoolToVis}}">
                             <TextBlock Text="处理模式:" FontWeight="Bold" Margin="0,0,0,5"/>
-                            <RadioButton x:Name="RdoSmartPathConcatenate" Content="拼接文件夹名字" GroupName="SmartPathMode" Margin="0,0,0,5"/>
-                            <RadioButton x:Name="RdoSmartPathSmartSelect" Content="智能选择（优先选择长的、有日文的）" GroupName="SmartPathMode" IsChecked="True"/>
+                            <RadioButton x:Name="RdoSmartPathConcatenate" Content="拼接文件夹名字" GroupName="SmartPathMode" Margin="0,0,0,5"
+                                         IsChecked="{Binding SmartPathConcatenate, Mode=TwoWay}"/>
+                            <RadioButton x:Name="RdoSmartPathSmartSelect" Content="智能选择（优先选择长的、有日文的）" GroupName="SmartPathMode"
+                                         IsChecked="{Binding SmartPathSmartSelect, Mode=TwoWay}"/>
                             <TextBlock Text="• 拼接模式：将所有层级文件夹名用下划线连接" FontSize="10" Foreground="Gray" Margin="0,3,0,0"/>
                             <TextBlock Text="• 智能选择：根据文件夹名长度和是否包含日文自动选择最合适的名称" FontSize="10" Foreground="Gray" Margin="0,2,0,0"/>
                         </StackPanel>
@@ -94,15 +108,20 @@
                     <!-- 解压输出模式 -->
                     <StackPanel Margin="0,0,0,15">
                         <TextBlock Text="解压输出模式:" FontWeight="Bold" Margin="0,0,0,5"/>
-                        <RadioButton x:Name="RdoOutputToSpecificDir" Content="输出到指定目录" GroupName="OutputMode" Margin="0,0,0,5" Checked="OutputMode_Checked"/>
-                        <RadioButton x:Name="RdoOutputToArchiveDir" Content="输出到压缩文件所在目录" GroupName="OutputMode" Margin="0,0,0,5" Checked="OutputMode_Checked"/>
-                        <RadioButton x:Name="RdoOutputToArchiveFolder" Content="输出到压缩文件同名文件夹" GroupName="OutputMode" Checked="OutputMode_Checked"/>
+                        <RadioButton x:Name="RdoOutputToSpecificDir" Content="输出到指定目录" GroupName="OutputMode" Margin="0,0,0,5"
+                                     IsChecked="{Binding OutputToSpecificDir, Mode=TwoWay}"/>
+                        <RadioButton x:Name="RdoOutputToArchiveDir" Content="输出到压缩文件所在目录" GroupName="OutputMode" Margin="0,0,0,5"
+                                     IsChecked="{Binding OutputToArchiveDir, Mode=TwoWay}"/>
+                        <RadioButton x:Name="RdoOutputToArchiveFolder" Content="输出到压缩文件同名文件夹" GroupName="OutputMode"
+                                     IsChecked="{Binding OutputToArchiveFolder, Mode=TwoWay}"/>
                                 
                         <!-- 输出目录选择（仅在"输出到指定目录"模式下显示） -->
-                        <StackPanel x:Name="PnlOutputDir" Margin="20,5,0,0" Visibility="Collapsed">
+                        <StackPanel x:Name="PnlOutputDir" Margin="20,5,0,0"
+                                    Visibility="{Binding IsOutputDirVisible, Converter={StaticResource BoolToVis}}">
                             <StackPanel Orientation="Horizontal">
-                                <TextBox x:Name="TxtOutputDir" Width="420" Height="30" VerticalContentAlignment="Center" Margin="0,0,10,0"/>
-                                <Button x:Name="BtnBrowseOutputDir" Content="浏览..." Width="100" Height="30" Click="BtnBrowseOutputDir_Click"/>
+                                <TextBox x:Name="TxtOutputDir" Width="420" Height="30" VerticalContentAlignment="Center" Margin="0,0,10,0"
+                                         Text="{Binding OutputDir, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                <Button x:Name="BtnBrowseOutputDir" Content="浏览..." Width="100" Height="30" Command="{Binding BrowseOutputDirCommand}"/>
                             </StackPanel>
                         </StackPanel>
                     </StackPanel>
@@ -114,33 +133,39 @@
                 <StackPanel Margin="10,10,0,0">
                     <!-- 分卷压缩检测 -->
                     <StackPanel Margin="0,0,0,12">
-                        <CheckBox x:Name="ChkMultiVolumeDetection" Content="启用分卷压缩包自动检测" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ChkMultiVolumeDetection" Content="启用分卷压缩包自动检测" VerticalAlignment="Center"
+                                  IsChecked="{Binding MultiVolumeDetection, Mode=TwoWay}"/>
                         <TextBlock Text="开启后会自动识别并合并分卷文件（如 .7z.001, .part1.rar 等）" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
                     </StackPanel>
                     
                     <!-- 防和谐文件名自动清理 -->
                     <StackPanel Margin="0,0,0,12">
-                        <CheckBox x:Name="ChkAutoCleanNames" Content="启用防和谐文件名自动清理" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ChkAutoCleanNames" Content="启用防和谐文件名自动清理" VerticalAlignment="Center"
+                                  IsChecked="{Binding AutoCleanNames, Mode=TwoWay}"/>
                         <TextBlock Text="开启后会在检测压缩文件前，自动删除扩展名后的「删」字等防和谐字符（如 xxx.part1.rar删1 → xxx.part1.rar），分卷文件整组一致重命名" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
                     </StackPanel>
                     
                     <!-- 隐写模式探测 -->
                     <StackPanel Margin="0,0,0,12">
-                        <CheckBox x:Name="ChkStegoDetection" Content="启用隐写模式探测（MP4/MKV 内嵌压缩包）" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="ChkStegoDetection" Content="启用隐写模式探测（MP4/MKV 内嵌压缩包）" VerticalAlignment="Center"
+                                  IsChecked="{Binding StegoDetection, Mode=TwoWay}"/>
                         <TextBlock Text="默认关闭以节省资源；开启后会对视频容器做额外 7z 探测" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
                     </StackPanel>
                     <StackPanel Margin="0,0,0,12">
                         <TextBlock Text="隐写探测文件大小下限（MB）:" FontSize="11" Margin="0,0,0,3"/>
                         <StackPanel Orientation="Horizontal">
-                            <TextBox x:Name="TxtStegoMinSizeMB" Width="120" Height="26" VerticalContentAlignment="Center"/>
+                            <TextBox x:Name="TxtStegoMinSizeMB" Width="120" Height="26" VerticalContentAlignment="Center"
+                                     Text="{Binding StegoMinSizeMB, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                             <TextBlock Text="低于该大小的文件将跳过隐写探测" FontSize="11" Foreground="Gray" Margin="10,4,0,0"/>
                         </StackPanel>
                     </StackPanel>
                     <TextBlock Text="压缩文件扩展名检测:" FontWeight="Bold" Margin="0,0,0,5"/>
                     <TextBlock Text="需要检测的扩展名（逗号分隔）:" FontSize="11" Margin="0,0,0,3"/>
-                    <TextBox x:Name="TxtArchiveExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,10"/>
+                    <TextBox x:Name="TxtArchiveExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,10"
+                             Text="{Binding ArchiveExtensions, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                     <TextBlock Text="需要排除的扩展名（逗号分隔，优先级高于包含列表）:" FontSize="11" Margin="0,0,0,3"/>
-                    <TextBox x:Name="TxtExcludedExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,5"/>
+                    <TextBox x:Name="TxtExcludedExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,5"
+                             Text="{Binding ExcludedExtensions, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                     <TextBlock Text="提示：符合扩展名的文件会用魔术数验证是否为压缩文件；排除列表中的文件直接跳过" FontSize="11" Foreground="Gray"/>
                 </StackPanel>
             </Expander>
@@ -150,8 +175,9 @@
                 <StackPanel Margin="10,10,0,0">
                     <TextBlock Text="黑名单规则（支持通配符与正则，一行一条，在表格中管理）:" FontWeight="Bold" Margin="0,0,0,8"/>
                     <StackPanel Orientation="Horizontal">
-                        <Button x:Name="BtnManageBlacklist" Content="管理黑名单..." Width="120" Height="30" Click="BtnManageBlacklist_Click"/>
-                        <TextBlock x:Name="TxtBlacklistSummary" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="Gray" FontSize="11"/>
+                        <Button x:Name="BtnManageBlacklist" Content="管理黑名单..." Width="120" Height="30" Command="{Binding ManageBlacklistCommand}"/>
+                        <TextBlock x:Name="TxtBlacklistSummary" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="Gray" FontSize="11"
+                                   Text="{Binding BlacklistSummary, Mode=OneWay}"/>
                     </StackPanel>
                     <TextBlock Text="提示：规则支持通配符（*、?）与 Perl/.NET 正则；主页上的“启用黑名单”开关可随时整体停用" FontSize="11" Foreground="Gray" Margin="0,8,0,0" TextWrapping="Wrap"/>
                     <TextBlock Text="警告：匹配的文件/文件夹将被永久删除（不经过回收站，不可恢复）" 
@@ -173,8 +199,8 @@
 
             <!-- 按钮区域 -->
             <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,50,0,0">
-                <Button x:Name="BtnSave" Content="💾 保存配置" Width="120" Height="35" Click="BtnSave_Click" Margin="0,0,10,0" FontWeight="Bold"/>
-                <Button x:Name="BtnCancel" Content="取消" Width="100" Height="35" Click="BtnCancel_Click"/>
+                <Button x:Name="BtnSave" Content="💾 保存配置" Width="120" Height="35" Command="{Binding SaveCommand}" Margin="0,0,10,0" FontWeight="Bold"/>
+                <Button x:Name="BtnCancel" Content="取消" Width="100" Height="35" Command="{Binding CancelCommand}"/>
             </StackPanel>
         </Grid>
     </ScrollViewer>

@@ -6,6 +6,8 @@
         <ResourceDictionary>
             <!-- 日志颜色：ConsoleColor -> 画刷 -->
             <services:ConsoleColorToBrushConverter x:Key="ConsoleColorToBrush"/>
+            <!-- bool -> Visibility -->
+            <BooleanToVisibilityConverter x:Key="BoolToVis"/>
         </ResourceDictionary>
     </Application.Resources>
 </Application>

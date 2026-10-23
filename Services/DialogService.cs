@@ -1,5 +1,7 @@
+using System.Linq;
 using System.Windows;
 using AutoUnpackTool.Core.Configuration;
+using AutoUnpackTool.ViewModels;
 using Microsoft.Win32;
 
 namespace AutoUnpackTool.Services
@@ -10,7 +12,8 @@ namespace AutoUnpackTool.Services
     /// </summary>
     public sealed class DialogService : IDialogService
     {
-        private static Window? Owner => Application.Current?.MainWindow;
+        private static Window? Owner => Application.Current?.Windows.OfType<Window>().FirstOrDefault(w => w.IsActive)
+            ?? Application.Current?.MainWindow;
 
         public string? SelectFolder(string title)
         {
@@ -22,10 +25,23 @@ namespace AutoUnpackTool.Services
             return dialog.ShowDialog() == true ? dialog.FolderName : null;
         }
 
+        public string? SelectFile(string title, string filter, string? fileName = null)
+        {
+            var dialog = new OpenFileDialog
+            {
+                Title = title,
+                Filter = filter,
+                FileName = fileName
+            };
+
+            return dialog.ShowDialog() == true ? dialog.FileName : null;
+        }
+
         public AppSettings? ShowSettings(AppSettings current)
         {
-            var dialog = new SettingsDialog(current) { Owner = Owner };
-            return dialog.ShowDialog() == true ? dialog.Settings : null;
+            var vm = new SettingsViewModel(current, this);
+            var dialog = new SettingsDialog(vm) { Owner = Owner };
+            return dialog.ShowDialog() == true ? vm.Settings : null;
         }
 
         public bool ShowPasswords(AppSettings current)
@@ -36,7 +52,8 @@ namespace AutoUnpackTool.Services
 
         public bool ShowBlacklist(AppSettings current)
         {
-            var dialog = new BlacklistManagerDialog(current) { Owner = Owner };
+            var vm = new BlacklistViewModel(current, this);
+            var dialog = new BlacklistManagerDialog(vm) { Owner = Owner };
             return dialog.ShowDialog() == true;
         }
 
@@ -51,6 +68,15 @@ namespace AutoUnpackTool.Services
             {
                 MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
             }
+        }
+
+        public bool ShowConfirm(string message, string title = "确认")
+        {
+            var owner = Owner;
+            var result = owner != null
+                ? MessageBox.Show(owner, message, title, MessageBoxButton.YesNo, MessageBoxImage.Question)
+                : MessageBox.Show(message, title, MessageBoxButton.YesNo, MessageBoxImage.Question);
+            return result == MessageBoxResult.Yes;
         }
     }
 }

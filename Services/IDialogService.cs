@@ -11,6 +11,9 @@ namespace AutoUnpackTool.Services
         /// <summary>选择文件夹，取消返回 null。</summary>
         string? SelectFolder(string title);
 
+        /// <summary>选择文件，取消返回 null。</summary>
+        string? SelectFile(string title, string filter, string? fileName = null);
+
         /// <summary>打开设置对话框；保存返回对话框内的设置实例，取消返回 null。</summary>
         AppSettings? ShowSettings(AppSettings current);
 
@@ -22,5 +25,8 @@ namespace AutoUnpackTool.Services
 
         /// <summary>警告提示框。</summary>
         void ShowWarning(string message, string title = "提示");
+
+        /// <summary>确定/取消确认框，确定返回 true。</summary>
+        bool ShowConfirm(string message, string title = "确认");
     }
 }
