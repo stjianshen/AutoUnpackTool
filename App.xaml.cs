@@ -82,13 +82,31 @@ namespace AutoUnpackTool
             base.OnExit(e);
         }
 
+        private bool _isShowingUnhandledException;
+
         private void App_DispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
         {
-            MessageBox.Show(
-                $"程序发生未处理的异常：\n\n{e.Exception.Message}\n\n{e.Exception.StackTrace}",
-                "错误",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
+            // 防止异常在弹窗的嵌套消息循环中反复抛出（弹窗自我复制 → 栈溢出）
+            if (_isShowingUnhandledException)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            _isShowingUnhandledException = true;
+            try
+            {
+                MessageBox.Show(
+                    $"程序发生未处理的异常：\n\n{e.Exception.Message}\n\n{e.Exception.StackTrace}",
+                    "错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            finally
+            {
+                _isShowingUnhandledException = false;
+            }
+
             e.Handled = true;
         }
 

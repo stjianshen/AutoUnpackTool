@@ -19,15 +19,7 @@ namespace AutoUnpackTool
             _vm = vm;
             DataContext = vm;
 
-            // 日志追加后自动滚动到底部（等价于原 TxtLog.ScrollToEnd）
-            vm.Logs.CollectionChanged += (s, e) =>
-            {
-                int count = LogList.Items.Count;
-                if (count > 0)
-                {
-                    LogList.ScrollIntoView(LogList.Items[count - 1]);
-                }
-            };
+            // 日志自动滚动由附加行为 LogListAutoScroll 负责（见 MainWindow.xaml）
         }
 
         private void Window_DragOver(object sender, DragEventArgs e) => _vm.HandleDragOver(e);
