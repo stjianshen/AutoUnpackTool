@@ -43,6 +43,20 @@ namespace AutoUnpackTool
         private ObservableCollection<FileItem> _fileList => _rootNode.Children;
         private AppSettings _settings;
         private PasswordMap _passwordMap = new PasswordMap(); // 密码映射表
+
+        // 黑名单规则编译缓存（规则未变化时复用，避免逐文件重复解析正则）
+        private sealed class CompiledBlacklistRule
+        {
+            public string SourcePattern = string.Empty;
+            public Regex? Matcher;
+            public bool MatchesFullPath;
+        }
+
+        private List<CompiledBlacklistRule> _compiledBlacklistRules = new();
+        private string _compiledBlacklistSignature = string.Empty;
+        private readonly object _blacklistCompileLock = new();
+        private readonly HashSet<string> _reportedInvalidBlacklistPatterns = new(StringComparer.OrdinalIgnoreCase);
+        private bool _suppressBlacklistToggleEvent = true; // 初始化期间不响应开关变化
         
         // 双队列架构：待处理队列（测试密码）和待解压队列（已测试密码）
         private ConcurrentQueue<FileItem> _pendingQueue = new();     // 待处理队列
@@ -165,8 +179,10 @@ namespace AutoUnpackTool
             // 初始化强制解压模式复选框状态
             ChkForceExtractMode.IsChecked = _settings.ForceExtractMode;
             
-            // 初始化跳过黑名单复选框状态
-            ChkSkipBlacklist.IsChecked = _settings.SkipBlacklist;
+            // 初始化黑名单启用开关（SkipBlacklist 取反）
+            _suppressBlacklistToggleEvent = true;
+            ChkEnableBlacklist.IsChecked = !_settings.SkipBlacklist;
+            _suppressBlacklistToggleEvent = false;
             
             // 初始化最大解压层数下拉框
             InitMaxExtractDepthComboBox();
@@ -679,24 +695,35 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 跳过黑名单处理复选框状态变化事件
+        /// 黑名单启用开关状态变化事件
         /// </summary>
-        private void ChkSkipBlacklist_Changed(object sender, RoutedEventArgs e)
+        private void ChkEnableBlacklist_Changed(object sender, RoutedEventArgs e)
         {
-            if (ChkSkipBlacklist.IsChecked.HasValue)
+            if (_suppressBlacklistToggleEvent)
+                return;
+
+            if (ChkEnableBlacklist.IsChecked.HasValue)
             {
-                _settings.SkipBlacklist = ChkSkipBlacklist.IsChecked.Value;
+                _settings.SkipBlacklist = !ChkEnableBlacklist.IsChecked.Value;
                 _settings.Save();
                 
                 if (_settings.SkipBlacklist)
                 {
-                    AppendLog("已启用跳过黑名单：黑名单匹配的文件将不会被删除", ConsoleColor.Yellow);
+                    AppendLog("已停用黑名单：匹配的文件将不会被删除", ConsoleColor.Yellow);
                 }
                 else
                 {
-                    AppendLog("已关闭跳过黑名单：恢复正常的黑名单处理", ConsoleColor.Cyan);
+                    AppendLog($"已启用黑名单：匹配的文件将被永久删除（{GetEnabledBlacklistRuleCount()} 条规则）", ConsoleColor.Cyan);
                 }
             }
+        }
+
+        /// <summary>
+        /// 获取启用且模式非空的黑名单规则数量
+        /// </summary>
+        private int GetEnabledBlacklistRuleCount()
+        {
+            return _settings.BlacklistRules?.Count(r => r != null && r.Enabled && !string.IsNullOrWhiteSpace(r.Pattern)) ?? 0;
         }
 
         /// <summary>
@@ -3138,8 +3165,12 @@ namespace AutoUnpackTool
             if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
                 return;
 
-            var patterns = _settings.GetBlacklistPatterns();
-            if (patterns == null || patterns.Count == 0)
+            // 黑名单已停用时无需扫描目录
+            if (_settings.SkipBlacklist)
+                return;
+
+            var activeRules = _settings.GetBlacklistRules();
+            if (activeRules == null || activeRules.Count == 0)
                 return;
 
             try
@@ -4633,9 +4664,9 @@ namespace AutoUnpackTool
         #region 黑名单文件处理
 
         /// <summary>
-        /// 检查文件是否匹配黑名单模式
+        /// 检查文件是否匹配黑名单规则（支持通配符与正则，规则顺序优先）
         /// </summary>
-        /// <param name="filePath">文件完整路径</param>
+        /// <param name="filePath">文件或文件夹完整路径</param>
         /// <param name="matchedPattern">匹配到的模式（输出）</param>
         /// <returns>是否为黑名单文件</returns>
         private bool IsBlacklistedFile(string filePath, out string matchedPattern)
@@ -4646,46 +4677,93 @@ namespace AutoUnpackTool
             if (_settings.SkipBlacklist)
                 return false;
 
-            // 获取黑名单模式列表
-            var patterns = _settings.GetBlacklistPatterns();
-            if (patterns == null || patterns.Count == 0)
+            var rules = GetCompiledBlacklistRules();
+            if (rules.Count == 0)
                 return false;
 
             string fileName = Path.GetFileName(filePath);
-            string fullPath = Path.GetFullPath(filePath).ToLowerInvariant();
+            string fullPath = Path.GetFullPath(filePath);
 
-            foreach (var pattern in patterns)
+            foreach (var rule in rules)
             {
-                if (string.IsNullOrWhiteSpace(pattern))
-                    continue;
-
-                string normalizedPattern = pattern.Trim().ToLowerInvariant();
-
-                // 判断是文件名模式还是完整路径模式
-                bool isPathPattern = normalizedPattern.Contains("\\") || normalizedPattern.Contains("/");
-                string target = isPathPattern ? fullPath : fileName.ToLowerInvariant();
-
-                // 将通配符转换为正则表达式
-                string regexPattern = "^" + Regex.Escape(normalizedPattern)
-                    .Replace("\\*", ".*")
-                    .Replace("\\?", ".") + "$";
-
-                try
+                string target = rule.MatchesFullPath ? fullPath : fileName;
+                if (rule.Matcher != null && rule.Matcher.IsMatch(target))
                 {
-                    if (Regex.IsMatch(target, regexPattern, RegexOptions.IgnoreCase))
-                    {
-                        matchedPattern = pattern;
-                        return true;
-                    }
-                }
-                catch (RegexParseException)
-                {
-                    // 忽略无效的正则表达式
-                    AppendLog($"[黑名单] 无效的模式: {pattern}", ConsoleColor.Yellow);
+                    matchedPattern = rule.SourcePattern;
+                    return true;
                 }
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// 获取黑名单规则的编译缓存。规则未变化时直接复用；
+        /// 通配符预转正则、正则预编译，避免逐文件重复解析
+        /// </summary>
+        private List<CompiledBlacklistRule> GetCompiledBlacklistRules()
+        {
+            var rules = _settings.GetBlacklistRules();
+
+            // 规则指纹：规则增删改或启用状态变化时重建缓存
+            string signature = string.Join("\u0001", rules.Select(r => $"{(r.IsRegex ? "R" : "W")}\u0002{r.Pattern.Trim()}"));
+
+            List<CompiledBlacklistRule> compiled;
+            List<string> invalidWarnings = new();
+            lock (_blacklistCompileLock)
+            {
+                if (string.Equals(signature, _compiledBlacklistSignature, StringComparison.Ordinal))
+                    return _compiledBlacklistRules;
+
+                compiled = new List<CompiledBlacklistRule>(rules.Count);
+                foreach (var rule in rules)
+                {
+                    string pattern = rule.Pattern.Trim();
+                    bool matchesFullPath = pattern.Contains('\\') || pattern.Contains('/');
+
+                    try
+                    {
+                        Regex matcher;
+                        if (rule.IsRegex)
+                        {
+                            // 正则规则：Perl/.NET 兼容语法，默认忽略大小写
+                            matcher = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                        }
+                        else
+                        {
+                            // 通配符规则：* 任意字符、? 单字符，全名匹配
+                            string regexPattern = "^" + Regex.Escape(pattern)
+                                .Replace("\\*", ".*")
+                                .Replace("\\?", ".") + "$";
+                            matcher = new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                        }
+
+                        compiled.Add(new CompiledBlacklistRule
+                        {
+                            SourcePattern = pattern,
+                            Matcher = matcher,
+                            MatchesFullPath = matchesFullPath
+                        });
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        // 同一无效规则只提示一次，避免扫描时刷屏
+                        if (_reportedInvalidBlacklistPatterns.Add(pattern))
+                        {
+                            invalidWarnings.Add($"[黑名单] 无效的{(rule.IsRegex ? "正则" : "通配符")}规则已跳过: {pattern}（{ex.Message}）");
+                        }
+                    }
+                }
+
+                _compiledBlacklistRules = compiled;
+                _compiledBlacklistSignature = signature;
+            }
+
+            // 日志可能跨线程调度，必须放在锁外，避免与 UI 线程互等
+            foreach (string warning in invalidWarnings)
+                AppendLog(warning, ConsoleColor.Yellow);
+
+            return compiled;
         }
 
         /// <summary>

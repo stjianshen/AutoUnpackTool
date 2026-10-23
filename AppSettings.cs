@@ -124,6 +124,61 @@ namespace AutoUnpackTool
         }
     }
 
+    /// <summary>
+    /// 黑名单规则（支持通配符与正则表达式），一行一条
+    /// </summary>
+    public class BlacklistRule : System.ComponentModel.INotifyPropertyChanged
+    {
+        private bool _enabled = true;
+        private bool _isRegex;
+        private string _pattern = string.Empty;
+        private string _note = string.Empty;
+
+        /// <summary>
+        /// 是否启用该规则（停用后保留但不参与匹配）
+        /// </summary>
+        public bool Enabled
+        {
+            get => _enabled;
+            set { if (_enabled != value) { _enabled = value; OnPropertyChanged(nameof(Enabled)); } }
+        }
+
+        /// <summary>
+        /// 是否按正则表达式匹配；false 表示按通配符匹配（* 任意字符、? 单字符）
+        /// 正则默认忽略大小写，支持 Perl/.NET 常用语法（\d、\w、|、[]、(?i)、环视等）
+        /// </summary>
+        public bool IsRegex
+        {
+            get => _isRegex;
+            set { if (_isRegex != value) { _isRegex = value; OnPropertyChanged(nameof(IsRegex)); } }
+        }
+
+        /// <summary>
+        /// 匹配模式。模式包含 / 或 \ 时匹配完整路径，否则只匹配文件名
+        /// </summary>
+        public string Pattern
+        {
+            get => _pattern;
+            set { if (_pattern != value) { _pattern = value ?? string.Empty; OnPropertyChanged(nameof(Pattern)); } }
+        }
+
+        /// <summary>
+        /// 规则说明（仅用于展示，便于日后维护）
+        /// </summary>
+        public string Note
+        {
+            get => _note;
+            set { if (_note != value) { _note = value ?? string.Empty; OnPropertyChanged(nameof(Note)); } }
+        }
+
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+
+        private void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(propertyName));
+        }
+    }
+
     public class AppSettings
     {
         // 配置文件路径（公开属性）
@@ -206,7 +261,12 @@ namespace AutoUnpackTool
         public string ExcludedExtensions { get; set; } = ".exe,.dll,.msi,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.pdf,.jpg,.jpeg,.png,.gif,.bmp,.mp3,.mp4,.avi,.mkv";
 
         /// <summary>
-        /// 黑名单文件模式列表（逗号或换行分隔，支持通配符 * 和 ?），匹配的文件将被永久删除
+        /// 黑名单规则列表（表格化管理，支持通配符与正则），匹配的文件/文件夹将被永久删除
+        /// </summary>
+        public List<BlacklistRule> BlacklistRules { get; set; } = new List<BlacklistRule>();
+
+        /// <summary>
+        /// 旧版黑名单模式字符串（逗号或换行分隔），仅用于加载旧配置时迁移到 BlacklistRules
         /// </summary>
         public string BlacklistFiles { get; set; } = "";
 
@@ -243,6 +303,9 @@ namespace AutoUnpackTool
                         var settings = JsonSerializer.Deserialize<AppSettings>(json);
                         if (settings != null)
                         {
+                            // 迁移旧版黑名单字符串到表格规则
+                            settings.MigrateLegacyBlacklist();
+
                             // 确保 PermanentPasswords 不为 null
                             if (settings.PermanentPasswords == null)
                             {
@@ -681,26 +744,59 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 获取黑名单文件模式列表（逗号、中文逗号、换行均可分隔多条）
+        /// 获取所有启用的黑名单规则（自动过滤空模式）
+        /// </summary>
+        public List<BlacklistRule> GetBlacklistRules()
+        {
+            if (BlacklistRules == null)
+                return new List<BlacklistRule>();
+
+            return BlacklistRules
+                .Where(r => r != null && r.Enabled && !string.IsNullOrWhiteSpace(r.Pattern))
+                .ToList();
+        }
+
+        /// <summary>
+        /// 获取黑名单模式列表（兼容旧调用方，返回启用规则的匹配模式）
         /// </summary>
         public List<string> GetBlacklistPatterns()
         {
-            if (string.IsNullOrWhiteSpace(BlacklistFiles))
-                return new List<string>();
+            return GetBlacklistRules().Select(r => r.Pattern.Trim()).ToList();
+        }
+
+        /// <summary>
+        /// 将旧版 BlacklistFiles 字符串迁移为 BlacklistRules 表格规则
+        /// </summary>
+        private void MigrateLegacyBlacklist()
+        {
+            if (BlacklistRules == null)
+                BlacklistRules = new List<BlacklistRule>();
+
+            if (BlacklistRules.Count > 0 || string.IsNullOrWhiteSpace(BlacklistFiles))
+                return;
 
             var separators = new[] { ',', '，' };
-            var patterns = new List<string>();
             foreach (var line in BlacklistFiles.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
                 foreach (var part in line.Split(separators, StringSplitOptions.RemoveEmptyEntries))
                 {
-                    string p = part.Trim();
-                    if (p.Length > 0)
-                        patterns.Add(p);
+                    string pattern = part.Trim();
+                    if (pattern.Length == 0)
+                        continue;
+
+                    // 旧格式为通配符（*、?），统一迁移为通配符规则
+                    BlacklistRules.Add(new BlacklistRule
+                    {
+                        Pattern = pattern,
+                        IsRegex = false,
+                        Enabled = true,
+                        Note = "由旧版黑名单迁移"
+                    });
                 }
             }
 
-            return patterns;
+            BlacklistFiles = string.Empty;
+            Console.WriteLine($"✅ 已迁移旧版黑名单 {BlacklistRules.Count} 条规则");
         }
 
         [Obsolete("使用 LoadPasswordsFromFile 代替")]

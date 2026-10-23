@@ -139,14 +139,16 @@
                 </StackPanel>
             </Expander>
 
-            <!-- 黑名单文件设置 - 可折叠 -->
-            <Expander Grid.Row="5" Header="🚫 黑名单文件设置" IsExpanded="False" Margin="0,0,0,15">
+            <!-- 黑名单规则设置 - 可折叠 -->
+            <Expander Grid.Row="5" Header="黑名单规则设置" IsExpanded="False" Margin="0,0,0,15">
                 <StackPanel Margin="10,10,0,0">
-                    <TextBlock Text="黑名单文件模式（逗号或换行分隔，支持通配符 * 和 ?）:" FontWeight="Bold" Margin="0,0,0,5"/>
-                    <TextBox x:Name="TxtBlacklistFiles" Height="80" TextWrapping="Wrap" 
-                             AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,5"/>
-                    <TextBlock Text="示例: *.tmp, C:\Temp\*, *temp*（也可每行写一条）" FontSize="11" Foreground="Gray"/>
-                    <TextBlock Text="⚠️ 警告：匹配的文件将被永久删除（不经过回收站，不可恢复）" 
+                    <TextBlock Text="黑名单规则（支持通配符与正则，一行一条，在表格中管理）:" FontWeight="Bold" Margin="0,0,0,8"/>
+                    <StackPanel Orientation="Horizontal">
+                        <Button x:Name="BtnManageBlacklist" Content="管理黑名单..." Width="120" Height="30" Click="BtnManageBlacklist_Click"/>
+                        <TextBlock x:Name="TxtBlacklistSummary" VerticalAlignment="Center" Margin="10,0,0,0" Foreground="Gray" FontSize="11"/>
+                    </StackPanel>
+                    <TextBlock Text="提示：规则支持通配符（*、?）与 Perl/.NET 正则；主页上的“启用黑名单”开关可随时整体停用" FontSize="11" Foreground="Gray" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                    <TextBlock Text="警告：匹配的文件/文件夹将被永久删除（不经过回收站，不可恢复）" 
                                FontSize="11" Foreground="Red" Margin="0,5,0,0"/>
                 </StackPanel>
             </Expander>

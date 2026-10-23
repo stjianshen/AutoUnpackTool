@@ -113,8 +113,34 @@ namespace AutoUnpackTool
             TxtArchiveExtensions.Text = Settings.ArchiveExtensions;
             TxtExcludedExtensions.Text = Settings.ExcludedExtensions;
             
-            // 加载黑名单设置
-            TxtBlacklistFiles.Text = Settings.BlacklistFiles;
+            // 加载黑名单规则摘要
+            UpdateBlacklistSummary();
+        }
+
+        /// <summary>
+        /// 打开黑名单表格管理对话框
+        /// </summary>
+        private void BtnManageBlacklist_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new BlacklistManagerDialog(Settings)
+            {
+                Owner = this
+            };
+            dialog.ShowDialog();
+            UpdateBlacklistSummary();
+        }
+
+        /// <summary>
+        /// 刷新黑名单规则摘要
+        /// </summary>
+        private void UpdateBlacklistSummary()
+        {
+            if (TxtBlacklistSummary == null)
+                return;
+
+            int total = Settings.BlacklistRules?.Count ?? 0;
+            int enabled = Settings.BlacklistRules?.Count(r => r != null && r.Enabled && !string.IsNullOrWhiteSpace(r.Pattern)) ?? 0;
+            TxtBlacklistSummary.Text = $"共 {total} 条规则（启用 {enabled} 条）";
         }
 
         private void BtnBrowse7z_Click(object sender, RoutedEventArgs e)
@@ -265,8 +291,7 @@ namespace AutoUnpackTool
                 Settings.ArchiveExtensions = TxtArchiveExtensions.Text.Trim();
                 Settings.ExcludedExtensions = TxtExcludedExtensions.Text.Trim();
                 
-                // 保存黑名单设置
-                Settings.BlacklistFiles = TxtBlacklistFiles.Text.Trim();
+                // 黑名单规则由 BlacklistManagerDialog 直接保存到 Settings.BlacklistRules
 
                 // 保存到文件
                 Settings.Save();

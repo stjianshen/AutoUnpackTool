@@ -55,8 +55,8 @@
             <!-- 强制解压模式复选框 -->
             <CheckBox x:Name="ChkForceExtractMode" Content="强制解压模式(跳过检测)" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ChkForceExtractMode_Changed" Unchecked="ChkForceExtractMode_Changed"/>
             
-            <!-- 跳过黑名单处理复选框 -->
-            <CheckBox x:Name="ChkSkipBlacklist" Content="跳过黑名单" VerticalAlignment="Center" Margin="5,0,0,0" Checked="ChkSkipBlacklist_Changed" Unchecked="ChkSkipBlacklist_Changed"/>
+            <!-- 黑名单总开关（规则在“软件设置”中管理） -->
+            <CheckBox x:Name="ChkEnableBlacklist" Content="启用黑名单" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ChkEnableBlacklist_Changed" Unchecked="ChkEnableBlacklist_Changed"/>
             
             <Separator Width="20" Visibility="Hidden"/>
             
