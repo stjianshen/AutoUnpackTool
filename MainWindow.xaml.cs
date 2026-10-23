@@ -32,6 +32,7 @@ namespace AutoUnpackTool
         private readonly VolumeDetector _volumeDetector;
         private readonly ArchiveDetector _detector;
         private readonly StegoService _stego;
+        private readonly FileCleanupService _cleanup;
         private PasswordMap _passwordMap = new PasswordMap(); // 密码映射表
 
         private bool _suppressBlacklistToggleEvent = true; // 初始化期间不响应开关变化
@@ -114,6 +115,9 @@ namespace AutoUnpackTool
             _detector = new ArchiveDetector(_settings, _logger, _volumeDetector);
             _stego = new StegoService(_settings, _logger, _detector);
             _detector.Stego = _stego;
+
+            // 原文件/分卷清理
+            _cleanup = new FileCleanupService(_settings, _logger);
             
             // 根据设置初始化单选按钮状态
             if (_settings.ExtractMode == ExtractMode.Auto)
@@ -794,10 +798,10 @@ namespace AutoUnpackTool
             Task.Delay(500).Wait();
             
             // 3. Kill掉所有7z进程
-            KillSevenZipProcesses();
+            _cleanup.KillSevenZipProcesses();
             
             // 4. Kill掉所有NanaZip进程
-            KillNanaZipProcesses();
+            _cleanup.KillNanaZipProcesses();
             
             // 5. 清空UI和数据
             _fileList.Clear();
@@ -857,45 +861,6 @@ namespace AutoUnpackTool
                 _extractCancellationTokenSource.Cancel();
             }
         }
-        
-        /// <summary>
-        /// Kill掉所有7z进程
-        /// </summary>
-        private void KillSevenZipProcesses()
-        {
-            try
-            {
-                var processes = System.Diagnostics.Process.GetProcessesByName("7z");
-                if (processes.Length > 0)
-                {
-                    AppendLog($"发现 {processes.Length} 个7z进程，正在终止...", ConsoleColor.Yellow);
-                    foreach (var process in processes)
-                    {
-                        try
-                        {
-                            if (!process.HasExited)
-                            {
-                                process.Kill();
-                                process.WaitForExit(1000); // 等待1秒让进程退出
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendLog($"终止7z进程失败: {ex.Message}", ConsoleColor.Red);
-                        }
-                        finally
-                        {
-                            process.Dispose();
-                        }
-                    }
-                    AppendLog("所有7z进程已终止", ConsoleColor.Green);
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"查找7z进程失败: {ex.Message}", ConsoleColor.Red);
-            }
-        }
 
         /// <summary>
         /// 统一操作按钮点击事件（根据状态自动切换功能）
@@ -938,8 +903,8 @@ namespace AutoUnpackTool
                 Task.Delay(500).Wait();
                 
                 // 3. Kill掉所有7z进程（包括 NanaZip）
-                KillSevenZipProcesses();
-                KillNanaZipProcesses();
+                _cleanup.KillSevenZipProcesses();
+                _cleanup.KillNanaZipProcesses();
                 
                 AppendLog("程序已关闭", ConsoleColor.Green);
             }
@@ -947,52 +912,6 @@ namespace AutoUnpackTool
             {
                 // 即使出错也允许关闭
                 AppendLog($"关闭时发生错误: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-        
-        /// <summary>
-        /// Kill掉所有 NanaZip 进程
-        /// </summary>
-        private void KillNanaZipProcesses()
-        {
-            try
-            {
-                // NanaZip 的进程名可能不同，尝试查找
-                var processNames = new[] { "NanaZip", "NanaZipC", "NanaZip.Universal.Console", "7zG", "NanaZipG" };
-                
-                foreach (var processName in processNames)
-                {
-                    var processes = System.Diagnostics.Process.GetProcessesByName(processName);
-                    if (processes.Length > 0)
-                    {
-                        AppendLog($"发现 {processes.Length} 个 {processName} 进程，正在终止...", ConsoleColor.Yellow);
-                        foreach (var process in processes)
-                        {
-                            try
-                            {
-                                if (!process.HasExited)
-                                {
-                                    process.Kill();
-                                    process.WaitForExit(1000); // 等待1秒让进程退出
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                AppendLog($"终止 {processName} 进程失败: {ex.Message}", ConsoleColor.Red);
-                            }
-                            finally
-                            {
-                                process.Dispose();
-                            }
-                        }
-                    }
-                }
-                
-                AppendLog("所有压缩软件进程已终止", ConsoleColor.Green);
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"查找压缩软件进程失败: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -1834,7 +1753,7 @@ namespace AutoUnpackTool
                     {
                         // 解压成功，处理原文件（移动到回收站/删除等）
                         // 由于这个方法被多处调用，且都是同步调用，我们使用 fire-and-forget 模式
-                        _ = HandleOriginalFileAsync(fileItem.FilePath);
+                        _ = _cleanup.HandleOriginalFileAsync(fileItem.FilePath, fileItem);
                         
                         // 从列表移除
                         Dispatcher.Invoke(() =>
@@ -1856,71 +1775,6 @@ namespace AutoUnpackTool
                         // 解压失败，保留原文件和列表记录
                         AppendLog($"[{fileItem.FileName}] 解压失败，保留原文件和列表记录", ConsoleColor.Yellow);
                     }
-                }
-            }
-        }
-
-        /// <summary>
-        /// 异步处理原文件（fire-and-forget 模式）
-        /// </summary>
-        private async Task HandleOriginalFileAsync(string filePath)
-        {
-            try
-            {
-                if (_settings.FileAfterExtract != FileAction.Keep)
-                {
-                    await HandleOriginalFile(filePath);
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"处理原文件时出错: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        /// <summary>
-        /// 永久删除文件（带重试逻辑），不受 FileAfterExtract 设置影响
-        /// 用于清理子压缩包——子压缩包总是直接删除，不保留
-        /// </summary>
-        private async Task DeleteFilePermanentlyAsync(string filePath)
-        {
-            for (int i = 0; i < 5; i++)
-            {
-                try
-                {
-                    if (!File.Exists(filePath))
-                        return;
-                    
-                    bool unlocked = await WaitForFileUnlock(filePath, 8000);
-                    if (!unlocked)
-                    {
-                        int randomWait = Random.Shared.Next(1000, 3001);
-                        AppendLog($"  文件仍在占用中，等待 {randomWait / 1000.0:F1} 秒后重试 ({i + 1}/5): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                        await Task.Delay(randomWait);
-                        continue;
-                    }
-                    
-                    await Task.Run(() => File.Delete(filePath));
-                    AppendLog($"  子压缩包已删除: {Path.GetFileName(filePath)}", ConsoleColor.Gray);
-                    return;
-                }
-                catch (IOException ex)
-                {
-                    if (i < 4)
-                    {
-                        int randomWait = Random.Shared.Next(1000, 3001);
-                        AppendLog($"  删除失败 ({ex.Message})，等待 {randomWait / 1000.0:F1} 秒后重试 ({i + 1}/5): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                        await Task.Delay(randomWait);
-                    }
-                    else
-                    {
-                        AppendLog($"  删除失败（多次重试后仍失败）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"  删除子压缩包出错: {Path.GetFileName(filePath)}: {ex.Message}", ConsoleColor.Red);
-                    return;
                 }
             }
         }
@@ -1964,11 +1818,11 @@ namespace AutoUnpackTool
                     if (item.VolumeInfo?.HasVolumeList == true)
                     {
                         // 分卷压缩包：删除所有分卷
-                        await DeleteAllVolumes(item.VolumeInfo);
+                        await _cleanup.DeleteAllVolumes(item.VolumeInfo);
                     }
                     else
                     {
-                        await DeleteFilePermanentlyAsync(item.FilePath);
+                        await _cleanup.DeleteFilePermanentlyAsync(item.FilePath);
                     }
                 }
                 catch (Exception ex)
@@ -2088,7 +1942,17 @@ namespace AutoUnpackTool
                 if (_settings.FileAfterExtract != FileAction.Keep)
                 {
                     AppendLog($"[阶段2] 等待文件解锁并清理...", ConsoleColor.Cyan);
-                    await HandleOriginalFile(topArchivePath);
+                    // 文件项（含分卷信息）必须在 UI 线程查找后传入清理服务
+                    FileItem? topFileItem = null;
+                    Dispatcher.Invoke(() =>
+                    {
+                        topFileItem = _fileList.FirstOrDefault(f => f.FilePath == topArchivePath);
+                        if (topFileItem == null)
+                        {
+                            topFileItem = FindFileItemInTree(topArchivePath);
+                        }
+                    });
+                    await _cleanup.HandleOriginalFile(topArchivePath, topFileItem);
                     AppendLog($"[阶段2] 顶级原压缩包清理完成", ConsoleColor.Cyan);
                 }
                 else
@@ -4632,484 +4496,6 @@ namespace AutoUnpackTool
             catch (Exception ex)
             {
                 AppendLog($"扫描目录失败: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        /// <summary>
-        /// 静默删除文件到回收站（不显示系统对话框）
-        /// </summary>
-        private async Task<bool> SilentDeleteToRecycleBinAsync(string filePath)
-        {
-            try
-            {
-                await Task.Run(() =>
-                {
-                    // 确保路径以双 null 结尾
-                    string path = filePath + "\0";
-                    
-                    var fileOp = new NativeMethods.SHFILEOPSTRUCT
-                    {
-                        hwnd = IntPtr.Zero,
-                        wFunc = NativeMethods.FO_DELETE,
-                        pFrom = path,
-                        pTo = string.Empty,
-                        fFlags = NativeMethods.FOF_ALLOWUNDO | NativeMethods.FOF_NOCONFIRMATION | NativeMethods.FOF_SILENT,
-                        fAnyOperationsAborted = false,
-                        hNameMappings = IntPtr.Zero,
-                        lpszProgressTitle = string.Empty
-                    };
-
-                    int result = NativeMethods.SHFileOperation(ref fileOp);
-                    
-                    // 返回0表示成功
-                    if (result != 0)
-                    {
-                        throw new Exception($"SHFileOperation failed with error code: {result}");
-                    }
-                });
-                
-                return true;
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"  删除文件到回收站失败: {ex.Message}", ConsoleColor.Red);
-                return false;
-            }
-        }
-
-        private async Task HandleOriginalFile(string filePath)
-        {
-            try
-            {
-                // 获取文件项以检查是否为分卷压缩包
-                FileItem? fileItem = null;
-                Dispatcher.Invoke(() =>
-                {
-                    fileItem = _fileList.FirstOrDefault(f => f.FilePath == filePath);
-                    if (fileItem == null)
-                    {
-                        // 尝试在子项中查找
-                        fileItem = FindFileItemInTree(filePath);
-                    }
-                });
-                
-                switch (_settings.FileAfterExtract)
-                {
-                    case FileAction.MoveToRecycleBin:
-                        // 移动到回收站
-                        if (fileItem?.VolumeInfo?.HasVolumeList == true)
-                        {
-                            // 分卷压缩包：移动所有分卷
-                            await MoveAllVolumesToRecycleBin(fileItem.VolumeInfo);
-                        }
-                        else
-                        {
-                            // 普通文件：移动到回收站
-                            bool success = false;
-                            int retryCount = 3;
-                                                    
-                            for (int i = 0; i < retryCount; i++)
-                            {
-                                // 尝试等待文件解锁（每次等待5秒）
-                                bool unlocked = await WaitForFileUnlock(filePath, 5000);
-                                                        
-                                if (!unlocked)
-                                {
-                                    int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
-                                    AppendLog($"  原文件仍在占用中，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(randomWait);
-                                    continue;
-                                }
-                            
-                                try
-                                {
-                                    // 使用Windows API静默删除到回收站
-                                    AppendLog($"  文件已解锁，开始移动到回收站: {Path.GetFileName(filePath)}", ConsoleColor.Gray);
-                                    success = await SilentDeleteToRecycleBinAsync(filePath);
-                                    if (success)
-                                    {
-                                        break;
-                                    }
-                                    else
-                                    {
-                                        int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
-                                        AppendLog($"  删除失败，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                        await Task.Delay(randomWait);
-                                    }
-                                }
-                                catch (IOException ex)
-                                {
-                                    int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
-                                    AppendLog($"  原文件被占用 ({ex.Message})，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(randomWait);
-                                }
-                            }
-
-                            if (success)
-                            {
-                                AppendLog($"  原文件已移动到回收站: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                            }
-                            else
-                            {
-                                AppendLog($"  移动原文件失败（多次重试后仍被占用）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
-                            }
-                        }
-                        break;
-
-                    case FileAction.Delete:
-                        // 直接删除
-                        if (fileItem?.VolumeInfo?.HasVolumeList == true)
-                        {
-                            // 分卷压缩包：删除所有分卷
-                            await DeleteAllVolumes(fileItem.VolumeInfo);
-                        }
-                        else
-                        {
-                            // 普通文件：直接删除
-                            bool success = false;
-                            int retryCount = 5;  // 增加重试次数到5次
-                                                    
-                            for (int i = 0; i < retryCount; i++)
-                            {
-                                // 尝试等待文件解锁（增加等待时间到8秒）
-                                bool unlocked = await WaitForFileUnlock(filePath, 8000);
-                                                        
-                                if (!unlocked)
-                                {
-                                    int randomWait = Random.Shared.Next(1000, 3001); // 1000-3000ms 随机等待
-                                    AppendLog($"  原文件仍在占用中，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(randomWait);
-                                    continue;
-                                }
-                            
-                                try
-                                {
-                                    await Task.Run(() => File.Delete(filePath));
-                                    success = true;
-                                    break;
-                                }
-                                catch (IOException ex)
-                                {
-                                    int randomWait = Random.Shared.Next(1000, 3001); // 1000-3000ms 随机等待
-                                    AppendLog($"  原文件被占用 ({ex.Message})，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(randomWait);
-                                }
-                            }
-
-                            if (success)
-                            {
-                                AppendLog($"  原文件已删除: {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                            }
-                            else
-                            {
-                                AppendLog($"   删除原文件失败（多次重试后仍被占用）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
-                                AppendLog($"  提示：请关闭可能占用该文件的程序（如资源管理器、杀毒软件等），然后手动删除", ConsoleColor.Gray);
-                            }
-                        }
-                        break;
-
-                    case FileAction.MoveToSpecificDir:
-                        // 移动到指定目录
-                        if (fileItem?.VolumeInfo?.HasVolumeList == true)
-                        {
-                            // 分卷压缩包：移动所有分卷
-                            await MoveAllVolumesToSpecificDir(fileItem.VolumeInfo);
-                        }
-                        else
-                        {
-                            // 普通文件：移动到指定目录
-                            await MoveFileToSpecificDir(filePath);
-                        }
-                        break;
-
-                    case FileAction.Keep:
-                    default:
-                        // 保留原文件，不做处理
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"  处理原文件失败: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        /// <summary>
-        /// 移动所有分卷到回收站
-        /// </summary>
-        private async Task MoveAllVolumesToRecycleBin(ArchiveVolumeInfo volumeInfo)
-        {
-            AppendLog($"  准备移动 {volumeInfo.VolumeCount} 个分卷到回收站...", ConsoleColor.Cyan);
-            
-            int movedCount = 0;
-            foreach (var volumePath in volumeInfo.AllVolumePaths)
-            {
-                try
-                {
-                    if (File.Exists(volumePath))
-                    {
-                        bool success = false;
-                        int retryCount = 3;
-                        
-                        for (int i = 0; i < retryCount; i++)
-                        {
-                            // 尝试等待文件解锁（每次等待5秒）
-                            bool unlocked = await WaitForFileUnlock(volumePath, 5000);
-                            
-                            if (!unlocked)
-                            {
-                                int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
-                                AppendLog($"  分卷文件仍在占用中，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                await Task.Delay(randomWait);
-                                continue;
-                            }
-
-                            try
-                            {
-                                // 使用Windows API静默删除到回收站
-                                success = await SilentDeleteToRecycleBinAsync(volumePath);
-                                if (success)
-                                {
-                                    break;
-                                }
-                                else
-                                {
-                                    int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
-                                    AppendLog($"  删除失败，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                    await Task.Delay(randomWait);
-                                }
-                            }
-                            catch (IOException ex)
-                            {
-                                int randomWait = Random.Shared.Next(500, 2001); // 500-2000ms 随机等待
-                                AppendLog($"  分卷文件被占用 ({ex.Message})，等待 {randomWait/1000.0:F1} 秒后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                await Task.Delay(randomWait);
-                            }
-                            catch (Exception ex)
-                            {
-                                AppendLog($"  移动分卷失败 ({ex.GetType().Name}: {ex.Message}): {Path.GetFileName(volumePath)}", ConsoleColor.Red);
-                                break;
-                            }
-                        }
-
-                        if (success)
-                        {
-                            AppendLog($"  已移动分卷到回收站: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                            movedCount++;
-                        }
-                        else
-                        {
-                            AppendLog($"  移动分卷失败（多次重试后仍被占用）: {Path.GetFileName(volumePath)}", ConsoleColor.Red);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    string errorMsg = ex.Message;
-                    if (string.IsNullOrWhiteSpace(errorMsg) && ex.InnerException != null)
-                    {
-                        errorMsg = ex.InnerException.Message;
-                    }
-                    AppendLog($"  移动分卷失败 {Path.GetFileName(volumePath)}: {errorMsg}", ConsoleColor.Red);
-                }
-            }
-            
-            AppendLog($"  分卷压缩包已处理（已移动 {movedCount}/{volumeInfo.VolumeCount} 个分卷到回收站）", ConsoleColor.Green);
-        }
-
-        /// <summary>
-        /// 等待文件解锁（文件不再被其他进程占用）
-        /// </summary>
-        /// <param name="filePath">文件路径</param>
-        /// <param name="timeoutMs">超时时间（毫秒）</param>
-        /// <returns>true=文件已解锁, false=超时</returns>
-        private async Task<bool> WaitForFileUnlock(string filePath, int timeoutMs)
-        {
-            int waited = 0;
-            int interval = 100; // 每100ms检查一次
-
-            while (waited < timeoutMs)
-            {
-                try
-                {
-                    // 独占读即可检测占用；ReadWrite 在只读属性/ACL 上会失败，导致误判未解锁而跳过清理
-                    using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None))
-                    {
-                        return true; // 成功打开，文件已解锁
-                    }
-                }
-                catch (IOException)
-                {
-                    // 文件被占用，等待后重试
-                    await Task.Delay(interval);
-                    waited += interval;
-                }
-                catch
-                {
-                    // 其他错误（如文件不存在），认为已解锁
-                    return true;
-                }
-            }
-
-            return false; // 超时
-        }
-
-        /// <summary>
-        /// 删除所有分卷
-        /// </summary>
-        private async Task DeleteAllVolumes(ArchiveVolumeInfo volumeInfo)
-        {
-            AppendLog($"  准备删除 {volumeInfo.VolumeCount} 个分卷...", ConsoleColor.Cyan);
-            
-            int deletedCount = 0;
-            foreach (var volumePath in volumeInfo.AllVolumePaths)
-            {
-                try
-                {
-                    if (File.Exists(volumePath))
-                    {
-                        // 等待文件解锁（每次等待5秒，符合规范）
-                        if (!await WaitForFileUnlock(volumePath, 5000))
-                        {
-                            AppendLog($"  警告：分卷文件仍在占用中: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                            continue;
-                        }
-
-                        bool success = false;
-                        int retryCount = 3;
-                        for (int i = 0; i < retryCount; i++)
-                        {
-                            try
-                            {
-                                await Task.Run(() => File.Delete(volumePath));
-                                success = true;
-                                break;
-                            }
-                            catch (IOException) when (i < retryCount - 1)
-                            {
-                                AppendLog($"  分卷文件被占用，等待后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                await Task.Delay(1000 * (i + 1));
-                            }
-                        }
-
-                        if (success)
-                        {
-                            AppendLog($"  已删除分卷: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                            deletedCount++;
-                        }
-                        else
-                        {
-                            AppendLog($"  删除分卷失败（多次重试后仍被占用）: {Path.GetFileName(volumePath)}", ConsoleColor.Red);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    string errorMsg = ex.Message;
-                    if (string.IsNullOrWhiteSpace(errorMsg) && ex.InnerException != null)
-                    {
-                        errorMsg = ex.InnerException.Message;
-                    }
-                    AppendLog($"  删除分卷失败 {Path.GetFileName(volumePath)}: {errorMsg}", ConsoleColor.Red);
-                }
-            }
-            
-            AppendLog($"  分卷压缩包已处理（已删除 {deletedCount}/{volumeInfo.VolumeCount} 个分卷）", ConsoleColor.Green);
-        }
-
-        /// <summary>
-        /// 移动所有分卷到指定目录
-        /// </summary>
-        private async Task MoveAllVolumesToSpecificDir(ArchiveVolumeInfo volumeInfo)
-        {
-            if (string.IsNullOrWhiteSpace(_settings.ArchiveCleanupDir))
-            {
-                AppendLog($"  警告：未设置分卷清理目录", ConsoleColor.Yellow);
-                return;
-            }
-
-            if (!Directory.Exists(_settings.ArchiveCleanupDir))
-            {
-                Directory.CreateDirectory(_settings.ArchiveCleanupDir);
-            }
-
-            AppendLog($"  准备移动 {volumeInfo.VolumeCount} 个分卷到: {_settings.ArchiveCleanupDir}", ConsoleColor.Cyan);
-            
-            int movedCount = 0;
-            foreach (var volumePath in volumeInfo.AllVolumePaths)
-            {
-                try
-                {
-                    if (File.Exists(volumePath))
-                    {
-                        string destPath = Path.Combine(_settings.ArchiveCleanupDir, Path.GetFileName(volumePath));
-                        
-                        // 如果目标文件已存在，添加序号
-                        if (File.Exists(destPath))
-                        {
-                            string nameWithoutExt = Path.GetFileNameWithoutExtension(destPath);
-                            string ext = Path.GetExtension(destPath);
-                            int counter = 1;
-                            while (File.Exists(destPath))
-                            {
-                                destPath = Path.Combine(_settings.ArchiveCleanupDir, $"{nameWithoutExt}_{counter}{ext}");
-                                counter++;
-                            }
-                        }
-                        
-                        await Task.Run(() => File.Move(volumePath, destPath));
-                        AppendLog($"  已移动分卷: {Path.GetFileName(volumePath)} -> {Path.GetFileName(destPath)}", ConsoleColor.Yellow);
-                        movedCount++;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"  移动分卷失败 {Path.GetFileName(volumePath)}: {ex.Message}", ConsoleColor.Red);
-                }
-            }
-            
-            AppendLog($"  分卷压缩包已处理（已移动 {movedCount}/{volumeInfo.VolumeCount} 个分卷）", ConsoleColor.Green);
-        }
-
-        /// <summary>
-        /// 移动单个文件到指定目录
-        /// </summary>
-        private async Task MoveFileToSpecificDir(string filePath)
-        {
-            if (string.IsNullOrWhiteSpace(_settings.ArchiveCleanupDir))
-            {
-                AppendLog($"  警告：未设置清理目录", ConsoleColor.Yellow);
-                return;
-            }
-
-            if (!Directory.Exists(_settings.ArchiveCleanupDir))
-            {
-                Directory.CreateDirectory(_settings.ArchiveCleanupDir);
-            }
-
-            try
-            {
-                string destPath = Path.Combine(_settings.ArchiveCleanupDir, Path.GetFileName(filePath));
-                
-                // 如果目标文件已存在，添加序号
-                if (File.Exists(destPath))
-                {
-                    string nameWithoutExt = Path.GetFileNameWithoutExtension(destPath);
-                    string ext = Path.GetExtension(destPath);
-                    int counter = 1;
-                    while (File.Exists(destPath))
-                    {
-                        destPath = Path.Combine(_settings.ArchiveCleanupDir, $"{nameWithoutExt}_{counter}{ext}");
-                        counter++;
-                    }
-                }
-                
-                await Task.Run(() => File.Move(filePath, destPath));
-                AppendLog($"  原文件已移动: {Path.GetFileName(filePath)} -> {destPath}", ConsoleColor.Yellow);
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"  移动文件失败: {ex.Message}", ConsoleColor.Red);
             }
         }
 
