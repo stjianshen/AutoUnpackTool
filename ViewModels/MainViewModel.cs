@@ -204,24 +204,24 @@ namespace AutoUnpackTool.ViewModels
             _smartPath.GetAllItemsSnapshot = _pipeline.SnapshotAllItems;
             _pipeline.OnTopLevelCompleted = UpdateTopLevelItemCompletedStatus;
 
-            AppendLog("系统就绪，请拖拽压缩文件到窗口...", ConsoleColor.Green);
+            _logger.Log("系统就绪，请拖拽压缩文件到窗口...", ConsoleColor.Green);
 
             // 如果有设置，显示提示
             if (!string.IsNullOrEmpty(_settings.SevenZipPath))
             {
-                AppendLog($"已加载配置: 7z.exe = {_settings.SevenZipPath}", ConsoleColor.Cyan);
+                _logger.Log($"已加载配置: 7z.exe = {_settings.SevenZipPath}", ConsoleColor.Cyan);
 
                 // 检查是否是 NanaZip 的 WindowsApps 路径
                 if (_settings.SevenZipPath.Contains("WindowsApps") || _settings.SevenZipPath.Contains("NanaZip"))
                 {
-                    AppendLog("⚠️  警告: 检测到 NanaZip (UWP版本)", ConsoleColor.Yellow);
-                    AppendLog("   UWP应用可能有权限限制，建议使用标准 7-Zip", ConsoleColor.Yellow);
-                    AppendLog("   下载地址: https://www.7-zip.org/", ConsoleColor.Gray);
+                    _logger.Log("⚠️  警告: 检测到 NanaZip (UWP版本)", ConsoleColor.Yellow);
+                    _logger.Log("   UWP应用可能有权限限制，建议使用标准 7-Zip", ConsoleColor.Yellow);
+                    _logger.Log("   下载地址: https://www.7-zip.org/", ConsoleColor.Gray);
                 }
             }
             else
             {
-                AppendLog("提示：请先在\"软件设置\"中配置 7z.exe 路径", ConsoleColor.Yellow);
+                _logger.Log("提示：请先在\"软件设置\"中配置 7z.exe 路径", ConsoleColor.Yellow);
             }
 
             // 根据设置初始化解压模式（等价于原 RdoAutoMode/RdoManualMode 的 IsChecked 赋值）
@@ -291,11 +291,11 @@ namespace AutoUnpackTool.ViewModels
 
             if (_settings.ForceExtractMode)
             {
-                AppendLog("已启用强制解压模式：所有拖入的文件将跳过检测直接尝试觧压", ConsoleColor.Yellow);
+                _logger.Log("已启用强制解压模式：所有拖入的文件将跳过检测直接尝试觧压", ConsoleColor.Yellow);
             }
             else
             {
-                AppendLog("已关闭强制解压模式：恢复正常的压缩文件检测", ConsoleColor.Cyan);
+                _logger.Log("已关闭强制解压模式：恢复正常的压缩文件检测", ConsoleColor.Cyan);
             }
         }
 
@@ -309,11 +309,11 @@ namespace AutoUnpackTool.ViewModels
 
             if (_settings.SkipBlacklist)
             {
-                AppendLog("已停用黑名单：匹配的文件将不会被删除", ConsoleColor.Yellow);
+                _logger.Log("已停用黑名单：匹配的文件将不会被删除", ConsoleColor.Yellow);
             }
             else
             {
-                AppendLog($"已启用黑名单：匹配的文件将被永久删除（{GetEnabledBlacklistRuleCount()} 条规则）", ConsoleColor.Cyan);
+                _logger.Log($"已启用黑名单：匹配的文件将被永久删除（{GetEnabledBlacklistRuleCount()} 条规则）", ConsoleColor.Cyan);
             }
         }
 
@@ -356,7 +356,7 @@ namespace AutoUnpackTool.ViewModels
                     else if (Directory.Exists(path))
                     {
                         // 处理文件夹：只扫描该文件夹内部（包括子文件夹），不处理同级目录的其他文件或文件夹
-                        AppendLog($"检测到文件夹: {path}", ConsoleColor.Cyan);
+                        _logger.Log($"检测到文件夹: {path}", ConsoleColor.Cyan);
 
                         // 记录拖入的文件夹，即使没有压缩包也会进行智能路径处理
                         _droppedFolders.Add(path);
@@ -367,16 +367,16 @@ namespace AutoUnpackTool.ViewModels
 
                 if (addedCount > 0)
                 {
-                    AppendLog($"已添加 {addedCount} 个压缩文件到列表", ConsoleColor.Blue);
+                    _logger.Log($"已添加 {addedCount} 个压缩文件到列表", ConsoleColor.Blue);
 
                     // 将新文件添加到待处理队列（避免重复添加）
                     foreach (var fileItem in newFileItems)
                     {
                         _pendingQueue.Enqueue(fileItem);
-                        AppendLog($"  [队列] {fileItem.FileName} 已加入待测试队列", ConsoleColor.Gray);
+                        _logger.Log($"  [队列] {fileItem.FileName} 已加入待测试队列", ConsoleColor.Gray);
                     }
 
-                    AppendLog("自动开始处理流程...", ConsoleColor.Cyan);
+                    _logger.Log("自动开始处理流程...", ConsoleColor.Cyan);
 
                     // 启动双队列处理流程（如果线程未运行）
                     // StartDualQueueProcessing 内部已经包含了唤醒逻辑
@@ -391,12 +391,12 @@ namespace AutoUnpackTool.ViewModels
                 }
                 else
                 {
-                    AppendLog("未检测到压缩文件", ConsoleColor.Yellow);
+                    _logger.Log("未检测到压缩文件", ConsoleColor.Yellow);
 
                     // 即使没有压缩包，如果启用了智能路径处理，也应该对拖入的文件夹进行处理
                     if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
                     {
-                        AppendLog("虽然没有压缩文件，但将对拖入的文件夹进行智能路径处理", ConsoleColor.Cyan);
+                        _logger.Log("虽然没有压缩文件，但将对拖入的文件夹进行智能路径处理", ConsoleColor.Cyan);
                         var folders = _droppedFolders.ToList();
                         _droppedFolders.Clear();
 
@@ -415,7 +415,7 @@ namespace AutoUnpackTool.ViewModels
                                     _dispatcher.Invoke(() =>
                                     {
                                         FinalPathText = finalPath ?? folder;
-                                        AppendLog($"[智能路径] 文件夹最终路径: {FinalPathText}", ConsoleColor.Green);
+                                        _logger.Log($"[智能路径] 文件夹最终路径: {FinalPathText}", ConsoleColor.Green);
                                     });
                                 }
                             }
@@ -441,7 +441,7 @@ namespace AutoUnpackTool.ViewModels
             if (folder != null)
             {
                 OutputDirectory = folder;
-                AppendLog($"输出目录设置为: {folder}", ConsoleColor.Cyan);
+                _logger.Log($"输出目录设置为: {folder}", ConsoleColor.Cyan);
             }
         }
 
@@ -454,7 +454,7 @@ namespace AutoUnpackTool.ViewModels
             if (_isPaused)
             {
                 // 暂停状态 → 继续
-                AppendLog("\n继续处理...", ConsoleColor.Cyan);
+                _logger.Log("\n继续处理...", ConsoleColor.Cyan);
                 _isPaused = false;
                 _pendingQueueSignal.Set();
                 _extractQueueSignal.Set();
@@ -463,7 +463,7 @@ namespace AutoUnpackTool.ViewModels
             else if (_isTesting || _isExtracting)
             {
                 // 运行中 → 暂停
-                AppendLog("\n正在暂停...（等待当前任务完成后停止）", ConsoleColor.Yellow);
+                _logger.Log("\n正在暂停...（等待当前任务完成后停止）", ConsoleColor.Yellow);
                 _isPaused = true;
                 UpdateUiState();
             }
@@ -484,7 +484,7 @@ namespace AutoUnpackTool.ViewModels
                 // 如果处于暂停状态，先清除暂停标志
                 if (_isPaused)
                 {
-                    AppendLog("\n继续处理...", ConsoleColor.Cyan);
+                    _logger.Log("\n继续处理...", ConsoleColor.Cyan);
                     _isPaused = false;
 
                     // 唤醒线程继续处理
@@ -501,13 +501,13 @@ namespace AutoUnpackTool.ViewModels
                 if (!needTestThread && !needExtractThread)
                 {
                     if (_isTesting || _isExtracting)
-                        AppendLog("处理流程已在运行中...", ConsoleColor.Yellow);
+                        _logger.Log("处理流程已在运行中...", ConsoleColor.Yellow);
                     else
-                        AppendLog("队列为空，等待新文件...", ConsoleColor.Gray);
+                        _logger.Log("队列为空，等待新文件...", ConsoleColor.Gray);
                     return;
                 }
 
-                AppendLog("继续处理剩余任务...", ConsoleColor.Cyan);
+                _logger.Log("继续处理剩余任务...", ConsoleColor.Cyan);
 
                 if (needTestThread && needExtractThread)
                 {
@@ -538,16 +538,16 @@ namespace AutoUnpackTool.ViewModels
             }
 
             // 调试日志：输出密码映射表状态
-            AppendLog($"[调试] 密码映射表Count: {_passwordMap.Count}", ConsoleColor.Magenta);
+            _logger.Log($"[调试] 密码映射表Count: {_passwordMap.Count}", ConsoleColor.Magenta);
             foreach (var fileItem in _fileList)
             {
                 if (_passwordMap.TryGetValue(fileItem.FilePath, out var pwd))
                 {
-                    AppendLog($"[调试] {fileItem.FileName} -> 密码: {pwd ?? "(无密码)"}", ConsoleColor.Magenta);
+                    _logger.Log($"[调试] {fileItem.FileName} -> 密码: {pwd ?? "(无密码)"}", ConsoleColor.Magenta);
                 }
                 else
                 {
-                    AppendLog($"[调试] {fileItem.FileName} -> 未找到密码", ConsoleColor.Magenta);
+                    _logger.Log($"[调试] {fileItem.FileName} -> 未找到密码", ConsoleColor.Magenta);
                 }
             }
 
@@ -592,7 +592,7 @@ namespace AutoUnpackTool.ViewModels
             if (_dialogs.ShowPasswords(_settings))
             {
                 // 设置已保存
-                AppendLog("密码本已更新", ConsoleColor.Cyan);
+                _logger.Log("密码本已更新", ConsoleColor.Cyan);
             }
         }
 
@@ -607,8 +607,8 @@ namespace AutoUnpackTool.ViewModels
             {
                 // 设置已保存，更新本地引用
                 _settings = updated;
-                AppendLog("设置已更新", ConsoleColor.Cyan);
-                AppendLog($"7z.exe 路径: {_settings.SevenZipPath}", ConsoleColor.Cyan);
+                _logger.Log("设置已更新", ConsoleColor.Cyan);
+                _logger.Log($"7z.exe 路径: {_settings.SevenZipPath}", ConsoleColor.Cyan);
             }
         }
 
@@ -656,7 +656,7 @@ namespace AutoUnpackTool.ViewModels
             _testCompletionSource = new TaskCompletionSource<bool>();
             _extractCompletionSource = new TaskCompletionSource<bool>();
 
-            AppendLog("已清空内容，程序已重置到初始状态", ConsoleColor.Gray);
+            _logger.Log("已清空内容，程序已重置到初始状态", ConsoleColor.Gray);
 
             // 9. 更新UI状态
             UpdateUiState();
@@ -669,7 +669,7 @@ namespace AutoUnpackTool.ViewModels
         {
             try
             {
-                AppendLog("\n正在关闭程序...", ConsoleColor.Yellow);
+                _logger.Log("\n正在关闭程序...", ConsoleColor.Yellow);
 
                 // 2. 等待一小段时间让线程退出
                 Task.Delay(500).Wait();
@@ -678,12 +678,12 @@ namespace AutoUnpackTool.ViewModels
                 _cleanup.KillSevenZipProcesses();
                 _cleanup.KillNanaZipProcesses();
 
-                AppendLog("程序已关闭", ConsoleColor.Green);
+                _logger.Log("程序已关闭", ConsoleColor.Green);
             }
             catch (Exception ex)
             {
                 // 即使出错也允许关闭
-                AppendLog($"关闭时发生错误: {ex.Message}", ConsoleColor.Red);
+                _logger.Log($"关闭时发生错误: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -729,7 +729,7 @@ namespace AutoUnpackTool.ViewModels
             _settings.MaxExtractDepth = depth;
             _settings.Save();
             MaxExtractDepthText = FormatMaxExtractDepth(depth);
-            AppendLog(depth == 0 ? "最大解压层数设置为: 不限制（递归解压所有嵌套压缩包）" : $"最大解压层数设置为: {depth} 层", ConsoleColor.Cyan);
+            _logger.Log(depth == 0 ? "最大解压层数设置为: 不限制（递归解压所有嵌套压缩包）" : $"最大解压层数设置为: {depth} 层", ConsoleColor.Cyan);
         }
 
         /// <summary>
@@ -896,28 +896,28 @@ namespace AutoUnpackTool.ViewModels
         public void CheckAndTriggerBatchSmartPathProcessing()
         {
             // 添加调试日志
-            AppendLog($"[批量智能路径] 检查触发条件: EnableSmartPathProcessing={_settings.EnableSmartPathProcessing}, OutputMode={_settings.OutputMode}", ConsoleColor.Gray);
+            _logger.Log($"[批量智能路径] 检查触发条件: EnableSmartPathProcessing={_settings.EnableSmartPathProcessing}, OutputMode={_settings.OutputMode}", ConsoleColor.Gray);
 
             if (!_settings.EnableSmartPathProcessing)
             {
-                AppendLog($"[批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Gray);
+                _logger.Log($"[批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Gray);
                 return;
             }
 
             // 检查是否所有顶级文件项都已完成
             var topLevelItems = _fileList.Where(f => f.Parent == null).ToList();
-            AppendLog($"[批量智能路径] 顶级文件项数量: {topLevelItems.Count}", ConsoleColor.Gray);
+            _logger.Log($"[批量智能路径] 顶级文件项数量: {topLevelItems.Count}", ConsoleColor.Gray);
 
             if (topLevelItems.Count == 0)
             {
-                AppendLog($"[批量智能路径] 没有顶级文件项，跳过处理", ConsoleColor.Gray);
+                _logger.Log($"[批量智能路径] 没有顶级文件项，跳过处理", ConsoleColor.Gray);
                 return;
             }
 
             // 打印每个顶级项的状态用于调试
             foreach (var item in topLevelItems)
             {
-                AppendLog($"[批量智能路径] 顶级项: {item.FileName}, 状态: {item.Status}", ConsoleColor.Gray);
+                _logger.Log($"[批量智能路径] 顶级项: {item.FileName}, 状态: {item.Status}", ConsoleColor.Gray);
             }
 
             bool allCompleted = topLevelItems.All(item =>
@@ -932,11 +932,11 @@ namespace AutoUnpackTool.ViewModels
                        item.Status.Contains("取消");
             });
 
-            AppendLog($"[批量智能路径] 所有项是否完成: {allCompleted}", ConsoleColor.Gray);
+            _logger.Log($"[批量智能路径] 所有项是否完成: {allCompleted}", ConsoleColor.Gray);
 
             if (allCompleted)
             {
-                AppendLog($"[批量智能路径] 所有顶级文件项已完成，开始批量处理...", ConsoleColor.Cyan);
+                _logger.Log($"[批量智能路径] 所有顶级文件项已完成，开始批量处理...", ConsoleColor.Cyan);
 
                 // 收集所有解压生成的文件夹（而不是目标目录）
                 var extractedFolders = new HashSet<string>();
@@ -951,18 +951,18 @@ namespace AutoUnpackTool.ViewModels
                     string archiveDir = Path.GetDirectoryName(item.FilePath) ?? string.Empty;
                     if (extractedFolder.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
                     {
-                        AppendLog($"[批量智能路径] 顶级项 {item.FileName} 使用 ArchiveDir 模式，跳过扁平化", ConsoleColor.Gray);
+                        _logger.Log($"[批量智能路径] 顶级项 {item.FileName} 使用 ArchiveDir 模式，跳过扁平化", ConsoleColor.Gray);
                         continue;
                     }
 
                     // SpecificDir 模式（统一输出到指定目录），不进行扁平化处理
                     if (_settings.OutputMode == OutputMode.SpecificDir)
                     {
-                        AppendLog($"[批量智能路径] 顶级项 {item.FileName} 使用 SpecificDir 模式，跳过扁平化", ConsoleColor.Gray);
+                        _logger.Log($"[批量智能路径] 顶级项 {item.FileName} 使用 SpecificDir 模式，跳过扁平化", ConsoleColor.Gray);
                         continue;
                     }
 
-                    AppendLog($"[批量智能路径] 顶级项 {item.FileName} 的解压文件夹: {extractedFolder}", ConsoleColor.Gray);
+                    _logger.Log($"[批量智能路径] 顶级项 {item.FileName} 的解压文件夹: {extractedFolder}", ConsoleColor.Gray);
 
                     if (!string.IsNullOrEmpty(extractedFolder) && Directory.Exists(extractedFolder))
                     {
@@ -970,7 +970,7 @@ namespace AutoUnpackTool.ViewModels
                     }
                 }
 
-                AppendLog($"[批量智能路径] 找到 {extractedFolders.Count} 个解压文件夹待处理", ConsoleColor.Cyan);
+                _logger.Log($"[批量智能路径] 找到 {extractedFolders.Count} 个解压文件夹待处理", ConsoleColor.Cyan);
 
                 // 对每个解压生成的文件夹执行批量扁平化（fire-and-forget）
                 // 【并发修复】持锁串行执行，避免与 FinalizeTopLevelExtractAndSmartPathAsync 的收尾并发移动同一目录树
@@ -1002,7 +1002,7 @@ namespace AutoUnpackTool.ViewModels
                 var topLevelItem = _pipeline.FindFileItemInTreeThreadSafe(topArchivePath);
                 if (topLevelItem == null)
                 {
-                    AppendLog($"[状态更新] 未找到顶级FileItem: {Path.GetFileName(topArchivePath)}", ConsoleColor.Yellow);
+                    _logger.Log($"[状态更新] 未找到顶级FileItem: {Path.GetFileName(topArchivePath)}", ConsoleColor.Yellow);
                     return;
                 }
 
@@ -1013,10 +1013,10 @@ namespace AutoUnpackTool.ViewModels
                 // 获取最终扁平化后的路径
                 // 直接使用 FindFinalFlattenedPath，它内部已处理目录不存在/被扁平化重命名等所有情况
                 string outputDir = _detector.GetOutputDirectory(topArchivePath);
-                AppendLog($"[状态更新] [DEBUG] outputDir(计算值)={outputDir}, 存在={Directory.Exists(outputDir)}", ConsoleColor.Gray);
+                _logger.Log($"[状态更新] [DEBUG] outputDir(计算值)={outputDir}, 存在={Directory.Exists(outputDir)}", ConsoleColor.Gray);
 
                 string? finalPath = _smartPath.FindFinalFlattenedPath(outputDir);
-                AppendLog($"[状态更新] [DEBUG] FindFinalFlattenedPath({outputDir}) = {finalPath}", ConsoleColor.Gray);
+                _logger.Log($"[状态更新] [DEBUG] FindFinalFlattenedPath({outputDir}) = {finalPath}", ConsoleColor.Gray);
 
                 _dispatcher.Invoke(() =>
                 {
@@ -1030,11 +1030,11 @@ namespace AutoUnpackTool.ViewModels
                     }
                 });
 
-                AppendLog($"[{topLevelItem.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green);
+                _logger.Log($"[{topLevelItem.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green);
             }
             catch (Exception ex)
             {
-                AppendLog($"[状态更新] 失败: {ex.Message}", ConsoleColor.Red);
+                _logger.Log($"[状态更新] 失败: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -1055,15 +1055,15 @@ namespace AutoUnpackTool.ViewModels
 
                 if (relatedItems.Count == 0)
                 {
-                    AppendLog($"[批量智能路径] [状态更新] 未找到相关的FileItem", ConsoleColor.Gray);
+                    _logger.Log($"[批量智能路径] [状态更新] 未找到相关的FileItem", ConsoleColor.Gray);
                     return;
                 }
 
-                AppendLog($"[批量智能路径] [状态更新] 找到 {relatedItems.Count} 个相关的FileItem", ConsoleColor.Gray);
+                _logger.Log($"[批量智能路径] [状态更新] 找到 {relatedItems.Count} 个相关的FileItem", ConsoleColor.Gray);
 
                 // 获取最终扁平化后的路径
                 string? finalPath = _smartPath.FindFinalFlattenedPath(rootDir);
-                AppendLog($"[批量智能路径] [状态更新] 最终路径: {finalPath}", ConsoleColor.Gray);
+                _logger.Log($"[批量智能路径] [状态更新] 最终路径: {finalPath}", ConsoleColor.Gray);
 
                 foreach (var item in relatedItems)
                 {
@@ -1088,13 +1088,13 @@ namespace AutoUnpackTool.ViewModels
                             }
                         });
 
-                        AppendLog($"[{item.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green, item);
+                        _logger.Log($"[{item.FileName}] 状态已更新: 解压完成-扁平化处理完成", ConsoleColor.Green, item);
                     }
                 }
             }
             catch (Exception ex)
             {
-                AppendLog($"[批量智能路径] [状态更新] 失败: {ex.Message}", ConsoleColor.Red);
+                _logger.Log($"[批量智能路径] [状态更新] 失败: {ex.Message}", ConsoleColor.Red);
             }
         }
 
@@ -1206,16 +1206,11 @@ namespace AutoUnpackTool.ViewModels
 
         /// <summary>
         /// [DIAG] 文件诊断日志：直接写文件，绕过 UI。
-        /// Dispatcher.Invoke 挂起时 AppendLog 会静默阻塞，诊断轨迹必须落盘才能定位中断点。
+        /// Dispatcher.Invoke 挂起时日志会静默阻塞，诊断轨迹必须落盘才能定位中断点。
         /// </summary>
         private void DiagLog(string message)
         {
             _logger.Diag(message);
-        }
-
-        private void AppendLog(string message, ConsoleColor color, FileItem? targetNode = null)
-        {
-            _logger.Log(message, color, targetNode);
         }
 
         /// <summary>

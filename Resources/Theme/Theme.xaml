@@ -1,0 +1,11 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!--
+        阶段 7 预留：主题资源字典。
+        视图已与 ViewModel 解耦，后续引入 Wpf.Ui 等 Fluent 样式库时，
+        按钮/输入框/DataGrid/菜单的样式集中在此文件内扩展或整体替换，
+        不需要改动任何 ViewModel 与业务代码。
+    -->
+
+</ResourceDictionary>

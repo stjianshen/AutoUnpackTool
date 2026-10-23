@@ -36,7 +36,7 @@ echo    - Single file: No
 echo    - File size: ~5-10 MB (much smaller!)
 echo.
 
-dotnet publish -c Release -r win-x64 --self-contained false -o ./publish
+dotnet publish AutoUnpackTool.csproj -c Release -r win-x64 --self-contained false -o ./publish
 
 if %errorlevel% neq 0 (
     echo.

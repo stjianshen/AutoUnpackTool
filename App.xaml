@@ -4,6 +4,10 @@
              xmlns:services="clr-namespace:AutoUnpackTool.Services">
     <Application.Resources>
         <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- 阶段7 预留：主题资源字典（后续扩展或替换为 Fluent 样式库资源） -->
+                <ResourceDictionary Source="Resources/Theme/Theme.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
             <!-- 日志颜色：ConsoleColor -> 画刷 -->
             <services:ConsoleColorToBrushConverter x:Key="ConsoleColorToBrush"/>
             <!-- bool -> Visibility -->
