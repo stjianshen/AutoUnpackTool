@@ -18,53 +18,73 @@
 
         <!-- 第一行：目录选择和模式选择 -->
         <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,5">
-            <Button x:Name="BtnSelectDirectory" Content="选择目录" Width="100" Height="30" Click="BtnSelectDirectory_Click" Margin="0,0,10,0"/>
-            <TextBox x:Name="TxtOutputDirectory" Width="450" Height="30" IsReadOnly="True" VerticalContentAlignment="Center"/>
-            
+            <Button x:Name="BtnSelectDirectory" Content="选择目录" Width="100" Height="30" Command="{Binding SelectOutputDirectoryCommand}" Margin="0,0,10,0"/>
+            <TextBox x:Name="TxtOutputDirectory" Width="450" Height="30" IsReadOnly="True" VerticalContentAlignment="Center"
+                     Text="{Binding OutputDirectory, Mode=OneWay}"/>
+
             <!-- 解压模式选择 -->
-            <RadioButton x:Name="RdoManualMode" Content="手动解压" GroupName="ExtractMode" VerticalAlignment="Center" Margin="15,0,0,0" IsChecked="True"/>
-            <RadioButton x:Name="RdoAutoMode" Content="自动解压" GroupName="ExtractMode" VerticalAlignment="Center" Margin="10,0,0,0"/>
-            
+            <RadioButton x:Name="RdoManualMode" Content="手动解压" GroupName="ExtractMode" VerticalAlignment="Center" Margin="15,0,0,0"
+                         IsChecked="{Binding IsManualMode, Mode=TwoWay}"/>
+            <RadioButton x:Name="RdoAutoMode" Content="自动解压" GroupName="ExtractMode" VerticalAlignment="Center" Margin="10,0,0,0"
+                         IsChecked="{Binding IsAutoMode, Mode=TwoWay}"/>
+
             <!-- 状态显示（顶部右侧） -->
-            <TextBlock x:Name="TxtStatusMain" Text="状态: 未开始" VerticalAlignment="Center" Margin="15,0,0,0" FontWeight="Bold" Foreground="Gray"/>
+            <TextBlock x:Name="TxtStatusMain" Text="{Binding StatusText}" VerticalAlignment="Center" Margin="15,0,0,0" FontWeight="Bold">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Foreground" Value="Gray"/>
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding StatusColor}" Value="Green">
+                                <Setter Property="Foreground" Value="Green"/>
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding StatusColor}" Value="Orange">
+                                <Setter Property="Foreground" Value="Orange"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
         </StackPanel>
 
         <!-- 第二行：主要操作按钮 -->
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,5">
             <!-- 统一操作按钮（根据状态自动切换功能） -->
-            <Button x:Name="BtnMainAction" Content="开始解压" Width="100" Height="30" Click="BtnMainAction_Click" Margin="0,0,10,0"/>
-            <Button x:Name="BtnClear" Content="清空内容" Width="100" Height="30" Click="BtnClear_Click" Margin="0,0,10,0"/>
-            
+            <Button x:Name="BtnMainAction" Content="{Binding MainActionText}" Width="100" Height="30"
+                    Command="{Binding MainActionCommand}" IsEnabled="{Binding IsMainActionEnabled}" Margin="0,0,10,0"/>
+            <Button x:Name="BtnClear" Content="清空内容" Width="100" Height="30" Command="{Binding ClearAllCommand}" Margin="0,0,10,0"/>
+
             <Separator Width="20" Visibility="Hidden"/>
-            
-            <Button x:Name="BtnPasswordConfig" Content="编辑密码" Width="100" Height="30" Click="BtnPasswordConfig_Click" Margin="0,0,10,0"/>
-            <Button x:Name="BtnSettings" Content="软件设置" Width="100" Height="30" Click="BtnSettings_Click"/>
+
+            <Button x:Name="BtnPasswordConfig" Content="编辑密码" Width="100" Height="30" Command="{Binding OpenPasswordsCommand}" Margin="0,0,10,0"/>
+            <Button x:Name="BtnSettings" Content="软件设置" Width="100" Height="30" Command="{Binding OpenSettingsCommand}"/>
         </StackPanel>
 
         <!-- 第三行：控制选项 -->
         <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
             <TextBlock Text="重复文件:" VerticalAlignment="Center" Margin="0,0,5,0"/>
-            <ComboBox x:Name="CmbDuplicateAction" Width="120" Height="30" SelectedIndex="0">
+            <ComboBox x:Name="CmbDuplicateAction" Width="120" Height="30" SelectedIndex="{Binding DuplicateActionIndex, Mode=TwoWay}">
                 <ComboBoxItem Content="跳过"/>
                 <ComboBoxItem Content="覆盖"/>
                 <ComboBoxItem Content="重命名"/>
             </ComboBox>
 
             <Separator Width="20" Visibility="Hidden"/>
-            
+
             <!-- 强制解压模式复选框 -->
-            <CheckBox x:Name="ChkForceExtractMode" Content="强制解压模式(跳过检测)" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ChkForceExtractMode_Changed" Unchecked="ChkForceExtractMode_Changed"/>
-            
+            <CheckBox x:Name="ChkForceExtractMode" Content="强制解压模式(跳过检测)" VerticalAlignment="Center" Margin="10,0,0,0"
+                      IsChecked="{Binding IsForceExtractMode, Mode=TwoWay}"/>
+
             <!-- 黑名单总开关（规则在“软件设置”中管理） -->
-            <CheckBox x:Name="ChkEnableBlacklist" Content="启用黑名单" VerticalAlignment="Center" Margin="10,0,0,0" Checked="ChkEnableBlacklist_Changed" Unchecked="ChkEnableBlacklist_Changed"/>
-            
+            <CheckBox x:Name="ChkEnableBlacklist" Content="启用黑名单" VerticalAlignment="Center" Margin="10,0,0,0"
+                      IsChecked="{Binding IsBlacklistEnabled, Mode=TwoWay}"/>
+
             <Separator Width="20" Visibility="Hidden"/>
-            
+
             <!-- 最大解压层数设置（下拉列表） -->
             <TextBlock Text="最大解压层数:" VerticalAlignment="Center" Margin="10,0,5,0"/>
             <ComboBox x:Name="CmbMaxExtractDepth" Width="100" Height="30" VerticalContentAlignment="Center"
-                      IsEditable="True" SelectionChanged="CmbMaxExtractDepth_SelectionChanged"
-                      LostFocus="CmbMaxExtractDepth_LostFocus" Text="0">
+                      IsEditable="True" SelectionChanged="MaxDepth_SelectionChanged"
+                      LostFocus="MaxDepth_LostFocus" Text="{Binding MaxExtractDepthText, Mode=OneWay}">
                 <ComboBoxItem Content="不限制"/>
                 <ComboBoxItem Content="1 层"/>
                 <ComboBoxItem Content="2 层"/>
@@ -88,6 +108,7 @@
                           Background="White"
                           ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
+                          ItemsSource="{Binding Roots}"
                           SelectedItemChanged="TreeView_SelectedItemChanged">
                     <TreeView.Resources>
                         <!-- RootNode 模板 -->
@@ -121,19 +142,35 @@
                     <Border Grid.Row="0" Background="#F0F8FF" BorderBrush="#4682B4" BorderThickness="1" Margin="5" Padding="10" CornerRadius="3">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="最终路径:" FontWeight="Bold" Foreground="#4682B4" Margin="0,0,10,0"/>
-                            <TextBox x:Name="TxtFinalPath" Text="无" Foreground="#333333" 
+                            <TextBox x:Name="TxtFinalPath" Text="{Binding FinalPathText, Mode=OneWay}" Foreground="#333333" 
                                      BorderThickness="0" Background="Transparent" IsReadOnly="True"
                                      TextWrapping="Wrap" VerticalAlignment="Center"
                                      Cursor="Arrow"/>
                         </StackPanel>
                     </Border>
                     
-                    <!-- 日志文本框 -->
-                    <TextBox Grid.Row="1" x:Name="TxtLog" IsReadOnly="True" VerticalScrollBarVisibility="Auto"
-                             HorizontalScrollBarVisibility="Auto"
+                    <!-- 日志列表（虚拟化，按节点过滤） -->
+                    <ListBox Grid.Row="1" x:Name="LogList" ItemsSource="{Binding Logs}"
                              Background="White" FontFamily="Consolas" FontSize="12"
-                             TextWrapping="NoWrap"
-                             AcceptsReturn="True"/>
+                             BorderThickness="0"
+                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                             ScrollViewer.VerticalScrollBarVisibility="Auto"
+                             VirtualizingStackPanel.IsVirtualizing="True"
+                             VirtualizingStackPanel.VirtualizationMode="Recycling">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="Padding" Value="0"/>
+                                <Setter Property="HorizontalContentAlignment" Value="Left"/>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock TextWrapping="NoWrap" Foreground="{Binding Color, Converter={StaticResource ConsoleColorToBrush}}">
+                                    <Run Text="["/><Run Text="{Binding Timestamp, Mode=OneWay, StringFormat={}{0:HH:mm:ss}}"/><Run Text="]--&gt; "/><Run Text="{Binding Message, Mode=OneWay}"/>
+                                </TextBlock>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
                 </Grid>
             </GroupBox>
         </Grid>
@@ -141,20 +178,21 @@
         <!-- 底部状态栏 -->
         <StatusBar Grid.Row="4" Margin="0,10,0,0">
             <StatusBarItem>
-                <TextBlock x:Name="TxtStatusTestThread" Text="测试线程: 空闲" Margin="0,0,20,0"/>
+                <TextBlock x:Name="TxtStatusTestThread" Text="{Binding TestThreadText}" Margin="0,0,20,0"/>
             </StatusBarItem>
             <StatusBarItem>
-                <TextBlock x:Name="TxtStatusExtractThread" Text="解压线程: 空闲" Margin="0,0,20,0"/>
+                <TextBlock x:Name="TxtStatusExtractThread" Text="{Binding ExtractThreadText}" Margin="0,0,20,0"/>
             </StatusBarItem>
             <StatusBarItem>
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="解压进度:" Margin="0,0,5,0"/>
-                    <ProgressBar x:Name="ProgressExtract" Width="200" Height="18" Minimum="0" Maximum="100" Value="0" Margin="0,0,10,0"/>
-                    <TextBlock x:Name="TxtExtractProgress" Text="0%" Margin="0,0,20,0" Width="35"/>
+                    <ProgressBar x:Name="ProgressExtract" Width="200" Height="18" Minimum="0" Maximum="100"
+                                 Value="{Binding ExtractProgress, Mode=OneWay}" Margin="0,0,10,0"/>
+                    <TextBlock x:Name="TxtExtractProgress" Text="{Binding ExtractProgress, StringFormat={}{0}%}" Margin="0,0,20,0" Width="35"/>
                 </StackPanel>
             </StatusBarItem>
             <StatusBarItem HorizontalAlignment="Right">
-                <TextBlock x:Name="TxtStatusCurrentPassword" Text="测试中的密码: 无"/>
+                <TextBlock x:Name="TxtStatusCurrentPassword" Text="{Binding CurrentPasswordText}"/>
             </StatusBarItem>
         </StatusBar>
     </Grid>

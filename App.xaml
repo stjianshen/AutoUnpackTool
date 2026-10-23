@@ -1,8 +1,11 @@
 <Application x:Class="AutoUnpackTool.App"
-             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"  
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             StartupUri="MainWindow.xaml">
+             xmlns:services="clr-namespace:AutoUnpackTool.Services">
     <Application.Resources>
-         
+        <ResourceDictionary>
+            <!-- 日志颜色：ConsoleColor -> 画刷 -->
+            <services:ConsoleColorToBrushConverter x:Key="ConsoleColorToBrush"/>
+        </ResourceDictionary>
     </Application.Resources>
 </Application>

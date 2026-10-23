@@ -23,6 +23,10 @@
   <ItemGroup>
     <!-- 代码页编码器支持（用于 GBK 等编码） -->
     <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.5" />
+    <!-- MVVM：可观察属性 + RelayCommand -->
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+    <!-- 依赖注入容器（阶段4 DI 启动） -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
   </ItemGroup>
 
   <ItemGroup>
