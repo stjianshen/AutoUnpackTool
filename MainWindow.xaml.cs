@@ -30,6 +30,8 @@ namespace AutoUnpackTool
         private readonly BlacklistService _blacklistService;
         private readonly ArchiveNameCleaner _archiveNameCleaner;
         private readonly VolumeDetector _volumeDetector;
+        private readonly ArchiveDetector _detector;
+        private readonly StegoService _stego;
         private PasswordMap _passwordMap = new PasswordMap(); // 密码映射表
 
         private bool _suppressBlacklistToggleEvent = true; // 初始化期间不响应开关变化
@@ -84,18 +86,6 @@ namespace AutoUnpackTool
         // 可能同时看到 false 而启动重复线程组，必须原子地检查并设置
         private readonly object _threadStateLock = new();
 
-        private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
-        // 缓存隐写文件检测到的具体压缩类型（如 zip/7z/rar），null 表示非隐写或未检测到类型
-        private readonly ConcurrentDictionary<string, string?> _stegoArchiveTypeCache = new(StringComparer.OrdinalIgnoreCase);
-        // 缓存隐写文件内包含的真实文件列表（白名单），用于过滤 -t# 提取产生的误匹配垃圾文件
-        private readonly ConcurrentDictionary<string, HashSet<string>> _stegoArchiveValidFilesCache = new(StringComparer.OrdinalIgnoreCase);
-        // 缓存 -t# 扫描解析出的子数据段（Name/Type/Offset/Size），用于按字节区间裁剪真实压缩包，
-        // 避免直接 7z x -t# 提取产生 "1"、"2" 这类按序号命名的碎片文件
-        private readonly ConcurrentDictionary<string, List<(string Name, string Type, long Offset, long Size)>> _stegoSubStreamCache = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ".mp4", ".mkv", ".webm", ".mov", ".m4v"
-        };
 
         public MainWindow()
         {
@@ -119,6 +109,11 @@ namespace AutoUnpackTool
             // 防和谐文件名清理 / 分卷识别
             _archiveNameCleaner = new ArchiveNameCleaner(_settings, _logger);
             _volumeDetector = new VolumeDetector();
+
+            // 压缩包/隐写检测（Stego 与 Detector 互相引用，构造后回填）
+            _detector = new ArchiveDetector(_settings, _logger, _volumeDetector);
+            _stego = new StegoService(_settings, _logger, _detector);
+            _detector.Stego = _stego;
             
             // 根据设置初始化单选按钮状态
             if (_settings.ExtractMode == ExtractMode.Auto)
@@ -336,7 +331,7 @@ namespace AutoUnpackTool
             }
 
             // 检测是否为压缩文件
-            if (IsArchiveFile(filePath))
+            if (_detector.IsArchiveFile(filePath))
             {
                 // 如果是分卷压缩包，自动检测所有分卷（仅在同级目录中查找分卷文件）
                 if (_settings.EnableMultiVolumeDetection && _volumeDetector.IsMultiVolumeArchive(filePath))
@@ -421,7 +416,7 @@ namespace AutoUnpackTool
                     }
 
                     // 初步筛选：通过扩展名或分卷格式判断
-                    if (IsArchiveFileByExtension(file) || _volumeDetector.IsMultiVolumeArchive(file))
+                    if (_detector.IsArchiveFileByExtension(file) || _volumeDetector.IsMultiVolumeArchive(file))
                     {
                         potentialArchives.Add(file);
                     }
@@ -812,10 +807,10 @@ namespace AutoUnpackTool
             _topLevelItems.Clear();
             _extractedDirectoryNodes.Clear();  // 清空觧压目录标记
             _flattenedFinalPathMap.Clear();    // 清空扁平化结果映射
-            _stegoProbeCache.Clear();
-            _stegoArchiveTypeCache.Clear();
-            _stegoArchiveValidFilesCache.Clear();
-            _stegoSubStreamCache.Clear();
+            _detector.ClearStegoProbeCache();
+            _stego.ClearStegoArchiveTypeCache();
+            _stego.ClearStegoArchiveValidFilesCache();
+            _stego.ClearStegoSubStreamCache();
             TxtLog.Clear();
             UpdateRootNodeTitle();
             
@@ -1256,7 +1251,7 @@ namespace AutoUnpackTool
             // 步骤1：判断是否是压缩文件
             // 有父节点的文件是解压过程中发现的（非用户直接拖入），isDroppedFile 应为 false
             bool isDroppedFile = fileItem.Parent == null;
-            bool isArchive = IsArchiveFile(fileItem.FilePath, isDroppedFile: isDroppedFile);
+            bool isArchive = _detector.IsArchiveFile(fileItem.FilePath, isDroppedFile: isDroppedFile);
             AppendLog($"[DEBUG-测试] {fileItem.FileName} IsArchiveFile 结果: {isArchive}", ConsoleColor.Magenta, fileItem);
             
             if (!isArchive)
@@ -1273,7 +1268,7 @@ namespace AutoUnpackTool
             }
 
             string? foundPassword = null;
-            bool stegoMode = IsStegoDetectionActiveForFile(fileItem.FilePath);
+            bool stegoMode = _stego.IsStegoDetectionActiveForFile(fileItem.FilePath);
 
             if (stegoMode)
             {
@@ -1957,7 +1952,7 @@ namespace AutoUnpackTool
                 
                 // 【修复】跳过隐写载体文件（如 .mp4, .mkv 等媒体文件）
                 // 这些文件不是传统的压缩包，即使被识别为隐写容器也不应删除
-                if (IsStegoCarrierExtension(item.FilePath))
+                if (_stego.IsStegoCarrierExtension(item.FilePath))
                 {
                     AppendLog($"  跳过清理 [{item.FileName}]：隐写载体文件（非传统压缩包），保留原文件", ConsoleColor.Cyan);
                     continue;
@@ -2131,7 +2126,7 @@ namespace AutoUnpackTool
             {
                 var parentSubDirs = Directory.GetDirectories(archiveParentDir);
                 var parentFiles = Directory.GetFiles(archiveParentDir);
-                var parentNonArchiveFiles = parentFiles.Where(f => !IsArchiveFile(f)).ToArray();
+                var parentNonArchiveFiles = parentFiles.Where(f => !_detector.IsArchiveFile(f)).ToArray();
                 
                 if (parentSubDirs.Length == 1 && parentNonArchiveFiles.Length == 0)
                 {
@@ -2213,7 +2208,7 @@ namespace AutoUnpackTool
         
             try
             {
-                string outputDir = GetOutputDirectory(topArchivePath);
+                string outputDir = _detector.GetOutputDirectory(topArchivePath);
                 if (Directory.Exists(outputDir))
                 {
                     if (!Directory.EnumerateFileSystemEntries(outputDir).Any())
@@ -2274,7 +2269,7 @@ namespace AutoUnpackTool
 
             Dispatcher.Invoke(() => fileItem.Status = "正在解压...");
             
-            string outputDir = GetOutputDirectory(fileItem.FilePath);
+            string outputDir = _detector.GetOutputDirectory(fileItem.FilePath);
             
             // 在解压前记录输出目录中已存在的文件列表（用于过滤隐写文件解压时误添加已存在的压缩包）
             HashSet<string> existingFilesBeforeExtract = new HashSet<string>();
@@ -2295,8 +2290,8 @@ namespace AutoUnpackTool
             }
             
             // 记录觧压目录用于调试
-            bool isStego = IsStegoDetectionActiveForFile(fileItem.FilePath);
-            string? detectedType = isStego ? DetectStegoArchiveType(fileItem.FilePath) : null;
+            bool isStego = _stego.IsStegoDetectionActiveForFile(fileItem.FilePath);
+            string? detectedType = isStego ? _stego.DetectStegoArchiveType(fileItem.FilePath) : null;
             // 类型无法确认时不能再用 7z x -t#：它会把载体自身的字节和误匹配碎片写成 "1"、"2" 这类序号文件，
             // 改为按 -t# 扫描出的 Offset/Size 裁剪出真实压缩包再解压
             bool stegoCarveMode = isStego && (string.IsNullOrEmpty(detectedType) || detectedType == "#");
@@ -2316,7 +2311,7 @@ namespace AutoUnpackTool
                 (bool Success, string Message) result;
                 if (stegoCarveMode)
                 {
-                    result = await Task.Run(() => CarveStegoPayloads(fileItem.FilePath, outputDir, taskId, token), token);
+                    result = await Task.Run(() => _stego.CarveStegoPayloads(fileItem.FilePath, outputDir, taskId, token), token);
                 }
                 else
                 {
@@ -2382,10 +2377,10 @@ namespace AutoUnpackTool
                     {
                         // 真实类型确认时，容器内白名单文件（如封面图）是真实内容，
                         // 不属于 -t# 碎片残留，不应删除
-                        string? stegoType = DetectStegoArchiveType(fileItem.FilePath);
+                        string? stegoType = _stego.DetectStegoArchiveType(fileItem.FilePath);
                         bool stegoTypeTrusted = !string.IsNullOrEmpty(stegoType) && stegoType != "#";
                         HashSet<string>? whitelist = stegoTypeTrusted
-                            ? GetStegoArchiveValidFiles(fileItem.FilePath)
+                            ? _stego.GetStegoArchiveValidFiles(fileItem.FilePath)
                             : null;
 
                         // 仅当真实类型确认且白名单非空时才清理：
@@ -2401,7 +2396,7 @@ namespace AutoUnpackTool
                                     string fName = Path.GetFileName(f);
                                     if (whitelist.Contains(fName))
                                         continue;
-                                    if (!IsArchiveFile(f, false, isDroppedFile: false))
+                                    if (!_detector.IsArchiveFile(f, false, isDroppedFile: false))
                                     {
                                         AppendLog($"[线程 {taskId}] [残留清理] 删除非压缩包残留: {fName}", ConsoleColor.Yellow, fileItem);
                                         try { File.Delete(f); } catch { }
@@ -2589,7 +2584,7 @@ namespace AutoUnpackTool
 
                     // 2. 使用魔术数检测（不依赖扩展名，仅在非扩展名匹配时使用）
                     // 注意：解压后发现的文件不受强制模式影响，始终进行正常检测
-                    if (IsArchiveFile(file, false, isDroppedFile: false))
+                    if (_detector.IsArchiveFile(file, false, isDroppedFile: false))
                     {
                         allArchiveFiles.Add(file);
                     }
@@ -2597,14 +2592,14 @@ namespace AutoUnpackTool
 
                 // 【隐写垃圾过滤】-t# 哈希扫描产生的文件用标准 7z l（不带 -t#）逐文件验证
                 // 真正的压缩包通得过标准检测，-t# 误匹配的垃圾文件通不过
-                if (parentFileItem != null && IsStegoDetectionActiveForFile(parentFileItem.FilePath))
+                if (parentFileItem != null && _stego.IsStegoDetectionActiveForFile(parentFileItem.FilePath))
                 {
                     // 白名单：探测阶段已确认容器内真实文件列表，命中白名单的直接通过，
                     // 避免标准验证对完整文件产生误伤（仅真实类型确认后启用）
-                    string? stegoType = DetectStegoArchiveType(parentFileItem.FilePath);
+                    string? stegoType = _stego.DetectStegoArchiveType(parentFileItem.FilePath);
                     bool stegoTypeTrusted = !string.IsNullOrEmpty(stegoType) && stegoType != "#";
                     HashSet<string>? whitelist = stegoTypeTrusted
-                        ? GetStegoArchiveValidFiles(parentFileItem.FilePath)
+                        ? _stego.GetStegoArchiveValidFiles(parentFileItem.FilePath)
                         : null;
                     // 仅当真实类型确认且白名单非空时，验证失败的文件才允许删除；
                     // 否则无法区分 -t# 误匹配碎片与真实内容，删除会丢失产物
@@ -2622,7 +2617,7 @@ namespace AutoUnpackTool
                             AppendLog($"[线程 {taskId}] [隐写验证]   ✓ 白名单通过: {fName}", ConsoleColor.Green, parentFileItem);
                             continue;
                         }
-                        if (VerifyIsRealArchive(f))
+                        if (_detector.VerifyIsRealArchive(f))
                         {
                             verifiedFiles.Add(f);
                             AppendLog($"[线程 {taskId}] [隐写验证]   ✓ 通过: {fName}", ConsoleColor.Green, parentFileItem);
@@ -3048,7 +3043,7 @@ namespace AutoUnpackTool
                 {
                     // 对于隐写文件等使用 ArchiveDir 模式解压的文件，不进行扁平化处理
                     // 因为输出目录就是压缩包所在目录，会误处理其他无关文件夹
-                    string extractedFolder = GetOutputDirectory(item.FilePath);
+                    string extractedFolder = _detector.GetOutputDirectory(item.FilePath);
                     
                     // 检查是否为 ArchiveDir 模式（输出目录等于压缩包所在目录）
                     string archiveDir = Path.GetDirectoryName(item.FilePath) ?? string.Empty;
@@ -3128,7 +3123,7 @@ namespace AutoUnpackTool
                 {
                     // 在 ArchiveFolder 模式下，输出目录是压缩包同名文件夹
                     // 例如: ba366.7z.001 -> D:\tem\ba366
-                    string extractedFolder = GetOutputDirectory(item.FilePath);
+                    string extractedFolder = _detector.GetOutputDirectory(item.FilePath);
                     
                     // 对于 ArchiveDir 模式（解压到当前目录），不进行扁平化处理
                     // 因为输出目录就是压缩包所在目录，会误处理其他无关文件夹
@@ -3196,7 +3191,7 @@ namespace AutoUnpackTool
                         continue;
                     
                     // 检查是否是压缩文件
-                    if (IsArchiveFile(file, false) && !_volumeDetector.IsMultiVolumeArchive(file))
+                    if (_detector.IsArchiveFile(file, false) && !_volumeDetector.IsMultiVolumeArchive(file))
                     {
                         try
                         {
@@ -3237,18 +3232,18 @@ namespace AutoUnpackTool
 
             // 【并发修复】只处理当前顶级文件的输出目录树，避免同一父目录下多个顶级文件并发收尾时
             // 互相处理对方的目录（会导致移动冲突、GUID 新目录、图片分散）。
-            // 用 GetOutputDirectory(topArchivePath) 作为树根：
+            // 用 _detector.GetOutputDirectory(topArchivePath) 作为树根：
             // - ArchiveFolder 模式：根 = 当前文件的同名输出文件夹，只包含本文件的解压节点
             // - ArchiveDir 模式：根 = 父目录（与旧逻辑一致，行下方有专门的跳过扁平化保护）
             // - SpecificDir 模式：根 = 统一输出目录（行下方有跳过保护）
             string archiveDir = Path.GetDirectoryName(topArchivePath) ?? string.Empty;
-            string ownOutputDir = GetOutputDirectory(topArchivePath);
+            string ownOutputDir = _detector.GetOutputDirectory(topArchivePath);
 
             // 【并发修复】排除正在解压/测试密码的文件对应的输出目录：收尾与解压线程之间没有锁，
             // ArchiveDir 模式下其他文件的中间层目录可能在快照范围内，移动正在被解压写入的目录会失败。
             var busyDirs = SnapshotAllItems()
                 .Where(f => f.Status.Contains("正在解压") || f.Status.Contains("正在测试密码"))
-                .Select(f => GetOutputDirectory(f.FilePath))
+                .Select(f => _detector.GetOutputDirectory(f.FilePath))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             
             var allExtractedDirs = _extractedDirectoryNodes.Keys
@@ -3361,7 +3356,7 @@ namespace AutoUnpackTool
 
                 // 获取最终扁平化后的路径
                 // 直接使用 FindFinalFlattenedPath，它内部已处理目录不存在/被扁平化重命名等所有情况
-                string outputDir = GetOutputDirectory(topArchivePath);
+                string outputDir = _detector.GetOutputDirectory(topArchivePath);
                 AppendLog($"[状态更新] [DEBUG] outputDir(计算值)={outputDir}, 存在={Directory.Exists(outputDir)}", ConsoleColor.Gray);
                 
                 string? finalPath = FindFinalFlattenedPath(outputDir);
@@ -3438,7 +3433,7 @@ namespace AutoUnpackTool
                 // 找到所有输出目录在 rootDir 下的 FileItem
                 var relatedItems = SnapshotTopLevelItems().Where(item => 
                 {
-                    string outputPath = GetOutputDirectory(item.FilePath);
+                    string outputPath = _detector.GetOutputDirectory(item.FilePath);
                     return outputPath.Equals(rootDir, StringComparison.OrdinalIgnoreCase) ||
                            outputPath.StartsWith(rootDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
                 }).ToList();
@@ -3748,7 +3743,7 @@ namespace AutoUnpackTool
                 var files = Directory.GetFiles(dirPath);
                 foreach (var file in files)
                 {
-                    if (IsArchiveFile(file, false))
+                    if (_detector.IsArchiveFile(file, false))
                     {
                         return true;
                     }
@@ -3784,14 +3779,14 @@ namespace AutoUnpackTool
                 var subDirs = Directory.GetDirectories(dirPath);
                 var allFiles = Directory.GetFiles(dirPath);
                 // 忽略压缩包文件（含分卷），这些残留文件将在后续 HandleOriginalFile 中统一清理
-                var nonArchiveFiles = allFiles.Where(f => !IsArchiveFile(f)).ToArray();
+                var nonArchiveFiles = allFiles.Where(f => !_detector.IsArchiveFile(f)).ToArray();
 
                 AppendLog($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {allFiles.Length} 个文件 (非压缩包: {nonArchiveFiles.Length})", ConsoleColor.Gray);
                 
                 // 【新增】详细列出所有文件及其类型，用于调试
                 foreach (var file in allFiles)
                 {
-                    bool isArchive = IsArchiveFile(file);
+                    bool isArchive = _detector.IsArchiveFile(file);
                     string fileName = Path.GetFileName(file);
                     AppendLog($"[批量智能路径] [DEBUG-文件列表] {fileName}: {(isArchive ? "压缩包" : "非压缩包")}", ConsoleColor.Gray);
                 }
@@ -3981,8 +3976,8 @@ namespace AutoUnpackTool
                 // 检查最外层目录是否只有一个子目录
                 var subDirs = Directory.GetDirectories(rootDir);
                 var allFiles = Directory.GetFiles(rootDir);
-                var archiveFiles = allFiles.Where(f => IsArchiveFile(f)).ToArray();
-                var nonArchiveFiles = allFiles.Where(f => !IsArchiveFile(f)).ToArray();
+                var archiveFiles = allFiles.Where(f => _detector.IsArchiveFile(f)).ToArray();
+                var nonArchiveFiles = allFiles.Where(f => !_detector.IsArchiveFile(f)).ToArray();
 
                 AppendLog($"[批量智能路径] [最外层检查] {Path.GetFileName(rootDir)}: {subDirs.Length} 个子目录, {archiveFiles.Length} 个压缩包, {nonArchiveFiles.Length} 个非压缩包文件", ConsoleColor.Gray);
 
@@ -4131,47 +4126,12 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 去掉目录名末尾的压缩包后缀（支持复合后缀，如 .tar.zst）
-        /// </summary>
-        private string NormalizeArchiveLikeName(string name)
-        {
-            if (string.IsNullOrWhiteSpace(name))
-                return name;
-
-            string result = name;
-            var archiveExtensions = _settings.GetArchiveExtensions()
-                .OrderByDescending(x => x.Length)
-                .ToList();
-
-            bool changed;
-            do
-            {
-                changed = false;
-                foreach (var ext in archiveExtensions)
-                {
-                    if (result.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
-                    {
-                        string trimmed = result.Substring(0, result.Length - ext.Length);
-                        if (!string.IsNullOrWhiteSpace(trimmed))
-                        {
-                            result = trimmed;
-                            changed = true;
-                            break;
-                        }
-                    }
-                }
-            } while (changed);
-
-            return result;
-        }
-
-        /// <summary>
         /// 根据配置模式决定最终的文件夹名称
         /// </summary>
         private string DetermineFolderName(string parentName, string childName)
         {
-            string normalizedParentName = NormalizeArchiveLikeName(parentName);
-            string normalizedChildName = NormalizeArchiveLikeName(childName);
+            string normalizedParentName = _detector.NormalizeArchiveLikeName(parentName);
+            string normalizedChildName = _detector.NormalizeArchiveLikeName(childName);
 
             if (_settings.SmartPathProcessingMode == SmartPathMode.Concatenate)
             {
@@ -4262,7 +4222,7 @@ namespace AutoUnpackTool
                 {
                     try
                     {
-                        if (IsArchiveFile(file))
+                        if (_detector.IsArchiveFile(file))
                         {
                             File.Delete(file);
                             AppendLog($"[批量智能路径]   删除残留压缩包: {Path.GetFileName(file)}", ConsoleColor.Gray);
@@ -4625,965 +4585,6 @@ namespace AutoUnpackTool
 
 
 
-        /// 流程：
-        /// 1. 先检查扩展名是否在排除列表中，如果是则直接返回 false
-        /// 2. 再检查扩展名是否在包含列表中，如果是则用魔术数验证
-        /// 3. 如果扩展名不在包含列表中，直接用魔术数检测
-        /// </summary>
-        private bool IsStegoCarrierExtension(string filePath)
-        {
-            string ext = Path.GetExtension(filePath).ToLowerInvariant();
-            return StegoCarrierExtensions.Contains(ext);
-        }
-
-        private bool IsStegoDetectionActiveForFile(string filePath)
-        {
-            if (!_settings.EnableStegoDetection)
-                return false;
-
-            if (!IsStegoCarrierExtension(filePath))
-                return false;
-
-            long minSizeBytes = (long)Math.Max(1, _settings.StegoDetectionMinFileSizeMB) * 1024L * 1024L;
-            long fileSizeBytes = new FileInfo(filePath).Length;
-            if (fileSizeBytes < minSizeBytes)
-            {
-                AppendLog(
-                    $"  [隐写探测] {Path.GetFileName(filePath)}: 文件过小 ({fileSizeBytes / 1024 / 1024}MB)，低于下限 {_settings.StegoDetectionMinFileSizeMB}MB，跳过探测",
-                    ConsoleColor.Gray);
-                return false;
-            }
-
-            return IsStegoFileBy7ZipProbe(filePath);
-        }
-
-        /// <summary>
-        /// 从 7z l -t# -slt 输出中检测隐藏压缩包的具体类型（如 zip/7z/rar/tar）
-        /// 同时解析出存档内包含的真实文件列表（白名单），用于过滤 -t# 提取的误匹配垃圾
-        /// 并缓存子数据段（Offset/Size），供类型无法确认时按区间裁剪真实压缩包
-        /// 返回 null 表示非隐写文件或无法确定类型
-        /// 结果会被缓存，同一文件只探测一次
-        /// </summary>
-        private string? DetectStegoArchiveType(string filePath)
-        {
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                return null;
-
-            if (_stegoArchiveTypeCache.TryGetValue(filePath, out string? cachedType))
-            {
-                return cachedType;
-            }
-
-            string? detectedType = null;
-            HashSet<string> validFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            try
-            {
-                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
-                    return null;
-
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = _settings.SevenZipPath,
-                    Arguments = $"l -t# -slt -sccUTF-8 \"{filePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8
-                };
-
-                using var process = new Process { StartInfo = startInfo };
-                process.Start();
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-                bool probeExited = process.WaitForExit(15000);
-
-                if (!probeExited)
-                {
-                    try { process.Kill(); } catch { }
-                    AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 探测超时，跳过", ConsoleColor.Gray);
-                }
-                else if (process.ExitCode == 0)
-                {
-                    string combined = output + Environment.NewLine + error;
-                    string lower = combined.ToLowerInvariant();
-
-                    // 缓存子数据段（Offset/Size）：类型无法确认时按区间裁剪真实压缩包，
-                    // 不再用 7z x -t# 提取出 "1"、"2" 这类序号命名的碎片
-                    var parsedSubStreams = ParseStegoSubStreamsFromSlt(combined);
-                    _stegoSubStreamCache[filePath] = parsedSubStreams;
-
-                    // 解析 "Type = xxx" 行获取具体压缩格式
-                    // -t# 输出的顶层 Type 恒为 "#"，解析不到真实格式时会返回 null
-                    detectedType = ParseArchiveTypeFromOutput(combined);
-                    
-                    // -t# 拿不到真实格式时，用标准 7z l（不带 -t#）再探测一次：
-                    // 对 7z 包伪装成视频、zip 追加在视频尾部等场景，标准探测能拿到真实类型，
-                    // 提取时才不会用 -t# 把嵌套压缩包拆成碎片
-                    if (detectedType == null)
-                    {
-                        var stdProbe = ProbeArchiveByStandardList(filePath);
-                        detectedType = stdProbe.Type;
-                        validFiles = stdProbe.ValidFiles;
-                        AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 标准探测{(detectedType != null ? $"解析到类型 {detectedType}" : "失败")}", ConsoleColor.Gray);
-                    }
-                    else
-                    {
-                        // 从 -t# 输出解析真实文件列表（白名单）
-                        validFiles = ParseStegoFileListFromSltOutput(combined, filePath);
-                    }
-                    
-                    // 标准探测也失败时，使用 # 作为回退（提取时会用 -t# 哈希扫描）
-                    if (detectedType == null)
-                    {
-                        bool isArchive = lower.Contains(".zip") ||
-                                         lower.Contains(".7z") ||
-                                         lower.Contains(".rar") ||
-                                         lower.Contains(".tar") ||
-                                         lower.Contains("listing archive");
-                        if (isArchive)
-                        {
-                            detectedType = "#";
-                            validFiles = ParseStegoFileListFromSltOutput(combined, filePath);
-                        }
-                    }
-                    
-                    if (detectedType != null)
-                    {
-                        AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 解析到 {validFiles.Count} 个白名单文件", ConsoleColor.Gray);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: {ex.Message}", ConsoleColor.Gray);
-            }
-
-            _stegoArchiveTypeCache[filePath] = detectedType;
-            _stegoArchiveValidFilesCache[filePath] = validFiles;
-            return detectedType;
-        }
-
-        /// <summary>
-        /// 用标准 7z l -slt（不带 -t#）探测真实压缩格式及真实文件列表。
-        /// -t# 哈希扫描的顶层 Type 恒为 "#"，且会把固实压缩流中的字节签名
-        /// 误识别为嵌套压缩包碎片（把完整 zip 拆碎）；
-        /// 标准探测从文件头/尾部解析，对 7z 包伪装成视频、zip 追加在视频尾部
-        /// 等场景能返回真实类型和真实文件列表。
-        /// </summary>
-        private (string? Type, HashSet<string> ValidFiles) ProbeArchiveByStandardList(string filePath)
-        {
-            var empty = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            try
-            {
-                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
-                    return (null, empty);
-
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = _settings.SevenZipPath,
-                    Arguments = $"l -slt -sccUTF-8 \"{filePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8
-                };
-
-                using var process = new Process { StartInfo = startInfo };
-                process.Start();
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-
-                if (!process.WaitForExit(15000))
-                {
-                    try { process.Kill(); } catch { }
-                    return (null, empty);
-                }
-
-                if (process.ExitCode != 0)
-                    return (null, empty);
-
-                string combined = output + Environment.NewLine + error;
-                string? type = ParseArchiveTypeFromOutput(combined);
-                if (type == null)
-                    return (null, empty);
-
-                return (type, ParseStegoFileListFromSltOutput(combined, filePath));
-            }
-            catch
-            {
-                return (null, empty);
-            }
-        }
-
-        /// <summary>
-        /// 从 7z l -t# -slt 输出中解析真实包含的文件名列表（白名单）
-        /// -slt 格式每行是 "Key = Value"，文件的 Path= 行即文件名
-        /// 跳过第一个 Path=（存档自身路径），后续的 Path= 均为存档内文件
-        /// </summary>
-        private static HashSet<string> ParseStegoFileListFromSltOutput(string combined, string archivePath)
-        {
-            var fileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            bool firstPathFound = false;
-            string archiveFileName = Path.GetFileName(archivePath);
-            
-            foreach (var line in combined.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string trimmed = line.Trim();
-                if (!trimmed.StartsWith("Path = ", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                
-                string pathValue = trimmed.Substring("Path = ".Length).Trim();
-                
-                // 跳过第一个 Path（存档自身路径）
-                if (!firstPathFound)
-                {
-                    firstPathFound = true;
-                    continue;
-                }
-                
-                // 取纯文件名
-                string fileName = Path.GetFileName(pathValue);
-                if (!string.IsNullOrEmpty(fileName))
-                {
-                    fileNames.Add(fileName);
-                }
-            }
-            
-            return fileNames;
-        }
-
-        /// <summary>
-        /// 获取隐写文件内包含的真实文件白名单（已缓存）
-        /// </summary>
-        private HashSet<string>? GetStegoArchiveValidFiles(string filePath)
-        {
-            if (_stegoArchiveValidFilesCache.TryGetValue(filePath, out var files))
-                return files;
-            return null;
-        }
-
-        /// <summary>
-        /// 隐写容器真实类型无法确认时的提取方式：按 -t# 扫描出的 Offset/Size 把
-        /// 数据段中真正的压缩包按字节区间裁剪成独立文件，再交给子压缩包流程解压。
-        /// 7z x -t# 会把载体自身的字节和误匹配碎片也写出来，命名成 "1"、"2" 这类序号文件；
-        /// 区间裁剪只产出确认过的压缩包，不会产生这些碎片。
-        /// </summary>
-        private (bool Success, string Message) CarveStegoPayloads(string carrierPath, string outputDir, int taskId, CancellationToken token)
-        {
-            if (File.Exists(outputDir))
-                return (false, $"输出路径已存在同名文件: {outputDir}，请更换输出模式");
-
-            if (!_stegoSubStreamCache.TryGetValue(carrierPath, out var streams) || streams == null || streams.Count == 0)
-                return (false, "未获取到 -t# 扫描的数据段信息，无法裁剪");
-
-            // 同一区间可能被重复列出，按 Offset 去重（保留最大 Size）
-            var candidates = streams
-                .GroupBy(s => s.Offset)
-                .Select(g => g.OrderByDescending(s => s.Size).First())
-                .ToList();
-
-            AppendLog($"[线程 {taskId}] [隐写裁剪] {Path.GetFileName(carrierPath)}: 定位到 {candidates.Count} 个候选压缩数据段", ConsoleColor.Cyan);
-
-            string baseName = FileSystemHelper.SanitizePathSegment(GetArchiveFolderName(carrierPath));
-            if (string.IsNullOrWhiteSpace(baseName))
-                baseName = "payload";
-
-            string stagingDir = Path.Combine(Path.GetTempPath(), "AutoUnpackTool_stego", Guid.NewGuid().ToString("N"));
-            var carved = new List<(string TempPath, string Ext, bool Verified)>();
-
-            try
-            {
-                Directory.CreateDirectory(stagingDir);
-
-                using (var source = new FileStream(carrierPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                {
-                    int index = 0;
-                    foreach (var candidate in candidates)
-                    {
-                        token.ThrowIfCancellationRequested();
-                        index++;
-
-                        string ext = FileSystemHelper.ArchiveTypeToExtension(candidate.Type);
-                        string tempPath = Path.Combine(stagingDir, $"carve{index}.{ext}");
-                        if (!TryCopyByteRange(source, candidate.Offset, candidate.Size, tempPath, token))
-                        {
-                            AppendLog($"[线程 {taskId}] [隐写裁剪]   数据段 #{index} 区间读取失败，跳过 (Offset={candidate.Offset}, Size={candidate.Size})", ConsoleColor.Yellow);
-                            continue;
-                        }
-
-                        bool verified = VerifyIsRealArchive(tempPath);
-                        carved.Add((tempPath, ext, verified));
-                        AppendLog($"[线程 {taskId}] [隐写裁剪]   数据段 #{index}: Type={candidate.Type} Offset={candidate.Offset} Size={candidate.Size} 标准验证={(verified ? "通过" : "未通过")}",
-                            verified ? ConsoleColor.Green : ConsoleColor.Yellow);
-                    }
-                }
-
-                if (carved.Count == 0)
-                    return (false, "隐写容器内未能裁出压缩数据段");
-
-                // 有通过标准验证的段时，其余未通过的都是 -t# 误匹配的固实流碎片，不写入输出目录；
-                // 全部未通过时退回魔术数判断（如表头加密的压缩包），避免丢失真实内容
-                bool anyVerified = carved.Any(c => c.Verified);
-                var publish = anyVerified
-                    ? carved.Where(c => c.Verified).ToList()
-                    : carved.Where(c => IsArchiveFileByMagicNumber(c.TempPath, "." + c.Ext)).ToList();
-
-                if (publish.Count == 0)
-                    return (false, "隐写容器内的数据段均无法确认为压缩包，原文件已保留");
-
-                Directory.CreateDirectory(outputDir);
-
-                int published = 0;
-                for (int i = 0; i < publish.Count; i++)
-                {
-                    token.ThrowIfCancellationRequested();
-                    string fileName = publish.Count == 1
-                        ? $"{baseName}.{publish[i].Ext}"
-                        : $"{baseName}_{i + 1}.{publish[i].Ext}";
-                    string destPath = FileSystemHelper.GetUniqueFilePath(outputDir, fileName);
-                    File.Move(publish[i].TempPath, destPath);
-                    published++;
-                    AppendLog($"[线程 {taskId}] [隐写裁剪]   已裁出: {Path.GetFileName(destPath)}", ConsoleColor.Cyan);
-                }
-
-                int skipped = carved.Count - published;
-                if (skipped > 0)
-                    AppendLog($"[线程 {taskId}] [隐写裁剪]   已丢弃 {skipped} 个无法验证的数据段（-t# 误匹配碎片）", ConsoleColor.Gray);
-
-                return (true, $"已裁出 {published} 个压缩数据段");
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                return (false, $"隐写裁剪失败: {ex.Message}");
-            }
-            finally
-            {
-                try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, true); } catch { }
-            }
-        }
-
-        /// <summary>
-        /// 按字节区间从载体文件中复制出压缩数据段
-        /// </summary>
-        private static bool TryCopyByteRange(FileStream source, long offset, long size, string destPath, CancellationToken token)
-        {
-            try
-            {
-                if (offset < 0 || size <= 0 || offset + size > source.Length)
-                    return false;
-
-                const int bufferSize = 1024 * 1024;
-                byte[] buffer = new byte[bufferSize];
-
-                source.Position = offset;
-                long remaining = size;
-                using var dest = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                while (remaining > 0)
-                {
-                    token.ThrowIfCancellationRequested();
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int read = source.Read(buffer, 0, toRead);
-                    if (read <= 0)
-                        return false;
-                    dest.Write(buffer, 0, read);
-                    remaining -= read;
-                }
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// 从 7z l -t# -slt 输出中解析子数据段（Path/Type/Offset/Size）
-        /// -t# 把载体切成若干数据段：识别为压缩包的段名形如 "2.zip"，
-        /// 识别不出的段只有序号名（如 "1"）且 Type 为空，不应参与裁剪
-        /// </summary>
-        private static List<(string Name, string Type, long Offset, long Size)> ParseStegoSubStreamsFromSlt(string combined)
-        {
-            var result = new List<(string Name, string Type, long Offset, long Size)>();
-            string? path = null;
-            string type = string.Empty;
-            long offset = -1;
-            long size = -1;
-
-            void Flush()
-            {
-                // 只保留带区间信息且类型可识别的数据段（顶层容器条目没有 Offset）
-                if (!string.IsNullOrEmpty(path) && offset >= 0 && size > 0 && IsKnownArchiveType(type))
-                    result.Add((path!, type, offset, size));
-
-                path = null;
-                type = string.Empty;
-                offset = -1;
-                size = -1;
-            }
-
-            // 注意：不能按字符 { '\r', '\n' } 切分。Windows 换行 "\r\n" 会被切成两个分隔符，
-            // 每两行之间多出一个空元素，而空行是条目边界（Flush），会导致
-            // Path/Type/Offset/Size 永远凑不齐、解析结果恒为空
-            foreach (var line in combined.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None))
-            {
-                string trimmed = line.Trim();
-
-                // 空行 / 分隔线是 -slt 的条目边界
-                if (trimmed.Length == 0 || trimmed.StartsWith("--", StringComparison.Ordinal))
-                {
-                    Flush();
-                    continue;
-                }
-
-                if (trimmed.StartsWith("Path = ", StringComparison.OrdinalIgnoreCase))
-                    path = trimmed.Substring("Path = ".Length).Trim();
-                else if (trimmed.StartsWith("Type =", StringComparison.OrdinalIgnoreCase))
-                    type = trimmed.Substring("Type =".Length).Trim();
-                else if (trimmed.StartsWith("Offset = ", StringComparison.OrdinalIgnoreCase))
-                    long.TryParse(trimmed.Substring("Offset = ".Length).Trim(), out offset);
-                else if (trimmed.StartsWith("Size = ", StringComparison.OrdinalIgnoreCase))
-                    long.TryParse(trimmed.Substring("Size = ".Length).Trim(), out size);
-            }
-            Flush();
-
-            return result;
-        }
-
-        /// <summary>
-        /// 用标准 7z l（不带 -t#）验证文件是否为真正的压缩包
-        /// -t# 哈希扫描可能将媒体文件的二进制数据误识别为压缩包签名，
-        /// 产生假阳性垃圾文件。标准 7z l 从文件头开始解析，不会误匹配。
-        /// 返回 true 表示该文件是可通过标准方式列出内容的真正压缩包。
-        /// </summary>
-        private bool VerifyIsRealArchive(string filePath)
-        {
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                return false;
-
-            try
-            {
-                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
-                    return false;
-
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = _settings.SevenZipPath,
-                    Arguments = $"l -sccUTF-8 \"{filePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8
-                };
-
-                using var process = new Process { StartInfo = startInfo };
-                process.Start();
-                process.StandardOutput.ReadToEnd();
-                process.StandardError.ReadToEnd();
-
-                if (!process.WaitForExit(15000))
-                {
-                    try { process.Kill(); } catch { }
-                    return false;
-                }
-
-                // 退出码 0 表示成功列出内容 → 真正的压缩包
-                return process.ExitCode == 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// 从 7z l -slt 输出中解析第一条 "Type = xxx" 行，提取压缩格式
-        /// 逐行解析，只取顶层容器的类型（-slt 输出中顶层 Type 行在最前）
-        /// </summary>
-        private static string? ParseArchiveTypeFromOutput(string output)
-        {
-            if (string.IsNullOrWhiteSpace(output))
-                return null;
-
-            // 注意：不能用跨行正则匹配。 -t# 输出中条目存在空 "Type = " 行，
-            // 正则的 \s* 会吞掉换行符，把下一行的键名（如 Comment）误当作类型值，
-            // 导致解析出的类型无效（如 "comment"）而回退到 -t# 提取。
-            foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string trimmed = line.Trim();
-                if (!trimmed.StartsWith("Type = ", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                string type = trimmed.Substring("Type = ".Length).Trim().ToLowerInvariant();
-
-                // -t# 哈希扫描模式的占位类型，不是真实格式，交由调用方回退处理
-                if (type == "#")
-                    return null;
-
-                // 只返回已知支持的格式
-                if (IsKnownArchiveType(type))
-                {
-                    return type;
-                }
-
-                // 顶层类型不是已知格式，后面的条目 Type 行不作数
-                return null;
-            }
-            return null;
-        }
-
-        /// <summary>
-        /// 判断是否为 7z 可识别的压缩格式类型
-        /// </summary>
-        private static bool IsKnownArchiveType(string type)
-        {
-            switch (type.ToLowerInvariant())
-            {
-                case "zip":
-                case "7z":
-                case "rar":
-                case "tar":
-                case "gzip":
-                case "gz":
-                case "bzip2":
-                case "bz2":
-                case "xz":
-                case "lzma":
-                case "cab":
-                case "arj":
-                case "z":
-                case "lzh":
-                case "iso":
-                case "wim":
-                    return true;
-                default:
-                    return false;
-            }
-        }
-
-        private bool IsStegoFileBy7ZipProbe(string filePath)
-        {
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                return false;
-
-            if (_stegoProbeCache.TryGetValue(filePath, out bool cached))
-                return cached;
-
-            string? detectedType = DetectStegoArchiveType(filePath);
-            bool detected = detectedType != null;
-            _stegoProbeCache[filePath] = detected;
-            return detected;
-        }
-
-        /// <param name="filePath">文件路径</param>
-        /// <param name="logVerification">是否输出魔术数验证日志，默认 false</param>
-        /// <returns>是否为压缩文件</returns>
-        private bool IsArchiveFile(string filePath, bool logVerification = false, bool isDroppedFile = true)
-        {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return false;
-
-            if (!File.Exists(filePath))
-                return false;
-
-            // 如果启用了强制压模式，跳过所有检测，直接返回 true
-            // 但只对最初拖入的文件生效，解压后发现的新文件仍进行正常检测
-            if (_settings.ForceExtractMode && isDroppedFile)
-            {
-                if (logVerification)
-                    AppendLog($"  [强制模式] {Path.GetFileName(filePath)}: 跳过检测，直接视为压缩文件", ConsoleColor.Yellow);
-                return true;
-            }
-
-            string extension = Path.GetExtension(filePath).ToLowerInvariant();
-            
-            // 步骤1：获取排除的扩展名列表
-            var excludedExtensions = _settings.GetExcludedExtensions();
-            
-            // 如果在排除列表中，直接返回 false，结束解压流程
-            if (excludedExtensions.Contains(extension))
-            {
-                // 【修复】只对最初拖入的文件进行隐写探测
-                // 解压过程中递归发现的新文件（如.mp4等媒体文件）是最终产物，不应作为隐写容器处理
-                if (isDroppedFile && IsStegoDetectionActiveForFile(filePath))
-                {
-                    if (logVerification)
-                        AppendLog($"  [确认] {Path.GetFileName(filePath)}: 命中隐写探测，按隐写容器处理", ConsoleColor.Green);
-                    return true;
-                }
-
-                return false;
-            }
-
-            // 步骤2：获取需要检测的压缩文件扩展名列表
-            var archiveExtensions = _settings.GetArchiveExtensions();
-            
-            // 如果扩展名在包含列表中，用魔术数验证是否真的是压缩文件
-            bool extensionMatched = false;
-            string fileName = Path.GetFileName(filePath).ToLowerInvariant();
-            foreach (var ext in archiveExtensions)
-            {
-                if (fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase) || extension == ext)
-                {
-                    extensionMatched = true;
-                    break;
-                }
-            }
-            
-            // 检查分卷压缩包格式
-            if (!extensionMatched && _volumeDetector.IsMultiVolumeArchive(filePath))
-            {
-                extensionMatched = true;
-            }
-            
-            if (extensionMatched)
-            {
-                // 扩展名匹配，用魔术数验证
-                if (IsArchiveFileByMagicNumber(filePath, extension))
-                {
-                    if (logVerification)
-                        AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数验证通过，是压缩文件", ConsoleColor.Green);
-                    return true;
-                }
-                else
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                // 扩展名不匹配，直接用魔术数检测
-                if (IsArchiveFileByMagicNumber(filePath, extension))
-                {
-                    if (logVerification)
-                        AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数检测通过，是压缩文件", ConsoleColor.Green);
-                    return true;
-                }
-                else
-                {
-                    if (IsStegoDetectionActiveForFile(filePath))
-                    {
-                        if (logVerification)
-                            AppendLog($"  [确认] {Path.GetFileName(filePath)}: 魔术数失败但隐写探测命中", ConsoleColor.Green);
-                        return true;
-                    }
-
-                    return false;
-                }
-            }
-        }
-
-        /// <summary>
-        /// 基于扩展名判断压缩文件
-        /// </summary>
-        private bool IsArchiveFileByExtension(string filePath, bool isDroppedFile = true)
-        {
-            // 如果启用了强制觧压模式，跳过所有检测，直接返回 true
-            // 但只对最初拖入的文件生效
-            if (_settings.ForceExtractMode && isDroppedFile)
-            {
-                return true;
-            }
-        
-            string extension = Path.GetExtension(filePath).ToLowerInvariant();
-            
-            // 获取排除的扩展名列表
-            var excludedExtensions = _settings.GetExcludedExtensions();
-            
-            // 先检查是否在排除列表中（优先级最高）
-            if (excludedExtensions.Contains(extension))
-            {
-                return false;
-            }
-            
-            // 获取需要检测的压缩文件扩展名列表
-            var archiveExtensions = _settings.GetArchiveExtensions();
-            
-            // 检查完整扩展名（处理 .tar.zst 这类复合扩展名）
-            string fileName = Path.GetFileName(filePath).ToLowerInvariant();
-            foreach (var ext in archiveExtensions)
-            {
-                if (fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-
-            // 再检查单层扩展名
-            if (archiveExtensions.Contains(extension))
-                return true;
-
-            // 检查分卷压缩包格式
-            if (_volumeDetector.IsMultiVolumeArchive(filePath))
-                return true;
-
-            return false;
-        }
-
-        /// <summary>
-        /// 基于文件头特征（魔数）判断压缩文件
-        /// 常见压缩文件的文件头魔数：
-        /// - ZIP: 50 4B 03 04 或 50 4B 05 06 (空ZIP) 或 50 4B 07 08
-        /// - RAR: 52 61 72 21 1A 07 (RAR 1.5) 或 52 61 72 21 1A 07 01 00 (RAR 5.0)
-        /// - 7Z: 37 7A BC AF 27 1C
-        /// - GZ: 1F 8B
-        /// - BZ2: 42 5A 68
-        /// - XZ: FD 37 7A 58 5A 00
-        /// - TAR: (在257字节偏移处有 "ustar")
-        /// - CAB: 4D 53 43 46
-        /// - ISO: 43 44 30 30 31 (在32769字节偏移处)
-        /// - ARJ: 60 EA
-        /// - LZH: (需要特殊检测)
-        /// - ZST: 28 B5 2F FD
-        /// </summary>
-        private bool IsArchiveFileByMagicNumber(string filePath, string? extension = null)
-        {
-            try
-            {
-                // 文件太小不可能包含有效压缩数据
-                if (new FileInfo(filePath).Length < 16)
-                    return false;
-
-                // 使用 FileShare.ReadWrite 允许其他进程同时访问文件
-                // 添加重试机制，避免文件被临时占用导致失败
-                for (int retry = 0; retry < 3; retry++)
-                {
-                    try
-                    {
-                        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                        using (var reader = new BinaryReader(fs))
-                        {
-                            // 读取文件头（最多读取64字节用于检测）
-                            int bytesToRead = (int)Math.Min(64, fs.Length);
-                            byte[] header = reader.ReadBytes(bytesToRead);
-
-                            if (header.Length < 2)
-                                return false;
-
-                            // ZIP: 50 4B 03 04 或 50 4B 05 06 或 50 4B 07 08
-                            if (header.Length >= 4 &&
-                                header[0] == 0x50 && header[1] == 0x4B &&
-                                (header[2] == 0x03 || header[2] == 0x05 || header[2] == 0x07) &&
-                                (header[3] == 0x04 || header[3] == 0x06 || header[3] == 0x08))
-                                return true;
-
-                            // RAR 5.0: 52 61 72 21 1A 07 01 00
-                            if (header.Length >= 8 &&
-                                header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21 &&
-                                header[4] == 0x1A && header[5] == 0x07 && header[6] == 0x01 && header[7] == 0x00)
-                                return true;
-
-                            // RAR 1.5: 52 61 72 21 1A 07 00
-                            if (header.Length >= 7 &&
-                                header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21 &&
-                                header[4] == 0x1A && header[5] == 0x07 && header[6] == 0x00)
-                                return true;
-
-                            // 7Z: 37 7A BC AF 27 1C
-                            if (header.Length >= 6 &&
-                                header[0] == 0x37 && header[1] == 0x7A && header[2] == 0xBC &&
-                                header[3] == 0xAF && header[4] == 0x27 && header[5] == 0x1C)
-                                return true;
-
-                            // GZ: 1F 8B
-                            if (header.Length >= 2 && header[0] == 0x1F && header[1] == 0x8B)
-                                return true;
-
-                            // BZ2: 42 5A 68
-                            if (header.Length >= 3 && header[0] == 0x42 && header[1] == 0x5A && header[2] == 0x68)
-                                return true;
-
-                            // XZ: FD 37 7A 58 5A 00
-                            if (header.Length >= 6 &&
-                                header[0] == 0xFD && header[1] == 0x37 && header[2] == 0x7A &&
-                                header[3] == 0x58 && header[4] == 0x5A && header[5] == 0x00)
-                                return true;
-
-                            // ZSTD: 28 B5 2F FD
-                            if (header.Length >= 4 &&
-                                header[0] == 0x28 && header[1] == 0xB5 &&
-                                header[2] == 0x2F && header[3] == 0xFD)
-                                return true;
-
-                            // CAB: 4D 53 43 46
-                            if (header.Length >= 4 &&
-                                header[0] == 0x4D && header[1] == 0x53 &&
-                                header[2] == 0x43 && header[3] == 0x46)
-                                return true;
-
-                            // ARJ: 60 EA
-                            if (header.Length >= 2 && header[0] == 0x60 && header[1] == 0xEA)
-                                return true;
-
-                            // TAR: 在257字节偏移处有 "ustar"
-                            // 注意：很多 TAR 文件不是标准的 ustar 格式，所以扩展名匹配就放行
-                            if (extension == ".tar")
-                            {
-                                // TAR 格式检测比较复杂，不同工具生成的 TAR 格式可能不同
-                                // 如果扩展名是 .tar 且文件大小合理，直接放行
-                                if (fs.Length >= 16)
-                                {
-                                    return true;
-                                }
-                            }
-                            
-                            if (fs.Length >= 263)
-                            {
-                                fs.Position = 257;
-                                byte[] tarHeader = reader.ReadBytes(5);
-                                if (tarHeader.Length == 5 &&
-                                    tarHeader[0] == 0x75 && tarHeader[1] == 0x73 &&
-                                    tarHeader[2] == 0x74 && tarHeader[3] == 0x61 &&
-                                    tarHeader[4] == 0x72)
-                                    return true;
-                            }
-
-                            return false;
-                        }
-                    }
-                    catch (IOException) when (retry < 2)
-                    {
-                        // 文件被占用，等待后重试
-                        System.Threading.Thread.Sleep(100);
-                        continue;
-                    }
-                }
-                
-                // 所有重试都失败
-                return false;
-            }
-            catch (Exception ex)
-            {
-                // 读取失败时，不判断为压缩文件
-                AppendLog($"  文件头检测失败 {Path.GetFileName(filePath)}: {ex.Message}", ConsoleColor.Gray);
-                return false;
-            }
-        }
-
-
-        /// <summary>
-        /// 根据输出模式计算输出目录
-        /// </summary>
-        private string GetOutputDirectory(string archivePath)
-        {
-            string archiveDir = Path.GetDirectoryName(archivePath) ?? string.Empty;
-            string archiveNameWithoutExt = GetArchiveFolderName(archivePath);
-
-            // 判断是否为隐写文件（视频容器等）
-            bool isStegoCarrier = IsStegoCarrierExtension(archivePath) && _settings.EnableStegoDetection;
-
-            // 对于隐写文件，强制使用 ArchiveFolder 逻辑，避免影响同级目录的其他文件
-            OutputMode effectiveMode = isStegoCarrier ? OutputMode.ArchiveFolder : _settings.OutputMode;
-
-            switch (effectiveMode)
-            {
-                case OutputMode.SpecificDir:
-                    // 输出到指定目录
-                    return _settings.OutputDir;
-
-                case OutputMode.ArchiveDir:
-                    // 输出到压缩文件所在目录
-                    return archiveDir;
-
-                case OutputMode.ArchiveFolder:
-                    // 输出到压缩文件同名文件夹（在压缩包目录下创建）
-                    string targetFolder = Path.Combine(archiveDir, archiveNameWithoutExt);
-                    
-                    // 检查是否存在同名文件冲突
-                    if (File.Exists(targetFolder))
-                    {
-                        AppendLog($"  警告: 存在同名文件 '{archiveNameWithoutExt}',自动切换为'解压到当前目录'模式", ConsoleColor.Yellow);
-                        return archiveDir;
-                    }
-                    
-                    return targetFolder;
-
-                default:
-                    return archiveDir;
-            }
-        }
-
-        /// <summary>
-        /// 获取压缩包的文件夹名称（智能去掉分卷后缀和压缩格式后缀）
-        /// 例如: ba360.7z.001 -> ba360
-        ///       test.rar -> test
-        ///       document.zip -> document
-        ///       sample.tar.gz -> sample
-        ///       3_hidden_23.mp4 -> 3_hidden_23 (隐写文件)
-        /// </summary>
-        private string GetArchiveFolderName(string archivePath)
-        {
-            string fileName = Path.GetFileName(archivePath);
-            
-            // 对于隐写文件（视频容器），直接去掉扩展名
-            bool isStegoCarrier = IsStegoCarrierExtension(archivePath) && _settings.EnableStegoDetection;
-            if (isStegoCarrier)
-            {
-                return Path.GetFileNameWithoutExtension(fileName);
-            }
-            
-            // 1. 处理 7z 分卷格式：xxx.7z.001 -> xxx
-            var match7z = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.7z\.\d{3,}$");
-            if (match7z.Success)
-            {
-                return match7z.Groups[1].Value;
-            }
-            
-            // 2. 处理 RAR 分卷格式：xxx.part1.rar -> xxx
-            var matchRarPart = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.part\d+\.rar$");
-            if (matchRarPart.Success)
-            {
-                return matchRarPart.Groups[1].Value;
-            }
-            
-            // 3. 处理 ZIP 分卷格式：xxx.z01 -> xxx
-            var matchZip = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.z\d{2,}$");
-            if (matchZip.Success)
-            {
-                return matchZip.Groups[1].Value;
-            }
-            
-            // 4. 处理 RAR 老式分卷：xxx.r00 -> xxx
-            var matchRarOld = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.r\d{2,}$");
-            if (matchRarOld.Success)
-            {
-                return matchRarOld.Groups[1].Value;
-            }
-            
-            // 5. 处理通用数字分卷：xxx.001 -> xxx
-            var matchGeneric = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.\d{3,}$");
-            if (matchGeneric.Success)
-            {
-                return matchGeneric.Groups[1].Value;
-            }
-            
-            // 6. 普通压缩包：去掉后缀（支持复合后缀）
-            // xxx.7z -> xxx
-            // xxx.tar.zst -> xxx
-            string normalized = NormalizeArchiveLikeName(fileName);
-            
-            // 7. 如果 NormalizeArchiveLikeName 未能去除扩展名（如 .exe 等非标准压缩格式），
-            //    使用 Path.GetFileNameWithoutExtension 兜底去除
-            if (normalized.IndexOf('.') > 0 && normalized == fileName)
-            {
-                return Path.GetFileNameWithoutExtension(fileName);
-            }
-            
-            return normalized;
-        }
 
         /// <summary>
         /// 扫描目录中的压缩文件并添加到测试列表
@@ -5600,7 +4601,7 @@ namespace AutoUnpackTool
             try
             {
                 var archiveFiles = Directory.GetFiles(directoryPath)
-                    .Where(f => IsArchiveFile(f, false))
+                    .Where(f => _detector.IsArchiveFile(f, false))
                     .ToList();
 
                 int addedCount = 0;
