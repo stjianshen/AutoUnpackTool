@@ -113,6 +113,9 @@ namespace AutoUnpackTool
         private readonly ConcurrentDictionary<string, string?> _stegoArchiveTypeCache = new(StringComparer.OrdinalIgnoreCase);
         // 缓存隐写文件内包含的真实文件列表（白名单），用于过滤 -t# 提取产生的误匹配垃圾文件
         private readonly ConcurrentDictionary<string, HashSet<string>> _stegoArchiveValidFilesCache = new(StringComparer.OrdinalIgnoreCase);
+        // 缓存 -t# 扫描解析出的子数据段（Name/Type/Offset/Size），用于按字节区间裁剪真实压缩包，
+        // 避免直接 7z x -t# 提取产生 "1"、"2" 这类按序号命名的碎片文件
+        private readonly ConcurrentDictionary<string, List<(string Name, string Type, long Offset, long Size)>> _stegoSubStreamCache = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".mp4", ".mkv", ".webm", ".mov", ".m4v"
@@ -821,6 +824,7 @@ namespace AutoUnpackTool
             _stegoProbeCache.Clear();
             _stegoArchiveTypeCache.Clear();
             _stegoArchiveValidFilesCache.Clear();
+            _stegoSubStreamCache.Clear();
             TxtLog.Clear();
             UpdateRootNodeTitle();
             
@@ -2302,31 +2306,46 @@ namespace AutoUnpackTool
             // 记录觧压目录用于调试
             bool isStego = IsStegoDetectionActiveForFile(fileItem.FilePath);
             string? detectedType = isStego ? DetectStegoArchiveType(fileItem.FilePath) : null;
+            // 类型无法确认时不能再用 7z x -t#：它会把载体自身的字节和误匹配碎片写成 "1"、"2" 这类序号文件，
+            // 改为按 -t# 扫描出的 Offset/Size 裁剪出真实压缩包再解压
+            bool stegoCarveMode = isStego && (string.IsNullOrEmpty(detectedType) || detectedType == "#");
             AppendLog($"\n[线程 {taskId}] 觧压: {fileItem.FileName}", ConsoleColor.White, fileItem);
             AppendLog($"  输出目录: {outputDir}", ConsoleColor.Gray, fileItem);
             AppendLog($"  隐写模式: {isStego}", ConsoleColor.Gray, fileItem);
             if (isStego)
-                AppendLog($"  压缩类型: -t{detectedType ?? "(null)"}", ConsoleColor.Gray, fileItem);
+            {
+                AppendLog(stegoCarveMode
+                    ? "  压缩类型: 未确定（按字节区间裁剪）"
+                    : $"  压缩类型: -t{detectedType}", ConsoleColor.Gray, fileItem);
+            }
             AppendLog($"  密码: {password ?? "(无密码)"}", ConsoleColor.Gray, fileItem);
 
             try
             {
-                var result = await extractor.ExtractAsync(
-                    fileItem.FilePath,
-                    outputDir,
-                    password,
-                    onProgress: (msg) => AppendLog($"  {msg}", ConsoleColor.Gray),
-                    onPercentChanged: (percent) =>
-                    {
-                        Dispatcher.Invoke(() =>
+                (bool Success, string Message) result;
+                if (stegoCarveMode)
+                {
+                    result = await Task.Run(() => CarveStegoPayloads(fileItem.FilePath, outputDir, taskId, token), token);
+                }
+                else
+                {
+                    result = await extractor.ExtractAsync(
+                        fileItem.FilePath,
+                        outputDir,
+                        password,
+                        onProgress: (msg) => AppendLog($"  {msg}", ConsoleColor.Gray),
+                        onPercentChanged: (percent) =>
                         {
-                            ProgressExtract.Value = percent;
-                            TxtExtractProgress.Text = $"{percent}%";
-                        });
-                    },
-                    showCliWindow: _settings.ShowCliWindow,
-                    cancellationToken: token,
-                    stegoArchiveType: isStego ? (detectedType ?? "#") : null);
+                            Dispatcher.Invoke(() =>
+                            {
+                                ProgressExtract.Value = percent;
+                                TxtExtractProgress.Text = $"{percent}%";
+                            });
+                        },
+                        showCliWindow: _settings.ShowCliWindow,
+                        cancellationToken: token,
+                        stegoArchiveType: isStego ? detectedType : null);
+                }
 
                 if (result.Success)
                 {
@@ -4843,6 +4862,7 @@ namespace AutoUnpackTool
         /// <summary>
         /// 从 7z l -t# -slt 输出中检测隐藏压缩包的具体类型（如 zip/7z/rar/tar）
         /// 同时解析出存档内包含的真实文件列表（白名单），用于过滤 -t# 提取的误匹配垃圾
+        /// 并缓存子数据段（Offset/Size），供类型无法确认时按区间裁剪真实压缩包
         /// 返回 null 表示非隐写文件或无法确定类型
         /// 结果会被缓存，同一文件只探测一次
         /// </summary>
@@ -4852,7 +4872,9 @@ namespace AutoUnpackTool
                 return null;
 
             if (_stegoArchiveTypeCache.TryGetValue(filePath, out string? cachedType))
+            {
                 return cachedType;
+            }
 
             string? detectedType = null;
             HashSet<string> validFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -4877,8 +4899,9 @@ namespace AutoUnpackTool
                 process.Start();
                 string output = process.StandardOutput.ReadToEnd();
                 string error = process.StandardError.ReadToEnd();
+                bool probeExited = process.WaitForExit(15000);
 
-                if (!process.WaitForExit(15000))
+                if (!probeExited)
                 {
                     try { process.Kill(); } catch { }
                     AppendLog($"  [隐写探测] {Path.GetFileName(filePath)}: 探测超时，跳过", ConsoleColor.Gray);
@@ -4887,7 +4910,12 @@ namespace AutoUnpackTool
                 {
                     string combined = output + Environment.NewLine + error;
                     string lower = combined.ToLowerInvariant();
-                    
+
+                    // 缓存子数据段（Offset/Size）：类型无法确认时按区间裁剪真实压缩包，
+                    // 不再用 7z x -t# 提取出 "1"、"2" 这类序号命名的碎片
+                    var parsedSubStreams = ParseStegoSubStreamsFromSlt(combined);
+                    _stegoSubStreamCache[filePath] = parsedSubStreams;
+
                     // 解析 "Type = xxx" 行获取具体压缩格式
                     // -t# 输出的顶层 Type 恒为 "#"，解析不到真实格式时会返回 null
                     detectedType = ParseArchiveTypeFromOutput(combined);
@@ -5041,6 +5069,251 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
+        /// 隐写容器真实类型无法确认时的提取方式：按 -t# 扫描出的 Offset/Size 把
+        /// 数据段中真正的压缩包按字节区间裁剪成独立文件，再交给子压缩包流程解压。
+        /// 7z x -t# 会把载体自身的字节和误匹配碎片也写出来，命名成 "1"、"2" 这类序号文件；
+        /// 区间裁剪只产出确认过的压缩包，不会产生这些碎片。
+        /// </summary>
+        private (bool Success, string Message) CarveStegoPayloads(string carrierPath, string outputDir, int taskId, CancellationToken token)
+        {
+            if (File.Exists(outputDir))
+                return (false, $"输出路径已存在同名文件: {outputDir}，请更换输出模式");
+
+            if (!_stegoSubStreamCache.TryGetValue(carrierPath, out var streams) || streams == null || streams.Count == 0)
+                return (false, "未获取到 -t# 扫描的数据段信息，无法裁剪");
+
+            // 同一区间可能被重复列出，按 Offset 去重（保留最大 Size）
+            var candidates = streams
+                .GroupBy(s => s.Offset)
+                .Select(g => g.OrderByDescending(s => s.Size).First())
+                .ToList();
+
+            AppendLog($"[线程 {taskId}] [隐写裁剪] {Path.GetFileName(carrierPath)}: 定位到 {candidates.Count} 个候选压缩数据段", ConsoleColor.Cyan);
+
+            string baseName = SanitizePathSegment(GetArchiveFolderName(carrierPath));
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "payload";
+
+            string stagingDir = Path.Combine(Path.GetTempPath(), "AutoUnpackTool_stego", Guid.NewGuid().ToString("N"));
+            var carved = new List<(string TempPath, string Ext, bool Verified)>();
+
+            try
+            {
+                Directory.CreateDirectory(stagingDir);
+
+                using (var source = new FileStream(carrierPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    int index = 0;
+                    foreach (var candidate in candidates)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        index++;
+
+                        string ext = ArchiveTypeToExtension(candidate.Type);
+                        string tempPath = Path.Combine(stagingDir, $"carve{index}.{ext}");
+                        if (!TryCopyByteRange(source, candidate.Offset, candidate.Size, tempPath, token))
+                        {
+                            AppendLog($"[线程 {taskId}] [隐写裁剪]   数据段 #{index} 区间读取失败，跳过 (Offset={candidate.Offset}, Size={candidate.Size})", ConsoleColor.Yellow);
+                            continue;
+                        }
+
+                        bool verified = VerifyIsRealArchive(tempPath);
+                        carved.Add((tempPath, ext, verified));
+                        AppendLog($"[线程 {taskId}] [隐写裁剪]   数据段 #{index}: Type={candidate.Type} Offset={candidate.Offset} Size={candidate.Size} 标准验证={(verified ? "通过" : "未通过")}",
+                            verified ? ConsoleColor.Green : ConsoleColor.Yellow);
+                    }
+                }
+
+                if (carved.Count == 0)
+                    return (false, "隐写容器内未能裁出压缩数据段");
+
+                // 有通过标准验证的段时，其余未通过的都是 -t# 误匹配的固实流碎片，不写入输出目录；
+                // 全部未通过时退回魔术数判断（如表头加密的压缩包），避免丢失真实内容
+                bool anyVerified = carved.Any(c => c.Verified);
+                var publish = anyVerified
+                    ? carved.Where(c => c.Verified).ToList()
+                    : carved.Where(c => IsArchiveFileByMagicNumber(c.TempPath, "." + c.Ext)).ToList();
+
+                if (publish.Count == 0)
+                    return (false, "隐写容器内的数据段均无法确认为压缩包，原文件已保留");
+
+                Directory.CreateDirectory(outputDir);
+
+                int published = 0;
+                for (int i = 0; i < publish.Count; i++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    string fileName = publish.Count == 1
+                        ? $"{baseName}.{publish[i].Ext}"
+                        : $"{baseName}_{i + 1}.{publish[i].Ext}";
+                    string destPath = GetUniqueFilePath(outputDir, fileName);
+                    File.Move(publish[i].TempPath, destPath);
+                    published++;
+                    AppendLog($"[线程 {taskId}] [隐写裁剪]   已裁出: {Path.GetFileName(destPath)}", ConsoleColor.Cyan);
+                }
+
+                int skipped = carved.Count - published;
+                if (skipped > 0)
+                    AppendLog($"[线程 {taskId}] [隐写裁剪]   已丢弃 {skipped} 个无法验证的数据段（-t# 误匹配碎片）", ConsoleColor.Gray);
+
+                return (true, $"已裁出 {published} 个压缩数据段");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return (false, $"隐写裁剪失败: {ex.Message}");
+            }
+            finally
+            {
+                try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 按字节区间从载体文件中复制出压缩数据段
+        /// </summary>
+        private static bool TryCopyByteRange(FileStream source, long offset, long size, string destPath, CancellationToken token)
+        {
+            try
+            {
+                if (offset < 0 || size <= 0 || offset + size > source.Length)
+                    return false;
+
+                const int bufferSize = 1024 * 1024;
+                byte[] buffer = new byte[bufferSize];
+
+                source.Position = offset;
+                long remaining = size;
+                using var dest = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                while (remaining > 0)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int toRead = (int)Math.Min(buffer.Length, remaining);
+                    int read = source.Read(buffer, 0, toRead);
+                    if (read <= 0)
+                        return false;
+                    dest.Write(buffer, 0, read);
+                    remaining -= read;
+                }
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 生成不冲突的目标文件路径（同名时追加 (2)、(3)...）
+        /// </summary>
+        private static string GetUniqueFilePath(string directory, string fileName)
+        {
+            string path = Path.Combine(directory, fileName);
+            if (!File.Exists(path) && !Directory.Exists(path))
+                return path;
+
+            string name = Path.GetFileNameWithoutExtension(fileName);
+            string ext = Path.GetExtension(fileName);
+            for (int i = 2; i < 1000; i++)
+            {
+                path = Path.Combine(directory, $"{name} ({i}){ext}");
+                if (!File.Exists(path) && !Directory.Exists(path))
+                    return path;
+            }
+
+            return Path.Combine(directory, $"{name}_{Guid.NewGuid():N}{ext}");
+        }
+
+        /// <summary>
+        /// 清理文件名中的非法字符（裁剪产物以载体名命名）
+        /// </summary>
+        private static string SanitizePathSegment(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return string.Empty;
+
+            char[] invalid = Path.GetInvalidFileNameChars();
+            var sb = new System.Text.StringBuilder(name.Length);
+            foreach (char c in name)
+                sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
+
+            return sb.ToString().Trim().TrimEnd('.');
+        }
+
+        /// <summary>
+        /// 7z 类型名转文件扩展名（gzip -> gz, bzip2 -> bz2）
+        /// </summary>
+        private static string ArchiveTypeToExtension(string type)
+        {
+            switch (type.ToLowerInvariant())
+            {
+                case "gzip": return "gz";
+                case "bzip2": return "bz2";
+                default: return type.ToLowerInvariant();
+            }
+        }
+
+        /// <summary>
+        /// 从 7z l -t# -slt 输出中解析子数据段（Path/Type/Offset/Size）
+        /// -t# 把载体切成若干数据段：识别为压缩包的段名形如 "2.zip"，
+        /// 识别不出的段只有序号名（如 "1"）且 Type 为空，不应参与裁剪
+        /// </summary>
+        private static List<(string Name, string Type, long Offset, long Size)> ParseStegoSubStreamsFromSlt(string combined)
+        {
+            var result = new List<(string Name, string Type, long Offset, long Size)>();
+            string? path = null;
+            string type = string.Empty;
+            long offset = -1;
+            long size = -1;
+
+            void Flush()
+            {
+                // 只保留带区间信息且类型可识别的数据段（顶层容器条目没有 Offset）
+                if (!string.IsNullOrEmpty(path) && offset >= 0 && size > 0 && IsKnownArchiveType(type))
+                    result.Add((path!, type, offset, size));
+
+                path = null;
+                type = string.Empty;
+                offset = -1;
+                size = -1;
+            }
+
+            // 注意：不能按字符 { '\r', '\n' } 切分。Windows 换行 "\r\n" 会被切成两个分隔符，
+            // 每两行之间多出一个空元素，而空行是条目边界（Flush），会导致
+            // Path/Type/Offset/Size 永远凑不齐、解析结果恒为空
+            foreach (var line in combined.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None))
+            {
+                string trimmed = line.Trim();
+
+                // 空行 / 分隔线是 -slt 的条目边界
+                if (trimmed.Length == 0 || trimmed.StartsWith("--", StringComparison.Ordinal))
+                {
+                    Flush();
+                    continue;
+                }
+
+                if (trimmed.StartsWith("Path = ", StringComparison.OrdinalIgnoreCase))
+                    path = trimmed.Substring("Path = ".Length).Trim();
+                else if (trimmed.StartsWith("Type =", StringComparison.OrdinalIgnoreCase))
+                    type = trimmed.Substring("Type =".Length).Trim();
+                else if (trimmed.StartsWith("Offset = ", StringComparison.OrdinalIgnoreCase))
+                    long.TryParse(trimmed.Substring("Offset = ".Length).Trim(), out offset);
+                else if (trimmed.StartsWith("Size = ", StringComparison.OrdinalIgnoreCase))
+                    long.TryParse(trimmed.Substring("Size = ".Length).Trim(), out size);
+            }
+            Flush();
+
+            return result;
+        }
+
+        /// <summary>
         /// 用标准 7z l（不带 -t#）验证文件是否为真正的压缩包
         /// -t# 哈希扫描可能将媒体文件的二进制数据误识别为压缩包签名，
         /// 产生假阳性垃圾文件。标准 7z l 从文件头开始解析，不会误匹配。
@@ -5113,10 +5386,7 @@ namespace AutoUnpackTool
                     return null;
 
                 // 只返回已知支持的格式
-                if (type == "zip" || type == "7z" || type == "rar" || type == "tar" ||
-                    type == "gzip" || type == "gz" || type == "bzip2" || type == "bz2" ||
-                    type == "xz" || type == "lzma" || type == "cab" || type == "arj" ||
-                    type == "z" || type == "lzh" || type == "iso" || type == "wim")
+                if (IsKnownArchiveType(type))
                 {
                     return type;
                 }
@@ -5125,6 +5395,35 @@ namespace AutoUnpackTool
                 return null;
             }
             return null;
+        }
+
+        /// <summary>
+        /// 判断是否为 7z 可识别的压缩格式类型
+        /// </summary>
+        private static bool IsKnownArchiveType(string type)
+        {
+            switch (type.ToLowerInvariant())
+            {
+                case "zip":
+                case "7z":
+                case "rar":
+                case "tar":
+                case "gzip":
+                case "gz":
+                case "bzip2":
+                case "bz2":
+                case "xz":
+                case "lzma":
+                case "cab":
+                case "arj":
+                case "z":
+                case "lzh":
+                case "iso":
+                case "wim":
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private bool IsStegoFileBy7ZipProbe(string filePath)

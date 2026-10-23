@@ -235,10 +235,11 @@ namespace AutoUnpackTool
                     }
 
                     // 注意：隐写模式下使用具体类型（如 -tzip/-t7z）而非 -t#
-                    // -t# 是哈希扫描模式，可能误匹配媒体文件中非压缩数据的字节签名，产生垃圾残留文件
-                    // 使用从 "7z l -t#" 输出中检测到的具体类型，只解析目标压缩格式
+                    // -t# 是哈希扫描模式，只应用于探测，不能用于提取：
+                    // 它会把载体自身的字节和误匹配碎片写成 "1"、"2" 这类按序号命名的文件
+                    // 类型无法确认时由调用方改为按 Offset/Size 裁剪真实压缩包，不会传 "#" 进来
                     var arguments = $"x \"{archivePath}\" -o\"{outputDir}\" -y -sccUTF-8";
-                    if (!string.IsNullOrEmpty(stegoArchiveType))
+                    if (!string.IsNullOrEmpty(stegoArchiveType) && stegoArchiveType != "#")
                     {
                         arguments += $" -t{stegoArchiveType}";
                     }
