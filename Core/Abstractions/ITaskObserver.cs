@@ -1,29 +1,36 @@
+using System;
+using AutoUnpackTool.Core.Models;
+
 namespace AutoUnpackTool.Core.Abstractions
 {
     /// <summary>
-    /// 任务状态观察者：Core 层向 UI 上报线程状态、进度等信息，
-    /// UI 层实现负责封送到界面线程并更新绑定属性。
+    /// 任务观察者：后台线程（测试/解压/监控）不直接操作控件，
+    /// 通过此接口把线程状态、进度、当前密码、最终路径等上报给 UI 层。
     /// </summary>
     public interface ITaskObserver
     {
-        /// <summary>
-        /// 测试/解压线程状态变化
-        /// </summary>
+        /// <summary>把动作封送到 UI 线程执行（等价于原来的 Dispatcher.Invoke）。</summary>
+        void InvokeOnUi(Action action);
+
+        /// <summary>当前是否已在 UI 线程（等价于原来的 Dispatcher.CheckAccess）。</summary>
+        bool CheckUiAccess();
+
+        /// <summary>线程状态变化：测试中 / 解压中 / 暂停中。</summary>
         void OnThreadState(bool isTesting, bool isExtracting, bool isPaused);
 
-        /// <summary>
-        /// 解压进度百分比（0-100）
-        /// </summary>
+        /// <summary>强制把状态栏置为“未开始”（全部流程结束时使用）。</summary>
+        void OnIdleStatus();
+
+        /// <summary>批量智能路径检查的触发请求（需要在 UI 线程再次转入宿主）。</summary>
+        void RequestBatchSmartPathCheck();
+
+        /// <summary>解压进度百分比。</summary>
         void OnExtractProgress(int percent);
 
-        /// <summary>
-        /// 当前正在测试的密码（null 表示无）
-        /// </summary>
-        void OnCurrentPassword(string? password);
+        /// <summary>当前测试中的密码文本。</summary>
+        void OnCurrentPassword(string text);
 
-        /// <summary>
-        /// 智能路径处理后的最终路径
-        /// </summary>
-        void OnFinalPath(string? path);
+        /// <summary>最终输出路径文本。</summary>
+        void OnFinalPath(string text);
     }
 }
