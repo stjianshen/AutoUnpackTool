@@ -12,6 +12,13 @@ namespace AutoUnpackTool.Services
     /// </summary>
     public sealed class DialogService : IDialogService
     {
+        private readonly IClipboardService _clipboard;
+
+        public DialogService(IClipboardService clipboard)
+        {
+            _clipboard = clipboard;
+        }
+
         private static Window? Owner => Application.Current?.Windows.OfType<Window>().FirstOrDefault(w => w.IsActive)
             ?? Application.Current?.MainWindow;
 
@@ -37,6 +44,19 @@ namespace AutoUnpackTool.Services
             return dialog.ShowDialog() == true ? dialog.FileName : null;
         }
 
+        public string? SelectSaveFile(string title, string filter, string? fileName = null)
+        {
+            var dialog = new SaveFileDialog
+            {
+                Title = title,
+                Filter = filter,
+                DefaultExt = "txt",
+                FileName = fileName
+            };
+
+            return dialog.ShowDialog() == true ? dialog.FileName : null;
+        }
+
         public AppSettings? ShowSettings(AppSettings current)
         {
             var vm = new SettingsViewModel(current, this);
@@ -46,7 +66,8 @@ namespace AutoUnpackTool.Services
 
         public bool ShowPasswords(AppSettings current)
         {
-            var dialog = new PasswordManagerDialog(current) { Owner = Owner };
+            var vm = new PasswordManagerViewModel(current, this, _clipboard);
+            var dialog = new PasswordManagerDialog(vm) { Owner = Owner };
             return dialog.ShowDialog() == true;
         }
 
@@ -58,15 +79,24 @@ namespace AutoUnpackTool.Services
         }
 
         public void ShowWarning(string message, string title = "提示")
+            => Show(message, title, MessageBoxImage.Warning);
+
+        public void ShowInfo(string message, string title = "提示")
+            => Show(message, title, MessageBoxImage.Information);
+
+        public void ShowError(string message, string title = "错误")
+            => Show(message, title, MessageBoxImage.Error);
+
+        private static void Show(string message, string title, MessageBoxImage icon)
         {
             var owner = Owner;
             if (owner != null)
             {
-                MessageBox.Show(owner, message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(owner, message, title, MessageBoxButton.OK, icon);
             }
             else
             {
-                MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show(message, title, MessageBoxButton.OK, icon);
             }
         }
 

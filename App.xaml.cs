@@ -54,6 +54,7 @@ namespace AutoUnpackTool
             services.AddSingleton<IAppLogger>(sp => new UiAppLogger(
                 sp.GetRequiredService<Dispatcher>(),
                 sp.GetRequiredService<LogHub>().Append));
+            services.AddSingleton<IClipboardService, ClipboardService>();
             services.AddSingleton<IDialogService, DialogService>();
 
             // 配置（配置文件路径与重构前一致：%AppData%\AutoUnpackTool\settings.json）
