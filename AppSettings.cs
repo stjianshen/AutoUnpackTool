@@ -210,6 +210,13 @@ namespace AutoUnpackTool
         public bool EnableMultiVolumeDetection { get; set; } = true;
         
         /// <summary>
+        /// 是否启用防和谐文件名自动清理
+        /// 开启后在检测压缩文件前，自动删除压缩扩展名后的"删"字等防和谐字符（如 xxx.part1.rar删1 → xxx.part1.rar）
+        /// 分卷文件按组原子重命名，保证整组一致
+        /// </summary>
+        public bool AutoCleanAntiCensorshipNames { get; set; } = true;
+        
+        /// <summary>
         /// 是否启用智能路径处理(解压后自动扁平化多层嵌套文件夹)
         /// </summary>
         public bool EnableSmartPathProcessing { get; set; } = true;

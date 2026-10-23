@@ -50,6 +50,7 @@ namespace AutoUnpackTool
             ChkShowCliWindow.IsChecked = Settings.ShowCliWindow;
             ChkSmartPathProcessing.IsChecked = Settings.EnableSmartPathProcessing;
             ChkMultiVolumeDetection.IsChecked = Settings.EnableMultiVolumeDetection;
+            ChkAutoCleanNames.IsChecked = Settings.AutoCleanAntiCensorshipNames;
             ChkStegoDetection.IsChecked = Settings.EnableStegoDetection;
             TxtStegoMinSizeMB.Text = Settings.StegoDetectionMinFileSizeMB.ToString();
             
@@ -277,6 +278,9 @@ namespace AutoUnpackTool
                 
                 // 保存分卷检测设置
                 Settings.EnableMultiVolumeDetection = ChkMultiVolumeDetection.IsChecked == true;
+                
+                // 保存防和谐文件名清理设置
+                Settings.AutoCleanAntiCensorshipNames = ChkAutoCleanNames.IsChecked == true;
                 
                 Settings.EnableStegoDetection = ChkStegoDetection.IsChecked == true;
                 Settings.StegoDetectionMinFileSizeMB = stegoMinSizeMb;

@@ -118,6 +118,12 @@
                         <TextBlock Text="开启后会自动识别并合并分卷文件（如 .7z.001, .part1.rar 等）" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
                     </StackPanel>
                     
+                    <!-- 防和谐文件名自动清理 -->
+                    <StackPanel Margin="0,0,0,12">
+                        <CheckBox x:Name="ChkAutoCleanNames" Content="启用防和谐文件名自动清理" VerticalAlignment="Center"/>
+                        <TextBlock Text="开启后会在检测压缩文件前，自动删除扩展名后的「删」字等防和谐字符（如 xxx.part1.rar删1 → xxx.part1.rar），分卷文件整组一致重命名" FontSize="11" Foreground="Gray" Margin="0,5,0,0"/>
+                    </StackPanel>
+                    
                     <!-- 隐写模式探测 -->
                     <StackPanel Margin="0,0,0,12">
                         <CheckBox x:Name="ChkStegoDetection" Content="启用隐写模式探测（MP4/MKV 内嵌压缩包）" VerticalAlignment="Center"/>
