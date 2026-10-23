@@ -14,10 +14,19 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- 防止 SDK 默认 glob 把 Core 源码与历史备份目录二次纳入本项目编译 -->
+    <Compile Remove="Core\**;.history\**" />
+    <Page Remove="Core\**" />
+    <None Remove="Core\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- 代码页编码器支持（用于 GBK 等编码） -->
     <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.5" />
-    <!-- Microsoft.VisualBasic 用于移动到回收站功能 -->
-    <PackageReference Include="Microsoft.VisualBasic" Version="10.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="Core\AutoUnpackTool.Core.csproj" />
   </ItemGroup>
 
 </Project>

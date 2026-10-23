@@ -1,7 +1,7 @@
 <Window x:Class="AutoUnpackTool.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:local="clr-namespace:AutoUnpackTool"
+        xmlns:models="clr-namespace:AutoUnpackTool.Core.Models;assembly=AutoUnpackTool.Core"
         Title="自动觧压工具 V1.0" Height="650" Width="1100"
         AllowDrop="True"
         Drop="Window_Drop"
@@ -91,12 +91,12 @@
                           SelectedItemChanged="TreeView_SelectedItemChanged">
                     <TreeView.Resources>
                         <!-- RootNode 模板 -->
-                        <HierarchicalDataTemplate DataType="{x:Type local:RootNode}" ItemsSource="{Binding Children}">
+                        <HierarchicalDataTemplate DataType="{x:Type models:RootNode}" ItemsSource="{Binding Children}">
                             <TextBlock Text="{Binding Title}" FontWeight="Bold" Foreground="Blue"/>
                         </HierarchicalDataTemplate>
                         
                         <!-- FileItem 模板 -->
-                        <HierarchicalDataTemplate DataType="{x:Type local:FileItem}" ItemsSource="{Binding Children}">
+                        <HierarchicalDataTemplate DataType="{x:Type models:FileItem}" ItemsSource="{Binding Children}">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="{Binding DisplayName}" Width="300" TextTrimming="CharacterEllipsis"/>
                                 <TextBlock Text="{Binding Status}" Margin="10,0,0,0" Foreground="Gray"/>

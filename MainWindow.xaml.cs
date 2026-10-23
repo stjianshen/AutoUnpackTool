@@ -12,50 +12,26 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using AutoUnpackTool.Core.Abstractions;
+using AutoUnpackTool.Core.Configuration;
+using AutoUnpackTool.Core.Infrastructure;
+using AutoUnpackTool.Core.Models;
+using AutoUnpackTool.Core.Services;
+using AutoUnpackTool.Services;
 
 namespace AutoUnpackTool
 {
     public partial class MainWindow : Window
     {
-        // Windows API: SHFileOperation for silent recycle bin
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        public struct SHFILEOPSTRUCT
-        {
-            public IntPtr hwnd;
-            public uint wFunc;
-            public string pFrom;
-            public string pTo;
-            public ushort fFlags;
-            public bool fAnyOperationsAborted;
-            public IntPtr hNameMappings;
-            public string lpszProgressTitle;
-        }
-
-        private const uint FO_DELETE = 0x0003;
-        private const ushort FOF_ALLOWUNDO = 0x0040;  // 允许撤销（移动到回收站）
-        private const ushort FOF_NOCONFIRMATION = 0x0010;  // 不显示确认对话框
-        private const ushort FOF_SILENT = 0x0004;  // 静默模式
-
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        private static extern int SHFileOperation(ref SHFILEOPSTRUCT lpFileOp);
-
         private RootNode _rootNode = new RootNode { Title = "待解压任务(共0个文件)" };
         private ObservableCollection<FileItem> _fileList => _rootNode.Children;
         private AppSettings _settings;
+        private readonly IAppLogger _logger;
+        private readonly BlacklistService _blacklistService;
+        private readonly ArchiveNameCleaner _archiveNameCleaner;
+        private readonly VolumeDetector _volumeDetector;
         private PasswordMap _passwordMap = new PasswordMap(); // 密码映射表
 
-        // 黑名单规则编译缓存（规则未变化时复用，避免逐文件重复解析正则）
-        private sealed class CompiledBlacklistRule
-        {
-            public string SourcePattern = string.Empty;
-            public Regex? Matcher;
-            public bool MatchesFullPath;
-        }
-
-        private List<CompiledBlacklistRule> _compiledBlacklistRules = new();
-        private string _compiledBlacklistSignature = string.Empty;
-        private readonly object _blacklistCompileLock = new();
-        private readonly HashSet<string> _reportedInvalidBlacklistPatterns = new(StringComparer.OrdinalIgnoreCase);
         private bool _suppressBlacklistToggleEvent = true; // 初始化期间不响应开关变化
         
         // 双队列架构：待处理队列（测试密码）和待解压队列（已测试密码）
@@ -124,10 +100,25 @@ namespace AutoUnpackTool
         public MainWindow()
         {
             InitializeComponent();
+
+            // 日志通道：Core 层只依赖 IAppLogger，实际呈现由本窗口负责
+            _logger = new UiAppLogger(Dispatcher, entry =>
+            {
+                TxtLog.AppendText($"[{entry.Timestamp:HH:mm:ss}]--> {entry.Message}\r\n");
+                TxtLog.ScrollToEnd();
+            });
+
             LstFiles.ItemsSource = new ObservableCollection<RootNode> { _rootNode };
             
             // 加载设置
             _settings = AppSettings.Load();
+
+            // 黑名单服务（规则编译缓存 + 匹配 + 删除）
+            _blacklistService = new BlacklistService(_settings, _logger);
+
+            // 防和谐文件名清理 / 分卷识别
+            _archiveNameCleaner = new ArchiveNameCleaner(_settings, _logger);
+            _volumeDetector = new VolumeDetector();
             
             // 根据设置初始化单选按钮状态
             if (_settings.ExtractMode == ExtractMode.Auto)
@@ -335,12 +326,12 @@ namespace AutoUnpackTool
         private void ProcessSingleFile(string filePath, ref int addedCount, List<FileItem>? newFileItems = null)
         {
             // 防和谐文件名预清理：检测前先清理压缩扩展名后的防和谐字符（分卷整组原子重命名）
-            filePath = PreCleanFileNamesForSingleFile(filePath);
+            filePath = _archiveNameCleaner.PreCleanFileNamesForSingleFile(filePath);
 
             // 检查黑名单
-            if (IsBlacklistedFile(filePath, out string matchedPattern))
+            if (_blacklistService.IsBlacklistedFile(filePath, out string matchedPattern))
             {
-                DeleteBlacklistedFile(filePath, matchedPattern);
+                _blacklistService.DeleteBlacklistedFile(filePath, matchedPattern);
                 return;  // 跳过后续处理
             }
 
@@ -348,9 +339,9 @@ namespace AutoUnpackTool
             if (IsArchiveFile(filePath))
             {
                 // 如果是分卷压缩包，自动检测所有分卷（仅在同级目录中查找分卷文件）
-                if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(filePath))
+                if (_settings.EnableMultiVolumeDetection && _volumeDetector.IsMultiVolumeArchive(filePath))
                 {
-                    var volumeInfo = DetectMultiVolumeArchive(filePath);
+                    var volumeInfo = _volumeDetector.DetectMultiVolumeArchive(filePath);
                     
                     if (volumeInfo.HasVolumeList)
                     {
@@ -414,7 +405,7 @@ namespace AutoUnpackTool
                 AppendLog($"正在扫描文件夹: {directoryPath}", ConsoleColor.Gray);
                 
                 // 【防和谐清理】检测压缩文件前，先清理文件名中的防和谐字符（分卷整组原子重命名）
-                files = CleanDirtyArchiveFileNames(files.ToList()).ToArray();
+                files = _archiveNameCleaner.CleanDirtyArchiveFileNames(files.ToList()).ToArray();
                 
                 AppendLog($"找到 {files.Length} 个文件，正在筛选压缩文件...", ConsoleColor.Gray);
                 
@@ -423,14 +414,14 @@ namespace AutoUnpackTool
                 foreach (string file in files)
                 {
                     // 检查黑名单
-                    if (IsBlacklistedFile(file, out string matchedPattern))
+                    if (_blacklistService.IsBlacklistedFile(file, out string matchedPattern))
                     {
-                        DeleteBlacklistedFile(file, matchedPattern);
+                        _blacklistService.DeleteBlacklistedFile(file, matchedPattern);
                         continue;
                     }
 
                     // 初步筛选：通过扩展名或分卷格式判断
-                    if (IsArchiveFileByExtension(file) || IsMultiVolumeArchive(file))
+                    if (IsArchiveFileByExtension(file) || _volumeDetector.IsMultiVolumeArchive(file))
                     {
                         potentialArchives.Add(file);
                     }
@@ -456,9 +447,9 @@ namespace AutoUnpackTool
                             continue;
                         
                         // 检查是否为分卷压缩
-                        if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(archiveFile))
+                        if (_settings.EnableMultiVolumeDetection && _volumeDetector.IsMultiVolumeArchive(archiveFile))
                         {
-                            var volumeInfo = DetectMultiVolumeArchive(archiveFile);
+                            var volumeInfo = _volumeDetector.DetectMultiVolumeArchive(archiveFile);
                             
                             if (volumeInfo.HasVolumeList)
                             {
@@ -2583,14 +2574,14 @@ namespace AutoUnpackTool
                 }
 
                 // 【防和谐清理】解压发现的嵌套文件也可能带防和谐脏名，检测前先清理
-                filesToScan = CleanDirtyArchiveFileNames(filesToScan);
+                filesToScan = _archiveNameCleaner.CleanDirtyArchiveFileNames(filesToScan);
 
                 // 只对新解压的文件进行压缩包检测
                 foreach (var file in filesToScan)
                 {
                     // 1. 先检查扩展名（快速路径）
                     string ext = Path.GetExtension(file).ToLowerInvariant();
-                    if (archiveExtensions.Contains(ext) || IsMultiVolumeArchive(file))
+                    if (archiveExtensions.Contains(ext) || _volumeDetector.IsMultiVolumeArchive(file))
                     {
                         allArchiveFiles.Add(file);
                         continue;
@@ -2671,7 +2662,7 @@ namespace AutoUnpackTool
                 foreach (var archiveFile in allArchiveFiles)
                 {
                     // 检查黑名单 - 如果是黑名单文件则直接删除，不加入处理队列
-                    if (IsBlacklistedFile(archiveFile, out string matchedPattern))
+                    if (_blacklistService.IsBlacklistedFile(archiveFile, out string matchedPattern))
                     {
                         try
                         {
@@ -2722,9 +2713,9 @@ namespace AutoUnpackTool
                     }
 
                     // 如果是分卷压缩包，检测所有分卷并只添加主卷
-                    if (_settings.EnableMultiVolumeDetection && IsMultiVolumeArchive(archiveFile))
+                    if (_settings.EnableMultiVolumeDetection && _volumeDetector.IsMultiVolumeArchive(archiveFile))
                     {
-                        var volumeInfo = DetectMultiVolumeArchive(archiveFile);
+                        var volumeInfo = _volumeDetector.DetectMultiVolumeArchive(archiveFile);
                         
                         if (volumeInfo.HasVolumeList)
                         {
@@ -3186,64 +3177,6 @@ namespace AutoUnpackTool
         }
 
         /// <summary>
-        /// 在智能路径扁平化之前，对解压目录递归删除黑名单匹配的文件和文件夹（含解压残留的压缩包）。
-        /// 否则同级黑名单文件或文件夹会导致「恰好一个子目录且无文件」条件不满足而无法扁平化。
-        /// </summary>
-        private void DeleteBlacklistedFilesUnderDirectory(string rootDir)
-        {
-            if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
-                return;
-
-            // 黑名单已停用时无需扫描目录
-            if (_settings.SkipBlacklist)
-                return;
-
-            var activeRules = _settings.GetBlacklistRules();
-            if (activeRules == null || activeRules.Count == 0)
-                return;
-
-            try
-            {
-                AppendLog($"[批量智能路径] 扁平化前黑名单清理: {rootDir}", ConsoleColor.Gray);
-                
-                // 先删除黑名单文件
-                foreach (string file in Directory.GetFiles(rootDir, "*.*", SearchOption.AllDirectories))
-                {
-                    if (!File.Exists(file))
-                        continue;
-                    if (IsBlacklistedFile(file, out string matchedPattern))
-                        DeleteBlacklistedFile(file, matchedPattern);
-                }
-                
-                // 再删除黑名单文件夹（从最深层次开始删除，避免父目录还有内容时无法删除）
-                var allDirs = Directory.GetDirectories(rootDir, "*", SearchOption.AllDirectories)
-                    .OrderByDescending(d => d.Length); // 从最深层次开始删除
-                
-                foreach (string dir in allDirs)
-                {
-                    if (!Directory.Exists(dir))
-                        continue;
-                    if (IsBlacklistedFile(dir, out string matchedPattern))
-                    {
-                        try
-                        {
-                            Directory.Delete(dir, true); // 递归删除目录及其所有内容
-                            AppendLog($"[批量智能路径] [黑名单] 已删除文件夹: {Path.GetFileName(dir)} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendLog($"[批量智能路径] [黑名单] 删除文件夹失败: {Path.GetFileName(dir)} - {ex.Message}", ConsoleColor.Red);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[批量智能路径] 扁平化前黑名单扫描失败: {ex.Message}", ConsoleColor.Yellow);
-            }
-        }
-
-        /// <summary>
         /// 在智能路径扁平化之前，清理所有子压缩包文件。
         /// 子压缩包不受 FileAfterExtract 设置影响，一律直接删除。
         /// 这是阶段1清理的补充，确保扫描目录中所有子压缩包并清理，而不仅仅依赖文件树记录。
@@ -3263,7 +3196,7 @@ namespace AutoUnpackTool
                         continue;
                     
                     // 检查是否是压缩文件
-                    if (IsArchiveFile(file, false) && !IsMultiVolumeArchive(file))
+                    if (IsArchiveFile(file, false) && !_volumeDetector.IsMultiVolumeArchive(file))
                     {
                         try
                         {
@@ -3471,7 +3404,7 @@ namespace AutoUnpackTool
         
             // 步骤1: 清理黑名单文件
             AppendLog($"[批量智能路径] [DEBUG] 步骤1: 清理黑名单文件", ConsoleColor.Gray);
-            DeleteBlacklistedFilesUnderDirectory(rootDir);
+            _blacklistService.DeleteBlacklistedFilesUnderDirectory(rootDir);
         
             // 步骤2: 后序遍历——从叶子节点向上逐级扁平化
             // 只处理解压树中的目录（_extractedDirectoryNodes），非解压目录跳过
@@ -3784,7 +3717,7 @@ namespace AutoUnpackTool
                     string fileExt = Path.GetExtension(file).ToLowerInvariant();
                     
                     // 检查是否是分卷压缩包（.001, .002, .part1.rar 等）
-                    bool isVolumeArchive = IsMultiVolumeArchive(file);
+                    bool isVolumeArchive = _volumeDetector.IsMultiVolumeArchive(file);
                     
                     // 获取压缩包的基础名称（去掉所有扩展名）
                     string baseName = fileName;
@@ -4690,141 +4623,6 @@ namespace AutoUnpackTool
             }
         }
 
-        #region 黑名单文件处理
-
-        /// <summary>
-        /// 检查文件是否匹配黑名单规则（支持通配符与正则，规则顺序优先）
-        /// </summary>
-        /// <param name="filePath">文件或文件夹完整路径</param>
-        /// <param name="matchedPattern">匹配到的模式（输出）</param>
-        /// <returns>是否为黑名单文件</returns>
-        private bool IsBlacklistedFile(string filePath, out string matchedPattern)
-        {
-            matchedPattern = string.Empty;
-
-            // 跳过黑名单处理：直接返回不匹配
-            if (_settings.SkipBlacklist)
-                return false;
-
-            var rules = GetCompiledBlacklistRules();
-            if (rules.Count == 0)
-                return false;
-
-            string fileName = Path.GetFileName(filePath);
-            string fullPath = Path.GetFullPath(filePath);
-
-            foreach (var rule in rules)
-            {
-                string target = rule.MatchesFullPath ? fullPath : fileName;
-                if (rule.Matcher != null && rule.Matcher.IsMatch(target))
-                {
-                    matchedPattern = rule.SourcePattern;
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        /// <summary>
-        /// 获取黑名单规则的编译缓存。规则未变化时直接复用；
-        /// 通配符预转正则、正则预编译，避免逐文件重复解析
-        /// </summary>
-        private List<CompiledBlacklistRule> GetCompiledBlacklistRules()
-        {
-            var rules = _settings.GetBlacklistRules();
-
-            // 规则指纹：规则增删改或启用状态变化时重建缓存
-            string signature = string.Join("\u0001", rules.Select(r => $"{(r.IsRegex ? "R" : "W")}\u0002{r.Pattern.Trim()}"));
-
-            List<CompiledBlacklistRule> compiled;
-            List<string> invalidWarnings = new();
-            lock (_blacklistCompileLock)
-            {
-                if (string.Equals(signature, _compiledBlacklistSignature, StringComparison.Ordinal))
-                    return _compiledBlacklistRules;
-
-                compiled = new List<CompiledBlacklistRule>(rules.Count);
-                foreach (var rule in rules)
-                {
-                    string pattern = rule.Pattern.Trim();
-                    bool matchesFullPath = pattern.Contains('\\') || pattern.Contains('/');
-
-                    try
-                    {
-                        Regex matcher;
-                        if (rule.IsRegex)
-                        {
-                            // 正则规则：Perl/.NET 兼容语法，默认忽略大小写
-                            matcher = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-                        }
-                        else
-                        {
-                            // 通配符规则：* 任意字符、? 单字符，全名匹配
-                            string regexPattern = "^" + Regex.Escape(pattern)
-                                .Replace("\\*", ".*")
-                                .Replace("\\?", ".") + "$";
-                            matcher = new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-                        }
-
-                        compiled.Add(new CompiledBlacklistRule
-                        {
-                            SourcePattern = pattern,
-                            Matcher = matcher,
-                            MatchesFullPath = matchesFullPath
-                        });
-                    }
-                    catch (ArgumentException ex)
-                    {
-                        // 同一无效规则只提示一次，避免扫描时刷屏
-                        if (_reportedInvalidBlacklistPatterns.Add(pattern))
-                        {
-                            invalidWarnings.Add($"[黑名单] 无效的{(rule.IsRegex ? "正则" : "通配符")}规则已跳过: {pattern}（{ex.Message}）");
-                        }
-                    }
-                }
-
-                _compiledBlacklistRules = compiled;
-                _compiledBlacklistSignature = signature;
-            }
-
-            // 日志可能跨线程调度，必须放在锁外，避免与 UI 线程互等
-            foreach (string warning in invalidWarnings)
-                AppendLog(warning, ConsoleColor.Yellow);
-
-            return compiled;
-        }
-
-        /// <summary>
-        /// 永久删除黑名单文件
-        /// </summary>
-        /// <param name="filePath">文件路径</param>
-        /// <param name="matchedPattern">匹配到的模式</param>
-        private void DeleteBlacklistedFile(string filePath, string matchedPattern)
-        {
-            try
-            {
-                string fileName = Path.GetFileName(filePath);
-                AppendLog($"[黑名单] 检测到黑名单文件: {fileName} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
-
-                File.Delete(filePath);
-                AppendLog($"[黑名单] 已永久删除: {fileName}", ConsoleColor.Green);
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                AppendLog($"[黑名单] 删除失败（权限不足）: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
-            }
-            catch (IOException ex)
-            {
-                AppendLog($"[黑名单] 删除失败（文件被占用）: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[黑名单] 删除失败: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        #endregion
 
 
         /// 流程：
@@ -5090,7 +4888,7 @@ namespace AutoUnpackTool
 
             AppendLog($"[线程 {taskId}] [隐写裁剪] {Path.GetFileName(carrierPath)}: 定位到 {candidates.Count} 个候选压缩数据段", ConsoleColor.Cyan);
 
-            string baseName = SanitizePathSegment(GetArchiveFolderName(carrierPath));
+            string baseName = FileSystemHelper.SanitizePathSegment(GetArchiveFolderName(carrierPath));
             if (string.IsNullOrWhiteSpace(baseName))
                 baseName = "payload";
 
@@ -5109,7 +4907,7 @@ namespace AutoUnpackTool
                         token.ThrowIfCancellationRequested();
                         index++;
 
-                        string ext = ArchiveTypeToExtension(candidate.Type);
+                        string ext = FileSystemHelper.ArchiveTypeToExtension(candidate.Type);
                         string tempPath = Path.Combine(stagingDir, $"carve{index}.{ext}");
                         if (!TryCopyByteRange(source, candidate.Offset, candidate.Size, tempPath, token))
                         {
@@ -5146,7 +4944,7 @@ namespace AutoUnpackTool
                     string fileName = publish.Count == 1
                         ? $"{baseName}.{publish[i].Ext}"
                         : $"{baseName}_{i + 1}.{publish[i].Ext}";
-                    string destPath = GetUniqueFilePath(outputDir, fileName);
+                    string destPath = FileSystemHelper.GetUniqueFilePath(outputDir, fileName);
                     File.Move(publish[i].TempPath, destPath);
                     published++;
                     AppendLog($"[线程 {taskId}] [隐写裁剪]   已裁出: {Path.GetFileName(destPath)}", ConsoleColor.Cyan);
@@ -5207,56 +5005,6 @@ namespace AutoUnpackTool
             catch
             {
                 return false;
-            }
-        }
-
-        /// <summary>
-        /// 生成不冲突的目标文件路径（同名时追加 (2)、(3)...）
-        /// </summary>
-        private static string GetUniqueFilePath(string directory, string fileName)
-        {
-            string path = Path.Combine(directory, fileName);
-            if (!File.Exists(path) && !Directory.Exists(path))
-                return path;
-
-            string name = Path.GetFileNameWithoutExtension(fileName);
-            string ext = Path.GetExtension(fileName);
-            for (int i = 2; i < 1000; i++)
-            {
-                path = Path.Combine(directory, $"{name} ({i}){ext}");
-                if (!File.Exists(path) && !Directory.Exists(path))
-                    return path;
-            }
-
-            return Path.Combine(directory, $"{name}_{Guid.NewGuid():N}{ext}");
-        }
-
-        /// <summary>
-        /// 清理文件名中的非法字符（裁剪产物以载体名命名）
-        /// </summary>
-        private static string SanitizePathSegment(string name)
-        {
-            if (string.IsNullOrWhiteSpace(name))
-                return string.Empty;
-
-            char[] invalid = Path.GetInvalidFileNameChars();
-            var sb = new System.Text.StringBuilder(name.Length);
-            foreach (char c in name)
-                sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
-
-            return sb.ToString().Trim().TrimEnd('.');
-        }
-
-        /// <summary>
-        /// 7z 类型名转文件扩展名（gzip -> gz, bzip2 -> bz2）
-        /// </summary>
-        private static string ArchiveTypeToExtension(string type)
-        {
-            switch (type.ToLowerInvariant())
-            {
-                case "gzip": return "gz";
-                case "bzip2": return "bz2";
-                default: return type.ToLowerInvariant();
             }
         }
 
@@ -5496,7 +5244,7 @@ namespace AutoUnpackTool
             }
             
             // 检查分卷压缩包格式
-            if (!extensionMatched && IsMultiVolumeArchive(filePath))
+            if (!extensionMatched && _volumeDetector.IsMultiVolumeArchive(filePath))
             {
                 extensionMatched = true;
             }
@@ -5579,7 +5327,7 @@ namespace AutoUnpackTool
                 return true;
 
             // 检查分卷压缩包格式
-            if (IsMultiVolumeArchive(filePath))
+            if (_volumeDetector.IsMultiVolumeArchive(filePath))
                 return true;
 
             return false;
@@ -5725,405 +5473,6 @@ namespace AutoUnpackTool
             }
         }
 
-        /// <summary>
-        /// 判断文件是否为分卷压缩包的一部分
-        /// 支持的分卷格式：
-        /// - .7z.001, .7z.002, ...
-        /// - .part1.rar, .part2.rar, ...
-        /// - .001, .002, ... (通用分卷)
-        /// - .z01, .z02, ... (ZIP 分卷)
-        /// - .r00, .r01, ... (RAR 分卷)
-        /// </summary>
-        /// <summary>
-        /// 尝试从"脏文件名"中解析出干净的文件名（删除压缩扩展名后的防和谐垃圾字符）。
-        /// 例如 "xxx.part1.rar删1" -> "xxx.part1.rar"、"xxx.zip删" -> "xxx.zip"。
-        /// 返回 null 表示无需清理。
-        /// </summary>
-        private string? GetCleanedArchiveFileName(string fileName, List<string> archiveExtensions)
-        {
-            if (string.IsNullOrWhiteSpace(fileName))
-                return null;
-
-            // 垃圾后缀：压缩扩展名之后、不含点号、包含中文"删"字的尾部片段
-            const string garbagePattern = @"[^.]*删[^.]*$";
-
-            // 1. 分卷形式（与 IsMultiVolumeArchive 保持一致，顺序即优先级）
-            string[] volumePatterns = new[]
-            {
-                @"\.part\d+\.rar",   // xxx.part1.rar
-                @"\.7z\.\d{3,}",     // xxx.7z.001
-                @"\.z\d{2,}",        // xxx.z01
-                @"\.r\d{2,}",        // xxx.r00
-                @"\.\d{3,}",         // xxx.001
-            };
-            foreach (string volPattern in volumePatterns)
-            {
-                var match = System.Text.RegularExpressions.Regex.Match(
-                    fileName,
-                    $@"^(?<head>.+{volPattern})(?<garbage>{garbagePattern})",
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                if (match.Success)
-                    return match.Groups["head"].Value;
-            }
-
-            // 2. 标准压缩扩展名（按长度降序，正确处理 .tar.zst 这类复合扩展名）
-            foreach (string ext in archiveExtensions)
-            {
-                string escaped = System.Text.RegularExpressions.Regex.Escape(ext);
-                var match = System.Text.RegularExpressions.Regex.Match(
-                    fileName,
-                    $@"^(?<head>.+{escaped})(?<garbage>{garbagePattern})",
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                if (match.Success)
-                    return match.Groups["head"].Value;
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// 解析分卷组键（目录 + 分卷类型 + 基础名），用于分卷文件的整组原子处理。
-        /// 与 DetectMultiVolumeArchive 使用相同的分卷类型判定，非分卷文件返回 null。
-        /// </summary>
-        private string? GetVolumeGroupKey(string filePath)
-        {
-            string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
-            string fileName = Path.GetFileName(filePath);
-
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.part\d+\.rar$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
-            {
-                var match = System.Text.RegularExpressions.Regex.Match(fileName, @"^(?<base>.+)\.part\d+\.rar$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                if (match.Success)
-                    return $"{directory}|part|{match.Groups["base"].Value}";
-            }
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.7z\.\d{3,}$"))
-            {
-                string baseName = fileName.Substring(0, fileName.LastIndexOf(".7z.", StringComparison.OrdinalIgnoreCase));
-                return $"{directory}|7z|{baseName}";
-            }
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.z\d{2,}$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
-            {
-                string baseName = fileName.Substring(0, fileName.LastIndexOf(".z", StringComparison.OrdinalIgnoreCase));
-                return $"{directory}|zip|{baseName}";
-            }
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.r\d{2,}$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
-            {
-                string baseName = fileName.Substring(0, fileName.LastIndexOf(".r", StringComparison.OrdinalIgnoreCase));
-                return $"{directory}|rarold|{baseName}";
-            }
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.\d{3,}$"))
-            {
-                return $"{directory}|num|{Path.GetFileNameWithoutExtension(fileName)}";
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// 防和谐文件名自动清理（分组原子重命名）。
-        /// 删除压缩扩展名后的"删"字等防和谐字符；分卷文件整组一致重命名：
-        /// 组内任一文件校验失败或重命名失败，整组放弃并保持原名。
-        /// 返回与输入等长的最终路径数组（重命名成功的为新路径，其余为原路径）。
-        /// </summary>
-        private List<string> CleanDirtyArchiveFileNames(List<string> filePaths)
-        {
-            var result = new List<string>(filePaths); // 默认保持原样
-            if (!_settings.AutoCleanAntiCensorshipNames || filePaths == null || filePaths.Count == 0)
-                return result;
-
-            try
-            {
-                var archiveExtensions = _settings.GetArchiveExtensions()
-                    .OrderByDescending(x => x.Length)
-                    .ToList();
-
-                // 1. 计算每个文件是否需要清理（仅记录需要重命名的文件）
-                var dirtyPlan = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (string filePath in filePaths)
-                {
-                    if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                        continue;
-
-                    string fileName = Path.GetFileName(filePath);
-                    string? cleanedName = GetCleanedArchiveFileName(fileName, archiveExtensions);
-                    if (string.IsNullOrEmpty(cleanedName) ||
-                        string.Equals(cleanedName, fileName, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    string cleanedPath = Path.Combine(Path.GetDirectoryName(filePath) ?? string.Empty, cleanedName);
-                    if (!string.Equals(cleanedPath, filePath, StringComparison.OrdinalIgnoreCase))
-                        dirtyPlan[filePath] = cleanedPath;
-                }
-
-                if (dirtyPlan.Count == 0)
-                    return result;
-
-                // 2. 按分卷组键分组（非分卷文件单独成组）
-                var groups = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-                foreach (var kvp in dirtyPlan)
-                {
-                    string groupKey = GetVolumeGroupKey(kvp.Value) ?? $"single|{kvp.Key}";
-                    if (!groups.TryGetValue(groupKey, out var list))
-                    {
-                        list = new List<string>();
-                        groups[groupKey] = list;
-                    }
-                    list.Add(kvp.Key);
-                }
-
-                // 3. 每组校验并原子执行
-                foreach (var group in groups.Values)
-                {
-                    TryRenameGroupAtomically(group, dirtyPlan);
-                }
-
-                // 4. 生成最终路径数组：重命名成功的条目其新路径已存在，失败条目自动回退原路径
-                for (int i = 0; i < filePaths.Count; i++)
-                {
-                    if (dirtyPlan.TryGetValue(filePaths[i], out string? newPath) && File.Exists(newPath))
-                        result[i] = newPath;
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[防和谐清理] 处理失败: {ex.Message}", ConsoleColor.Red);
-            }
-
-            return result;
-        }
-
-        /// <summary>
-        /// 对一个分组执行原子重命名：校验全部通过才统一执行，
-        /// 执行中途失败则回滚已重命名的卷并整组放弃。
-        /// </summary>
-        private void TryRenameGroupAtomically(List<string> groupFiles, Dictionary<string, string> dirtyPlan)
-        {
-            // 校验阶段：目标路径不能已存在（除非是组内其他成员的旧路径），且目标之间不能重复
-            var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string oldPath in groupFiles)
-            {
-                string newPath = dirtyPlan[oldPath];
-                if (File.Exists(newPath) && !groupFiles.Contains(newPath, StringComparer.OrdinalIgnoreCase))
-                {
-                    AppendLog($"[防和谐清理] {Path.GetFileName(oldPath)}: 目标已存在 {newPath}，整组放弃重命名", ConsoleColor.Yellow);
-                    return;
-                }
-                if (!targets.Add(newPath))
-                {
-                    AppendLog($"[防和谐清理] 多个文件清理后重名 {Path.GetFileName(newPath)}，整组放弃重命名", ConsoleColor.Yellow);
-                    return;
-                }
-            }
-
-            // 执行阶段：逐个重命名，失败则回滚整组
-            var moved = new List<(string Old, string New)>();
-            foreach (string oldPath in groupFiles)
-            {
-                string newPath = dirtyPlan[oldPath];
-                try
-                {
-                    File.Move(oldPath, newPath);
-                    moved.Add((oldPath, newPath));
-                    AppendLog($"[防和谐清理] {Path.GetFileName(oldPath)} → {Path.GetFileName(newPath)}", ConsoleColor.Cyan);
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"[防和谐清理] {Path.GetFileName(oldPath)} 重命名失败: {ex.Message}，整组回滚", ConsoleColor.Yellow);
-                    foreach (var m in moved)
-                    {
-                        try { File.Move(m.New, m.Old); }
-                        catch { /* 回滚尽力而为 */ }
-                    }
-                    return;
-                }
-            }
-        }
-
-        /// <summary>
-        /// 拖入单文件时的防和谐文件名预清理。
-        /// 若当前文件需要清理，则收集同目录所有文件参与分组原子清理，
-        /// 保证分卷文件整组一致重命名。返回清理后的当前文件路径。
-        /// </summary>
-        private string PreCleanFileNamesForSingleFile(string filePath)
-        {
-            if (!_settings.AutoCleanAntiCensorshipNames || string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                return filePath;
-
-            string fileName = Path.GetFileName(filePath);
-            var archiveExtensions = _settings.GetArchiveExtensions()
-                .OrderByDescending(x => x.Length)
-                .ToList();
-            if (string.IsNullOrEmpty(GetCleanedArchiveFileName(fileName, archiveExtensions)))
-                return filePath; // 无需清理，避免不必要的目录扫描
-
-            string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
-            try
-            {
-                var allFiles = Directory.GetFiles(directory, "*.*", SearchOption.TopDirectoryOnly).ToList();
-                var cleaned = CleanDirtyArchiveFileNames(allFiles);
-                for (int i = 0; i < allFiles.Count; i++)
-                {
-                    if (string.Equals(allFiles[i], filePath, StringComparison.OrdinalIgnoreCase))
-                        return cleaned[i];
-                }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[防和谐清理] {fileName}: {ex.Message}", ConsoleColor.Yellow);
-            }
-
-            return filePath;
-        }
-
-        private bool IsMultiVolumeArchive(string filePath)
-        {
-            if (string.IsNullOrWhiteSpace(filePath))
-                return false;
-
-            string fileName = Path.GetFileName(filePath).ToLowerInvariant();
-            
-            // 7z 分卷格式：.7z.001, .7z.002, ...
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.7z\.\d{3,}$"))
-                return true;
-
-            // RAR 分卷格式：.part1.rar, .part2.rar, ...
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.part\d+\.rar$"))
-                return true;
-
-            // 通用数字分卷：.001, .002, .003, ...
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.\d{3,}$"))
-                return true;
-
-            // ZIP 分卷：.z01, .z02, ...
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.z\d{2,}$"))
-                return true;
-
-            // RAR 老式分卷：.r00, .r01, ...
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.r\d{2,}$"))
-                return true;
-
-            return false;
-        }
-
-        /// <summary>
-        /// 检测并获取分卷压缩包的所有分卷文件
-        /// </summary>
-        /// <param name="filePath">任意一个分卷文件路径</param>
-        /// <returns>分卷压缩包信息</returns>
-        private ArchiveVolumeInfo DetectMultiVolumeArchive(string filePath)
-        {
-            var volumeInfo = new ArchiveVolumeInfo();
-            
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-                return volumeInfo;
-
-            string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
-            string fileName = Path.GetFileName(filePath);
-            string fileNameWithoutExt = Path.GetFileNameWithoutExtension(filePath);
-            
-            // 判断分卷类型并查找所有分卷
-            var allVolumes = new List<string>();
-
-            // 1. 7z 分卷格式：xxx.7z.001, xxx.7z.002, ...
-            if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.7z\.\d{3,}$"))
-            {
-                string baseName = fileName.Substring(0, fileName.LastIndexOf(".7z."));
-                allVolumes = FindSequentialVolumes(directory, baseName + ".7z.", 3);
-            }
-            // 2. RAR 分卷格式：xxx.part1.rar, xxx.part2.rar, ...
-            else if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.part\d+\.rar$"))
-            {
-                var match = System.Text.RegularExpressions.Regex.Match(fileName, @"^(.+)\.part(\d+)\.rar$");
-                if (match.Success)
-                {
-                    string baseName = match.Groups[1].Value;
-                    allVolumes = FindRarPartVolumes(directory, baseName);
-                }
-            }
-            // 3. 通用数字分卷：xxx.001, xxx.002, ...
-            else if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.\d{3,}$"))
-            {
-                string extension = Path.GetExtension(fileName);
-                string baseName = fileNameWithoutExt;
-                allVolumes = FindSequentialVolumes(directory, baseName + ".", extension.TrimStart('.').Length);
-            }
-            // 4. ZIP 分卷：xxx.z01, xxx.z02, ...
-            else if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.z\d{2,}$"))
-            {
-                string baseName = fileName.Substring(0, fileName.LastIndexOf(".z"));
-                allVolumes = FindSequentialVolumes(directory, baseName + ".z", 2);
-            }
-            // 5. RAR 老式分卷：xxx.r00, xxx.r01, ...
-            else if (System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.r\d{2,}$"))
-            {
-                string baseName = fileName.Substring(0, fileName.LastIndexOf(".r"));
-                allVolumes = FindSequentialVolumes(directory, baseName + ".r", 2);
-            }
-
-            volumeInfo.AllVolumePaths = allVolumes;
-            
-            // 主卷通常是第一个分卷
-            if (allVolumes.Count > 0)
-            {
-                volumeInfo.MainVolumePath = allVolumes[0];
-            }
-
-            return volumeInfo;
-        }
-
-        /// <summary>
-        /// 查找顺序编号的分卷文件（如 .001, .002, .003）
-        /// </summary>
-        private List<string> FindSequentialVolumes(string directory, string prefix, int numberLength)
-        {
-            var volumes = new List<string>();
-            int volumeNumber = 1;
-
-            while (true)
-            {
-                string volumeName = $"{prefix}{volumeNumber.ToString($"D{numberLength}")}";
-                string volumePath = Path.Combine(directory, volumeName);
-
-                if (File.Exists(volumePath))
-                {
-                    volumes.Add(volumePath);
-                    volumeNumber++;
-                }
-                else
-                {
-                    break;
-                }
-            }
-
-            return volumes;
-        }
-
-        /// <summary>
-        /// 查找 RAR part 格式的分卷文件
-        /// </summary>
-        private List<string> FindRarPartVolumes(string directory, string baseName)
-        {
-            var volumes = new List<string>();
-            int partNumber = 1;
-
-            while (true)
-            {
-                string volumeName = $"{baseName}.part{partNumber}.rar";
-                string volumePath = Path.Combine(directory, volumeName);
-
-                if (File.Exists(volumePath))
-                {
-                    volumes.Add(volumePath);
-                    partNumber++;
-                }
-                else
-                {
-                    break;
-                }
-            }
-
-            return volumes;
-        }
 
         /// <summary>
         /// 根据输出模式计算输出目录
@@ -6297,19 +5646,19 @@ namespace AutoUnpackTool
                     // 确保路径以双 null 结尾
                     string path = filePath + "\0";
                     
-                    var fileOp = new SHFILEOPSTRUCT
+                    var fileOp = new NativeMethods.SHFILEOPSTRUCT
                     {
                         hwnd = IntPtr.Zero,
-                        wFunc = FO_DELETE,
+                        wFunc = NativeMethods.FO_DELETE,
                         pFrom = path,
                         pTo = string.Empty,
-                        fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT,
+                        fFlags = NativeMethods.FOF_ALLOWUNDO | NativeMethods.FOF_NOCONFIRMATION | NativeMethods.FOF_SILENT,
                         fAnyOperationsAborted = false,
                         hNameMappings = IntPtr.Zero,
                         lpszProgressTitle = string.Empty
                     };
 
-                    int result = SHFileOperation(ref fileOp);
+                    int result = NativeMethods.SHFileOperation(ref fileOp);
                     
                     // 返回0表示成功
                     if (result != 0)
@@ -6881,30 +6230,12 @@ namespace AutoUnpackTool
         /// </summary>
         private void DiagLog(string message)
         {
-            try
-            {
-                System.IO.File.AppendAllText(
-                    System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "diag_trace.log"),
-                    $"[{DateTime.Now:HH:mm:ss.fff}] [TID:{Environment.CurrentManagedThreadId}] {message}\r\n");
-            }
-            catch { }
+            _logger.Diag(message);
         }
 
         private void AppendLog(string message, ConsoleColor color, FileItem? targetNode = null)
         {
-            // 如果指定了目标节点,记录到该节点
-            if (targetNode != null)
-            {
-                targetNode.AddLog(message, color);
-            }
-            
-            // 实时显示到日志窗口(始终显示,不过滤)
-            Dispatcher.Invoke(() =>
-            {
-                string timestamp = DateTime.Now.ToString("HH:mm:ss");
-                TxtLog.AppendText($"[{timestamp}]--> {message}\r\n");
-                TxtLog.ScrollToEnd();
-            });
+            _logger.Log(message, color, targetNode);
         }
 
         /// <summary>
@@ -6917,398 +6248,6 @@ namespace AutoUnpackTool
 
         #endregion
     }
-
-    public class FileItem : System.ComponentModel.INotifyPropertyChanged
-    {
-        private string _fileName = string.Empty;
-        private string _filePath = string.Empty;
-        private string _status = string.Empty;
-        private long _fileSize = 0;
-        private string? _foundPassword = null;
-        
-        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
-        
-        protected virtual void OnPropertyChanged(string propertyName)
-        {
-            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(propertyName));
-        }
-        
-        public string FileName 
-        { 
-            get => _fileName; 
-            set 
-            { 
-                _fileName = value; 
-                OnPropertyChanged(nameof(FileName));
-                OnPropertyChanged(nameof(DisplayName));
-            } 
-        }
-        
-        public string FilePath 
-        { 
-            get => _filePath; 
-            set 
-            { 
-                _filePath = value; 
-                OnPropertyChanged(nameof(FilePath));
-            } 
-        }
-        
-        public string Status 
-        { 
-            get => _status; 
-            set 
-            { 
-                _status = value; 
-                OnPropertyChanged(nameof(Status));
-            } 
-        }
-        
-        public long FileSize 
-        { 
-            get => _fileSize; 
-            set 
-            { 
-                _fileSize = value; 
-                OnPropertyChanged(nameof(FileSize));
-            } 
-        }
-        
-        public string? FoundPassword 
-        { 
-            get => _foundPassword; 
-            set 
-            { 
-                _foundPassword = value; 
-                OnPropertyChanged(nameof(FoundPassword));
-            } 
-        }
-        
-        /// <summary>
-        /// 当 FileItem 源于文件夹拖入时，记录源文件夹名称用于 UI 显示
-        /// </summary>
-        private string? _sourceFolderName = null;
-        public string? SourceFolderName 
-        { 
-            get => _sourceFolderName; 
-            set 
-            { 
-                _sourceFolderName = value; 
-                OnPropertyChanged(nameof(SourceFolderName));
-                OnPropertyChanged(nameof(DisplayName));
-            } 
-        }
-        
-        /// <summary>
-        /// 用于 UI 显示的名称：如果是从文件夹拖入的，显示文件夹名；否则显示文件名
-        /// </summary>
-        public string DisplayName => SourceFolderName ?? FileName;
-        
-        public ArchiveVolumeInfo? VolumeInfo { get; set; }
-        
-        // 新增：父子关系支持
-        public ObservableCollection<FileItem> Children { get; set; } = new ObservableCollection<FileItem>();
-        public FileItem? Parent { get; set; }
-        public bool IsParent => Children.Count > 0;
-        
-        /// <summary>
-        /// 所属的任务ID（用于批量处理时识别任务范围）
-        /// </summary>
-        public int TaskId { get; set; } = -1;
-        
-        /// <summary>
-        /// 当前解压层数（从拖入的文件开始计算，拖入的文件为第1层）
-        /// </summary>
-        public int CurrentDepth { get; set; } = 1;
-        
-        // 新增：子节点完成状态跟踪（用于反向传播）
-        private int _expectedChildrenCount = 0;      // 预期的子节点总数
-        private int _completedChildrenCount = 0;     // 已完成的子节点数
-        private bool _isMarkedComplete = false;      // 是否已标记为完成（防止重复上报）
-        private bool _selfExtractSuccess = false;    // 自身压是否成功
-                
-        private string? _finalOutputPath = null;
-        
-        /// <summary>
-        /// 扁平化处理后的最终路径（用于在日志区域上方显示）
-        /// </summary>
-        public string? FinalOutputPath 
-        { 
-            get => _finalOutputPath; 
-            set 
-            { 
-                if (_finalOutputPath != value)
-                {
-                    _finalOutputPath = value; 
-                    OnPropertyChanged(nameof(FinalOutputPath));
-                }
-            } 
-        }
-        
-        /// <summary>
-        /// 设置自身解压结果
-        /// </summary>
-        public void SetSelfExtractResult(bool success)
-        {
-            _selfExtractSuccess = success;
-        }
-        
-        /// <summary>
-        /// 获取自身解压结果
-        /// </summary>
-        public bool GetSelfExtractResult()
-        {
-            return _selfExtractSuccess;
-        }
-        
-        /// <summary>
-        /// 设置预期的子节点数量（在扫描完解压目录后调用）
-        /// </summary>
-        public void SetExpectedChildrenCount(int count)
-        {
-            _expectedChildrenCount = count;
-            _completedChildrenCount = 0;
-            _isMarkedComplete = false;
-        }
-        
-        /// <summary>
-        /// 标记一个子节点完成，并返回是否所有子节点都已完成
-        /// </summary>
-        public bool MarkChildComplete()
-        {
-            lock (_lockObject)
-            {
-                if (_isMarkedComplete)
-                    return false;  // 已经标记完成，不再处理
-                    
-                _completedChildrenCount++;
-                
-                // 检查是否所有子节点都已完成
-                bool allCompleted = _completedChildrenCount >= _expectedChildrenCount && _expectedChildrenCount > 0;
-                
-                if (allCompleted)
-                {
-                    _isMarkedComplete = true;
-                }
-                
-                return allCompleted;
-            }
-        }
-        
-        /// <summary>
-        /// 获取完成进度信息
-        /// </summary>
-        public string GetProgressInfo()
-        {
-            return $"{_completedChildrenCount}/{_expectedChildrenCount}";
-        }
-        
-        // 用于线程安全的状态标记
-        private readonly object _lockObject = new object();
-        private bool _isBeingProcessed = false;
-        
-        /// <summary>
-        /// 尝试获取处理锁，防止多线程竞争
-        /// </summary>
-        public bool TryLock()
-        {
-            lock (_lockObject)
-            {
-                if (_isBeingProcessed)
-                    return false;
-                _isBeingProcessed = true;
-                return true;
-            }
-        }
-        
-        /// <summary>
-        /// 释放处理锁
-        /// </summary>
-        public void ReleaseLock()
-        {
-            lock (_lockObject)
-            {
-                _isBeingProcessed = false;
-            }
-        }
-        
-        // 日志存储
-        private List<LogEntry> _logs = new List<LogEntry>();
-        private readonly object _logLock = new object();
-        
-        /// <summary>
-        /// 节点关联的日志列表
-        /// </summary>
-        public List<LogEntry> Logs
-        {
-            get { lock (_logLock) return new List<LogEntry>(_logs); }
-        }
-        
-        /// <summary>
-        /// 添加日志到当前节点
-        /// </summary>
-        public void AddLog(string message, ConsoleColor color)
-        {
-            lock (_logLock)
-            {
-                _logs.Add(new LogEntry
-                {
-                    Timestamp = DateTime.Now,
-                    Message = message,
-                    Color = color
-                });
-            }
-        }
-        
-        /// <summary>
-        /// 递归收集当前节点及所有子节点的日志
-        /// </summary>
-        public List<LogEntry> CollectAllLogs()
-        {
-            var allLogs = new List<LogEntry>();
-            
-            lock (_logLock)
-            {
-                allLogs.AddRange(_logs);
-            }
-            
-            // 递归收集子节点日志
-            foreach (var child in Children)
-            {
-                allLogs.AddRange(child.CollectAllLogs());
-            }
-            
-            // 按时间排序
-            allLogs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
-            return allLogs;
-        }
-    }
-    
-    /// <summary>
-    /// 日志条目
-    /// </summary>
-    public class LogEntry
-    {
-        public DateTime Timestamp { get; set; }
-        public string Message { get; set; } = string.Empty;
-        public ConsoleColor Color { get; set; }
-    }
-    
-    /// <summary>
-    /// 根节点类
-    /// </summary>
-    public class RootNode : System.ComponentModel.INotifyPropertyChanged
-    {
-        private string _title = string.Empty;
-        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
-        
-        public string Title
-        {
-            get => _title;
-            set
-            {
-                _title = value;
-                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Title)));
-            }
-        }
-        
-        public ObservableCollection<FileItem> Children { get; set; } = new ObservableCollection<FileItem>();
-        
-        public int FileCount
-        {
-            get
-            {
-                int count = 0;
-                foreach (var child in Children)
-                {
-                    count += CountFilesInTree(child);
-                }
-                return count;
-            }
-        }
-        
-        private int CountFilesInTree(FileItem item)
-        {
-            int count = 1;
-            foreach (var child in item.Children)
-            {
-                count += CountFilesInTree(child);
-            }
-            return count;
-        }
-        
-        public void UpdateTitle()
-        {
-            Title = $"待解压任务(共{FileCount}个文件)";
-        }
-        
-        /// <summary>
-        /// 收集所有日志
-        /// </summary>
-        public List<LogEntry> CollectAllLogs()
-        {
-            var allLogs = new List<LogEntry>();
-            foreach (var child in Children)
-            {
-                allLogs.AddRange(child.CollectAllLogs());
-            }
-            allLogs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
-            return allLogs;
-        }
-    }
-    
-    /// <summary>
-    /// 密码映射表（线程安全）
-    /// </summary>
-    public class PasswordMap
-    {
-        private readonly Dictionary<string, string?> _map = new Dictionary<string, string?>();
-        private readonly object _lock = new object();
-        
-        public void Add(string filePath, string? password)
-        {
-            lock (_lock)
-            {
-                _map[filePath] = password;
-            }
-        }
-        
-        public bool TryGetValue(string filePath, out string? password)
-        {
-            lock (_lock)
-            {
-                return _map.TryGetValue(filePath, out password);
-            }
-        }
-
-        public bool ContainsKey(string filePath)
-        {
-            lock (_lock)
-            {
-                return _map.ContainsKey(filePath);
-            }
-        }
-        
-        public int Count
-        {
-            get
-            {
-                lock (_lock)
-                {
-                    return _map.Count;
-                }
-            }
-        }
-
-        public bool Remove(string filePath)
-        {
-            lock (_lock)
-            {
-                return _map.Remove(filePath);
-            }
-        }
-    }
-
 }
 
 

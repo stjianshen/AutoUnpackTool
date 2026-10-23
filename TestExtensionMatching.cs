@@ -1,6 +1,6 @@
 using System;
 using System.IO;
-using AutoUnpackTool;
+using AutoUnpackTool.Core.Configuration;
 
 namespace TestExtensionMatching
 {

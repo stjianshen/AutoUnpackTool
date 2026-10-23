@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using AutoUnpackTool.Core.Configuration;
 
 namespace AutoUnpackTool
 {

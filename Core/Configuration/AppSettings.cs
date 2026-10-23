@@ -5,180 +5,8 @@ using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace AutoUnpackTool
+namespace AutoUnpackTool.Core.Configuration
 {
-    public enum FileAction
-    {
-        Keep,               // 保留原文件
-        MoveToRecycleBin,   // 移动到回收站
-        Delete,             // 删除文件
-        MoveToSpecificDir   // 移动到指定目录
-    }
-
-    public enum OutputMode
-    {
-        SpecificDir,        // 输出到指定目录
-        ArchiveDir,         // 输出到压缩文件所在目录
-        ArchiveFolder       // 输出到压缩文件同名文件夹
-    }
-
-    public enum ExtractMode
-    {
-        Manual,             // 手动解压（默认）
-        Auto                // 自动解压
-    }
-
-    /// <summary>
-    /// 智能路径处理模式
-    /// </summary>
-    public enum SmartPathMode
-    {
-        Concatenate,        // 拼接文件夹名字
-        SmartSelect         // 智能选择（优先选择长的、有日文的）
-    }
-
-    /// <summary>
-    /// 分卷压缩包信息
-    /// </summary>
-    public class ArchiveVolumeInfo
-    {
-        /// <summary>
-        /// 主卷文件路径（通常是 .001, .part1.rar, .7z.001 等）
-        /// </summary>
-        public string MainVolumePath { get; set; } = string.Empty;
-        
-        /// <summary>
-        /// 所有分卷文件路径列表
-        /// </summary>
-        public List<string> AllVolumePaths { get; set; } = new List<string>();
-        
-        /// <summary>
-        /// 分卷总数
-        /// </summary>
-        public int VolumeCount => AllVolumePaths.Count;
-        
-        /// <summary>
-        /// 是否为多分卷（至少两个物理分卷文件）
-        /// </summary>
-        public bool IsMultiVolume => VolumeCount > 1;
-
-        /// <summary>
-        /// 是否按分卷列表处理（含仅存在 .001 单卷的命名格式，用于清理时遍历 AllVolumePaths）
-        /// </summary>
-        public bool HasVolumeList => AllVolumePaths != null && AllVolumePaths.Count > 0;
-    }
-
-    public class PasswordEntry
-    {
-        public string Password { get; set; } = string.Empty;
-        public int UsageCount { get; set; } = 0;
-        public DateTime LastUsedTime { get; set; } = DateTime.MinValue;
-        
-        /// <summary>
-        /// 计算密码的综合评分（用于排序）
-        /// 优先级：最近使用时间 > 使用频率
-        /// - 1小时内使用过：获得极高的基础分（10000分），确保排在最前
-        /// - 24小时内使用过：获得高分（5000分）
-        /// - 7天内使用过：获得中等分（1000分）
-        /// - 超过7天：仅按使用次数排序
-        /// </summary>
-        public double Score
-        {
-            get
-            {
-                double recencyBonus = 0;
-                
-                // 根据最近使用时间给予不同的基础加分
-                if (LastUsedTime != DateTime.MinValue)
-                {
-                    double hoursSinceLastUse = (DateTime.Now - LastUsedTime).TotalHours;
-                    
-                    if (hoursSinceLastUse <= 1)
-                    {
-                        // 1小时内使用过：极高优先级
-                        recencyBonus = 10000;
-                    }
-                    else if (hoursSinceLastUse <= 24)
-                    {
-                        // 24小时内使用过：高优先级
-                        recencyBonus = 5000;
-                    }
-                    else if (hoursSinceLastUse <= 168) // 7天
-                    {
-                        // 7天内使用过：中等优先级
-                        recencyBonus = 1000;
-                    }
-                    else
-                    {
-                        // 超过7天：使用时间衰减
-                        double daysSinceLastUse = hoursSinceLastUse / 24;
-                        recencyBonus = Math.Max(0, 500 - daysSinceLastUse * 10);
-                    }
-                }
-                
-                // 使用次数作为次要排序因素
-                double frequencyScore = UsageCount * 10;
-                
-                return recencyBonus + frequencyScore;
-            }
-        }
-    }
-
-    /// <summary>
-    /// 黑名单规则（支持通配符与正则表达式），一行一条
-    /// </summary>
-    public class BlacklistRule : System.ComponentModel.INotifyPropertyChanged
-    {
-        private bool _enabled = true;
-        private bool _isRegex;
-        private string _pattern = string.Empty;
-        private string _note = string.Empty;
-
-        /// <summary>
-        /// 是否启用该规则（停用后保留但不参与匹配）
-        /// </summary>
-        public bool Enabled
-        {
-            get => _enabled;
-            set { if (_enabled != value) { _enabled = value; OnPropertyChanged(nameof(Enabled)); } }
-        }
-
-        /// <summary>
-        /// 是否按正则表达式匹配；false 表示按通配符匹配（* 任意字符、? 单字符）
-        /// 正则默认忽略大小写，支持 Perl/.NET 常用语法（\d、\w、|、[]、(?i)、环视等）
-        /// </summary>
-        public bool IsRegex
-        {
-            get => _isRegex;
-            set { if (_isRegex != value) { _isRegex = value; OnPropertyChanged(nameof(IsRegex)); } }
-        }
-
-        /// <summary>
-        /// 匹配模式。模式包含 / 或 \ 时匹配完整路径，否则只匹配文件名
-        /// </summary>
-        public string Pattern
-        {
-            get => _pattern;
-            set { if (_pattern != value) { _pattern = value ?? string.Empty; OnPropertyChanged(nameof(Pattern)); } }
-        }
-
-        /// <summary>
-        /// 规则说明（仅用于展示，便于日后维护）
-        /// </summary>
-        public string Note
-        {
-            get => _note;
-            set { if (_note != value) { _note = value ?? string.Empty; OnPropertyChanged(nameof(Note)); } }
-        }
-
-        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
-
-        private void OnPropertyChanged(string propertyName)
-        {
-            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(propertyName));
-        }
-    }
-
     public class AppSettings
     {
         // 配置文件路径（公开属性）
@@ -198,35 +26,35 @@ namespace AutoUnpackTool
         public OutputMode OutputMode { get; set; } = OutputMode.SpecificDir;
         public ExtractMode ExtractMode { get; set; } = ExtractMode.Auto;
         public bool ShowCliWindow { get; set; } = false; // 是否显示CLI窗口
-        
+
         /// <summary>
         /// 分卷压缩包清理后的目标目录（当 FileAfterExtract = MoveToSpecificDir 时使用）
         /// </summary>
         public string ArchiveCleanupDir { get; set; } = string.Empty;
-        
+
         /// <summary>
         /// 是否启用分卷压缩包自动检测
         /// </summary>
         public bool EnableMultiVolumeDetection { get; set; } = true;
-        
+
         /// <summary>
         /// 是否启用防和谐文件名自动清理
         /// 开启后在检测压缩文件前，自动删除压缩扩展名后的"删"字等防和谐字符（如 xxx.part1.rar删1 → xxx.part1.rar）
         /// 分卷文件按组原子重命名，保证整组一致
         /// </summary>
         public bool AutoCleanAntiCensorshipNames { get; set; } = true;
-        
+
         /// <summary>
         /// 是否启用智能路径处理(解压后自动扁平化多层嵌套文件夹)
         /// </summary>
         public bool EnableSmartPathProcessing { get; set; } = true;
-        
+
         /// <summary>
         /// 是否启用隐写文件探测(MP4/MKV 等容器内嵌压缩包)
         /// 默认开启以检测视频文件中的隐藏压缩包
         /// </summary>
         public bool EnableStegoDetection { get; set; } = true;
-        
+
         /// <summary>
         /// 强制解压模式:跳过压缩文件检测,对所有拖入的文件直接尝试解压
         /// 适用于某些特殊格式的压缩包无法被识别的情况
@@ -251,17 +79,17 @@ namespace AutoUnpackTool
         /// 默认 10MB（视频文件通常不会太小）
         /// </summary>
         public int StegoDetectionMinFileSizeMB { get; set; } = 10;
-        
+
         /// <summary>
         /// 智能路径处理模式
         /// </summary>
         public SmartPathMode SmartPathProcessingMode { get; set; } = SmartPathMode.SmartSelect;
-        
+
         /// <summary>
         /// 需要检测的压缩文件扩展名列表（逗号分隔）
         /// </summary>
         public string ArchiveExtensions { get; set; } = ".zip,.rar,.7z,.tar,.gz,.bz2,.xz,.zst,.zstd,.tgz,.tbz2,.tbz,.txz,.cab,.iso,.wim,.arj,.lzh,.cpio,.rpm,.deb";
-        
+
         /// <summary>
         /// 需要排除的文件扩展名列表（逗号分隔，优先级高于包含列表）
         /// </summary>
@@ -279,14 +107,14 @@ namespace AutoUnpackTool
 
         // 永久密码（按使用次数排序）
         public List<PasswordEntry> PermanentPasswords { get; set; } = new List<PasswordEntry>();
-        
+
         // 向后兼容：保留私有字段的引用
-        private List<PasswordEntry> _permanentPasswords 
-        { 
-            get => PermanentPasswords; 
-            set => PermanentPasswords = value; 
+        private List<PasswordEntry> _permanentPasswords
+        {
+            get => PermanentPasswords;
+            set => PermanentPasswords = value;
         }
-        
+
         // 一次性密码（本次运行添加，排在最前）
         // 注意：添加 JsonIgnore 特性，确保一次性密码不会被序列化到配置文件
         // 这样一次性密码只在内存中生效，重启后自动清除
@@ -303,7 +131,7 @@ namespace AutoUnpackTool
                 if (File.Exists(ConfigPath))
                 {
                     string json = File.ReadAllText(ConfigPath);
-                    
+
                     // 添加更详细的错误处理
                     try
                     {
@@ -318,7 +146,7 @@ namespace AutoUnpackTool
                             {
                                 settings.PermanentPasswords = new List<PasswordEntry>();
                             }
-                            
+
                             Console.WriteLine($"✅ 配置加载成功: {ConfigPath}");
                             return settings;
                         }
@@ -333,7 +161,7 @@ namespace AutoUnpackTool
                             Console.WriteLine($"⚠️  配置文件JSON格式错误，已备份到: {backupPath}");
                         }
                         catch { }
-                        
+
                         throw new Exception($"配置文件JSON格式错误，请检查文件内容。\n\n原始错误: {jsonEx.Message}", jsonEx);
                     }
                 }
@@ -366,7 +194,7 @@ namespace AutoUnpackTool
                     WriteIndented = true
                 });
                 File.WriteAllText(ConfigPath, json);
-                
+
                 // 验证是否保存成功
                 if (!File.Exists(ConfigPath))
                 {
@@ -412,7 +240,7 @@ namespace AutoUnpackTool
             {
                 string[] lines = File.ReadAllLines(PasswordFilePath);
                 var passwords = new List<PasswordEntry>();
-                
+
                 foreach (string line in lines)
                 {
                     string trimmed = line.Trim();
@@ -422,27 +250,27 @@ namespace AutoUnpackTool
                         string password = trimmed;
                         int usageCount = 0;
                         DateTime lastUsedTime = DateTime.MinValue;
-                        
+
                         // 尝试分割密码、使用次数和时间戳
                         string[] parts = trimmed.Split(new[] { "\t\t" }, StringSplitOptions.None);
                         if (parts.Length >= 2)
                         {
                             password = parts[0].Trim();
                             int.TryParse(parts[1].Trim(), out usageCount);
-                            
+
                             // 如果有时间戳，解析它
                             if (parts.Length >= 3 && long.TryParse(parts[2].Trim(), out long ticks))
                             {
                                 lastUsedTime = new DateTime(ticks);
                             }
                         }
-                        
+
                         // 检查是否已存在
                         if (!passwords.Any(p => p.Password == password))
                         {
-                            passwords.Add(new PasswordEntry 
-                            { 
-                                Password = password, 
+                            passwords.Add(new PasswordEntry
+                            {
+                                Password = password,
                                 UsageCount = usageCount,
                                 LastUsedTime = lastUsedTime
                             });
@@ -510,7 +338,7 @@ namespace AutoUnpackTool
                     if (parts.Length >= 1)
                     {
                         password = parts[0].Trim();
-                        
+
                         if (parts.Length >= 2)
                         {
                             int.TryParse(parts[1].Trim(), out usageCount);
@@ -555,12 +383,12 @@ namespace AutoUnpackTool
                 {
                     // 重新排序
                     PermanentPasswords = PermanentPasswords.OrderByDescending(p => p.Score).ToList();
-                    
+
                     // 自动保存到配置文件
                     Console.WriteLine($"正在保存配置文件: {ConfigPath}");
                     Save();
                     Console.WriteLine($"配置文件保存成功");
-                    
+
                     // 验证保存结果
                     if (File.Exists(ConfigPath))
                     {
@@ -574,7 +402,7 @@ namespace AutoUnpackTool
                             Console.WriteLine("✗ 警告: PermanentPasswords 未找到在配置文件中");
                         }
                     }
-                    
+
                     return $"导入成功！\n\n" +
                            $"新增密码: {importedCount} 个\n" +
                            $"跳过重复: {skippedCount} 个\n" +
@@ -645,13 +473,13 @@ namespace AutoUnpackTool
             {
                 // 新添加的密码给予高初始评分，确保排在最前面
                 // 设置一个虚拟的"最近使用时间"，让它优先测试
-                var entry = new PasswordEntry 
-                { 
-                    Password = password, 
+                var entry = new PasswordEntry
+                {
+                    Password = password,
                     UsageCount = usageCount,
                     LastUsedTime = DateTime.Now // 设置为当前时间，确保高评分
                 };
-                
+
                 // 插入到列表开头
                 PermanentPasswords.Insert(0, entry);
             }
@@ -681,7 +509,7 @@ namespace AutoUnpackTool
             {
                 entry.UsageCount++;
                 entry.LastUsedTime = DateTime.Now;
-                
+
                 // 重新排序（按综合评分）
                 PermanentPasswords = PermanentPasswords.OrderByDescending(p => p.Score).ToList();
             }
@@ -702,7 +530,7 @@ namespace AutoUnpackTool
             {
                 // 按综合评分排序后保存
                 var sortedPasswords = PermanentPasswords.OrderByDescending(p => p.Score).ToList();
-                var lines = sortedPasswords.Select(p => 
+                var lines = sortedPasswords.Select(p =>
                     $"{p.Password}\t\t{p.UsageCount}\t\t{p.LastUsedTime.Ticks}").ToList();
                 File.WriteAllLines(PasswordFilePath, lines);
             }
@@ -730,7 +558,7 @@ namespace AutoUnpackTool
             }
             return extensions;
         }
-        
+
         /// <summary>
         /// 获取需要排除的文件扩展名列表
         /// </summary>

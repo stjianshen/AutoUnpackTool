@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AutoUnpackTool.Core</RootNamespace>
+    <AssemblyName>AutoUnpackTool.Core</AssemblyName>
+    <!-- 抑制 NU1510 警告，因为 System.Text.Encoding.CodePages 是必需的 -->
+    <NoWarn>$(NoWarn);NU1510</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 代码页编码器支持（用于 GBK 等编码） -->
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.5" />
+  </ItemGroup>
+
+</Project>
