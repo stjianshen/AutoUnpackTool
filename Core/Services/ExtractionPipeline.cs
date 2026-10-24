@@ -549,8 +549,8 @@ namespace AutoUnpackTool.Core.Services
                 // 只有 noPasswordSuccess = false 且密码本测试也失败才算“未找到密码”
                 if (noPasswordSuccess)
                 {
-                    // 无密码测试成功
-                    fileItem.Status = "解压成功(无密码)";
+                    // 无密码测试成功：同样只是拿到入队资格，解压尚未发生，用非终态文案
+                    fileItem.Status = "正在解压...";
                     
                     // 加入待解压队列
                     _extractQueue.Enqueue(fileItem);
