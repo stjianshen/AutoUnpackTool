@@ -1,0 +1,145 @@
+<ui:FluentWindow x:Class="AutoUnpackTool.HelpDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+        Title="使用说明" Width="760" Height="640"
+        WindowStartupLocation="CenterOwner"
+        ExtendsContentIntoTitleBar="True"
+        WindowBackdropType="Mica"
+        WindowCornerPreference="Round">
+    <DockPanel>
+        <ui:TitleBar DockPanel.Dock="Top" Title="使用说明" Height="36"/>
+
+        <!-- 底部按钮栏 -->
+        <Border DockPanel.Dock="Bottom" Padding="20,10,20,16">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <ui:Button x:Name="BtnClose" Content="关闭" Width="100" Height="32" Appearance="Primary" Click="CloseButton_Click"/>
+            </StackPanel>
+        </Border>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20,6,20,10">
+            <StackPanel>
+                <TextBlock Text="自动解压工具 · 使用说明" FontSize="20" FontWeight="Bold"
+                           Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" Margin="0,0,0,4"/>
+                <TextBlock Text="基于密码本自动测试并解压加密压缩包，支持递归解压、分卷、隐写容器与智能路径整理。"
+                           TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,14"/>
+
+                <!-- 快速上手 -->
+                <Expander Header="快速上手（三步）" IsExpanded="True" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6">
+                            <Run Text="1. 配置解压引擎："/><Run FontWeight="SemiBold" Text="软件设置"/></TextBlock>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,2" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Text="     首次使用必须在「软件设置」中指定 7z.exe 路径（7-Zip 安装目录下，默认 C:\Program Files\7-Zip\7z.exe），保存后生效。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6">
+                            <Run Text="2. 选择输出目录：点击「选择目录」，确定解压结果的保存位置。"/></TextBlock>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,2">
+                            <Run Text="3. 拖入文件：把压缩包或包含压缩包的文件夹直接拖拽到窗口。"/></TextBlock>
+                        <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Text="     勾选「自动解压」后拖入即自动开始；否则点击主操作按钮（开始/暂停/继续）手动控制。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 解压模式与控制 -->
+                <Expander Header="解压模式与控制" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 手动解压 / 自动解压：自动模式下拖入文件立即排队并开始；手动模式需点击主操作按钮启动。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 主操作按钮：随状态自动切换为 开始 / 暂停 / 继续，便于中途控制整体流程。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 强制解压模式(跳过检测)：勾选后对拖入文件跳过类型检测直接尝试解压，用于识别不了的非常规文件。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 最大解压层数：限制递归解压深度（不限制 / 1 / 2 / 3 / 5 / 10 层），防止异常嵌套导致无限展开。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 智能识别 -->
+                <Expander Header="智能识别与递归解压" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 直接拖入的单个文件视为「确认压缩包」，不受排除后缀列表拦截；排除列表仅作用于文件夹扫描与解压产物。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 文件类型以魔术数（文件头）为准，即使把 .exe 改名、或给文本文件加 .rar 后缀也能被识别或识破。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 递归解压：解压产物中若发现新的压缩包，会继续测试并解压，直到达到最大层数或无新包。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 分卷压缩包（.part1.rar、.7z.001 等）会自动归并为一个条目统一处理。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 密码本 -->
+                <Expander Header="密码本与自动测试" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 编辑密码：管理「永久密码」与「一次性密码」。程序按密码本依次尝试，命中后记住该密码以加速同类包。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 密码本文件：可在「软件设置」中指定一个 TXT 文件（每行一个密码）批量导入。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 未命中任何密码的加密包会被跳过并在日志与节点状态中标注。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 隐写容器 -->
+                <Expander Header="隐写容器（媒体文件内嵌压缩包）" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 开启后对 .mp4/.mkv/.webm 等媒体文件探测内部是否隐藏压缩包。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 命中的隐写容器按字节区间裁剪出真实压缩包再解压，避免产生无意义碎片；设文件大小下限过滤误报。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 黑名单 -->
+                <Expander Header="黑名单过滤" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 「启用黑名单」勾选后，命中规则的推广/广告文件在收集与解压产物阶段都会被删除。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 规则在「软件设置」中管理，支持通配符（* ?）与正则；删除带占用重试，避免句柄未释放失败。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 智能路径 -->
+                <Expander Header="智能路径与输出重名" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 智能路径（扁平化）：解压完成后自动合并「单子目录」，去掉多余的嵌套层级，右侧「最终路径」显示结果位置。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 输出产物重名策略：在「软件设置 → 基础设置」中选择覆盖/保留两者/自动改名等处理方式。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 界面 -->
+                <Expander Header="界面、日志与主题" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 左侧文件树：显示每个任务及其子包的实时状态；选中节点可把右侧日志过滤到该节点。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="· 底部状态栏：显示测试/解压线程状态、解压进度百分比与当前正在测试的密码。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="· 界面主题：跟随系统 / 浅色 / 深色，可在「软件设置」中切换，Windows 深浅色变化可实时同步。"/>
+                    </StackPanel>
+                </Expander>
+
+                <!-- 配置与常见问题 -->
+                <Expander Header="配置文件位置与常见问题" IsExpanded="False" Margin="0,0,0,8">
+                    <StackPanel Margin="12,10,0,4">
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6">
+                            <Run Text="配置文件："/><Run FontFamily="Consolas" Text="%APPDATA%\AutoUnpackTool\settings.json"/></TextBlock>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="Q：无法解压？ A：确认 7z.exe 路径正确、输出目录有写入权限、压缩包未损坏。"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                                   Text="Q：支持哪些格式？ A：7-Zip 支持的格式均可，如 7Z / ZIP / RAR / CAB / GZIP / BZIP2 / TAR / XZ / ZSTD 等。"/>
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="Q：拖入文件夹？ A：会扫描其中所有压缩包并逐个处理；文件夹内文件仍受排除后缀列表约束。"/>
+                    </StackPanel>
+                </Expander>
+
+                <TextBlock TextWrapping="Wrap" Margin="0,10,0,0" FontSize="11"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                           Text="提示：大文件解压耗时较长请耐心等待；首次使用建议先用不重要的文件试跑，熟悉流程。"/>
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</ui:FluentWindow>

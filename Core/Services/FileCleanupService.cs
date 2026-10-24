@@ -20,12 +20,14 @@ namespace AutoUnpackTool.Core.Services
         private readonly AppSettings _settings;
         private readonly IAppLogger _logger;
         private readonly ConflictResolver _conflicts;
+        private readonly FileOperationService _fileOps;
 
-        public FileCleanupService(AppSettings settings, IAppLogger logger, ConflictResolver conflicts)
+        public FileCleanupService(AppSettings settings, IAppLogger logger, ConflictResolver conflicts, FileOperationService fileOps)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _conflicts = conflicts ?? throw new ArgumentNullException(nameof(conflicts));
+            _fileOps = fileOps ?? throw new ArgumentNullException(nameof(fileOps));
         }
         
         /// <summary>
@@ -139,45 +141,21 @@ namespace AutoUnpackTool.Core.Services
         /// </summary>
         public async Task DeleteFilePermanentlyAsync(string filePath)
         {
-            for (int i = 0; i < 5; i++)
+            if (!File.Exists(filePath))
+                return;
+
+            // 统一走 FileOperationService：5 次尝试，每轮先等待解锁(8s)，失败随机退避(1~3s)
+            var policy = new DeleteRetryPolicy
             {
-                try
-                {
-                    if (!File.Exists(filePath))
-                        return;
-                    
-                    bool unlocked = await WaitForFileUnlock(filePath, 8000);
-                    if (!unlocked)
-                    {
-                        int randomWait = Random.Shared.Next(1000, 3001);
-                        _logger.Log($"  文件仍在占用中，等待 {randomWait / 1000.0:F1} 秒后重试 ({i + 1}/5): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                        await Task.Delay(randomWait);
-                        continue;
-                    }
-                    
-                    await Task.Run(() => File.Delete(filePath));
-                    _logger.Log($"  子压缩包已删除: {Path.GetFileName(filePath)}", ConsoleColor.Gray);
-                    return;
-                }
-                catch (IOException ex)
-                {
-                    if (i < 4)
-                    {
-                        int randomWait = Random.Shared.Next(1000, 3001);
-                        _logger.Log($"  删除失败 ({ex.Message})，等待 {randomWait / 1000.0:F1} 秒后重试 ({i + 1}/5): {Path.GetFileName(filePath)}", ConsoleColor.Yellow);
-                        await Task.Delay(randomWait);
-                    }
-                    else
-                    {
-                        _logger.Log($"  删除失败（多次重试后仍失败）: {Path.GetFileName(filePath)}", ConsoleColor.Red);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.Log($"  删除子压缩包出错: {Path.GetFileName(filePath)}: {ex.Message}", ConsoleColor.Red);
-                    return;
-                }
-            }
+                MaxRetries = 5,
+                Backoff = BackoffKind.Random,
+                BaseDelayMs = 1000,
+                UnlockTimeoutMs = 8000,
+                LogPrefix = "  "
+            };
+            bool ok = await _fileOps.DeleteWithRetryAsync(filePath, policy);
+            if (ok)
+                _logger.Log($"  子压缩包已删除: {Path.GetFileName(filePath)}", ConsoleColor.Gray);
         }
 
 
@@ -460,35 +438,7 @@ namespace AutoUnpackTool.Core.Services
         /// <param name="timeoutMs">超时时间（毫秒）</param>
         /// <returns>true=文件已解锁, false=超时</returns>
         public async Task<bool> WaitForFileUnlock(string filePath, int timeoutMs)
-        {
-            int waited = 0;
-            int interval = 100; // 每100ms检查一次
-
-            while (waited < timeoutMs)
-            {
-                try
-                {
-                    // 独占读即可检测占用；ReadWrite 在只读属性/ACL 上会失败，导致误判未解锁而跳过清理
-                    using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None))
-                    {
-                        return true; // 成功打开，文件已解锁
-                    }
-                }
-                catch (IOException)
-                {
-                    // 文件被占用，等待后重试
-                    await Task.Delay(interval);
-                    waited += interval;
-                }
-                catch
-                {
-                    // 其他错误（如文件不存在），认为已解锁
-                    return true;
-                }
-            }
-
-            return false; // 超时
-        }
+            => await _fileOps.WaitForUnlockAsync(filePath, timeoutMs);
 
         /// <summary>
         /// 删除所有分卷
@@ -504,38 +454,19 @@ namespace AutoUnpackTool.Core.Services
                 {
                     if (File.Exists(volumePath))
                     {
-                        // 等待文件解锁（每次等待5秒，符合规范）
-                        if (!await WaitForFileUnlock(volumePath, 5000))
+                        // 统一走 FileOperationService：3 次尝试，每轮先等待解锁(5s)，失败线性退避(1s,2s)
+                        var policy = new DeleteRetryPolicy
                         {
-                            _logger.Log($"  警告：分卷文件仍在占用中: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                            continue;
-                        }
-
-                        bool success = false;
-                        int retryCount = 3;
-                        for (int i = 0; i < retryCount; i++)
-                        {
-                            try
-                            {
-                                await Task.Run(() => File.Delete(volumePath));
-                                success = true;
-                                break;
-                            }
-                            catch (IOException) when (i < retryCount - 1)
-                            {
-                                _logger.Log($"  分卷文件被占用，等待后重试 ({i + 1}/{retryCount}): {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
-                                await Task.Delay(1000 * (i + 1));
-                            }
-                        }
-
-                        if (success)
+                            MaxRetries = 3,
+                            Backoff = BackoffKind.Linear,
+                            BaseDelayMs = 1000,
+                            UnlockTimeoutMs = 5000,
+                            LogPrefix = "  "
+                        };
+                        if (await _fileOps.DeleteWithRetryAsync(volumePath, policy))
                         {
                             _logger.Log($"  已删除分卷: {Path.GetFileName(volumePath)}", ConsoleColor.Yellow);
                             deletedCount++;
-                        }
-                        else
-                        {
-                            _logger.Log($"  删除分卷失败（多次重试后仍被占用）: {Path.GetFileName(volumePath)}", ConsoleColor.Red);
                         }
                     }
                 }

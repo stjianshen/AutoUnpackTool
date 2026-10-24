@@ -30,6 +30,9 @@ namespace AutoUnpackTool.Core.Services
         private readonly SmartPathService _smartPath;
         private readonly ConflictResolver _conflicts;
         private readonly VolumeDetector _volumeDetector;
+        private readonly FileOperationService _fileOps;
+        private readonly SevenZipExtractorFactory _extractorFactory;
+        private readonly DroppedFolderService _droppedFolders;
 
         // ---- 共享状态（原 MainWindow 字段，保持原名以让方法体逐行不变） ----
         private ConcurrentQueue<FileItem> _pendingQueue = new();
@@ -45,10 +48,7 @@ namespace AutoUnpackTool.Core.Services
         private bool _isPaused = false;
         private TaskCompletionSource<bool> _testCompletionSource = new();
         private TaskCompletionSource<bool> _extractCompletionSource = new();
-        private List<FileItem> _topLevelItems = new();
         private PasswordMap _passwordMap = new();
-        private HashSet<string> _droppedFolders = new(StringComparer.OrdinalIgnoreCase);
-        private readonly SemaphoreSlim _smartPathFinalizeLock = new(1, 1);
         private readonly HashSet<string> _finalizingTopArchives = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _threadStateLock = new();
         private ObservableCollection<FileItem> _fileList = null!;
@@ -64,7 +64,10 @@ namespace AutoUnpackTool.Core.Services
             FileCleanupService cleanup,
             SmartPathService smartPath,
             VolumeDetector volumeDetector,
-            ConflictResolver conflicts)
+            ConflictResolver conflicts,
+            FileOperationService fileOps,
+            SevenZipExtractorFactory extractorFactory,
+            DroppedFolderService droppedFolders)
         {
             _settings = settings;
             _logger = logger;
@@ -77,6 +80,9 @@ namespace AutoUnpackTool.Core.Services
             _smartPath = smartPath;
             _volumeDetector = volumeDetector;
             _conflicts = conflicts;
+            _fileOps = fileOps;
+            _extractorFactory = extractorFactory;
+            _droppedFolders = droppedFolders;
         }
 
         /// <summary>绑定文件树集合（必须在窗口构造时调用；集合实例不做替换）</summary>
@@ -98,10 +104,7 @@ namespace AutoUnpackTool.Core.Services
         public CancellationTokenSource? GlobalCancellationSource { get => _globalCancellationTokenSource; set => _globalCancellationTokenSource = value; }
         public TaskCompletionSource<bool> TestCompletionSource { get => _testCompletionSource; set => _testCompletionSource = value; }
         public TaskCompletionSource<bool> ExtractCompletionSource { get => _extractCompletionSource; set => _extractCompletionSource = value; }
-        public List<FileItem> TopLevelItems => _topLevelItems;
         public PasswordMap PasswordMap { get => _passwordMap; set => _passwordMap = value; }
-        public HashSet<string> DroppedFolders => _droppedFolders;
-        public SemaphoreSlim SmartPathFinalizeLock => _smartPathFinalizeLock;
         public HashSet<string> FinalizingTopArchives => _finalizingTopArchives;
         public object ThreadStateLock => _threadStateLock;
 
@@ -216,7 +219,7 @@ namespace AutoUnpackTool.Core.Services
                 _ui.OnThreadState(_isTesting, _isExtracting, _isPaused);
                 _logger.Log($"\n========== 测试线程启动 ==========", ConsoleColor.Cyan);
 
-                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
+                var extractor = _extractorFactory.Create();
 
                 _logger.Log($"加载密码本: 共 {_settings.PermanentPasswords.Count} 个永久密码 + {_settings.OneTimePasswords.Count} 个一次性密码", ConsoleColor.Cyan);
 
@@ -254,7 +257,7 @@ namespace AutoUnpackTool.Core.Services
                         catch (Exception ex)
                         {
                             _logger.Diag($"[DIAG] 测试文件异常: {fileItem.FileName}: {ex.GetType().Name}: {ex.Message}");
-                            _ui.InvokeOnUi(() => fileItem.Status = $"测试异常: {ex.Message}");
+                            _ui.SetStatusOnUiThread(fileItem, $"测试异常: {ex.Message}");
                             _logger.Log($"[{fileItem.FileName}] 测试异常: {ex.Message}", ConsoleColor.Red);
                         }
                     }
@@ -346,7 +349,7 @@ namespace AutoUnpackTool.Core.Services
             // 检查层数限制（0表示不限制）
             if (_settings.MaxExtractDepth > 0 && fileItem.CurrentDepth > _settings.MaxExtractDepth)
             {
-                _ui.InvokeOnUi(() => fileItem.Status = $"跳过: 超过最大层数({_settings.MaxExtractDepth})");
+                _ui.SetStatusOnUiThread(fileItem, $"跳过: 超过最大层数({_settings.MaxExtractDepth})");
                 _logger.Log($"[{fileItem.FileName}] 当前层数 {fileItem.CurrentDepth} 超过最大层数 {_settings.MaxExtractDepth}，跳过处理", ConsoleColor.Yellow, fileItem);
                 
                 // 检查父项完成（传入子节点）
@@ -357,17 +360,15 @@ namespace AutoUnpackTool.Core.Services
                 return;
             }
             
-            _ui.InvokeOnUi(() => fileItem.Status = "正在测试密码...");
+            _ui.SetStatusOnUiThread(fileItem, "正在测试密码...");
 
-            // 步骤1：判断是否是压缩文件
-            // 有父节点的文件是解压过程中发现的（非用户直接拖入），isDroppedFile 应为 false
-            bool isDroppedFile = fileItem.Parent == null;
-            bool isArchive = _detector.IsArchiveFile(fileItem.FilePath, isDroppedFile: isDroppedFile);
+            // 步骤1：判断是否是压缩文件（按文件来源统一判定：拖入文件跳过排除列表，解压产物强制魔术数验证）
+            bool isArchive = _detector.IsArchiveFile(fileItem.FilePath, origin: fileItem.Origin);
             _logger.Log($"[DEBUG-测试] {fileItem.FileName} IsArchiveFile 结果: {isArchive}", ConsoleColor.Magenta, fileItem);
             
             if (!isArchive)
             {
-                _ui.InvokeOnUi(() => fileItem.Status = "非压缩文件，跳过");
+                _ui.SetStatusOnUiThread(fileItem, "非压缩文件，跳过");
                 _logger.Log($"[DEBUG-测试] {fileItem.FileName} 被判定为非压缩文件", ConsoleColor.Yellow, fileItem);
                 
                 // 检查父项完成（传入子节点）
@@ -537,7 +538,7 @@ namespace AutoUnpackTool.Core.Services
                 _logger.Log($"\n========== 解压线程启动 ==========", ConsoleColor.Cyan);
                 _logger.Log($"并发线程数: {_settings.ThreadCount}", ConsoleColor.Cyan);
 
-                var extractor = new SevenZipExtractor(_settings.SevenZipPath);
+                var extractor = _extractorFactory.Create();
                 var tasks = new List<Task>();
 
                 // 创建多个并发任务
@@ -788,54 +789,10 @@ namespace AutoUnpackTool.Core.Services
                     // 更新状态栏为“未开始”
                     _ui.OnIdleStatus();
                     
-                    // 对拖入的文件夹进行智能路径处理（即使没有压缩包）
-                    if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
-                    {
-                        _logger.Log($"[智能路径] 开始处理拖入的文件夹（{_droppedFolders.Count} 个）...", ConsoleColor.Cyan);
-                        
-                        // 使用 Task.Run 在后台处理，不阻塞主流程
-                        var folders = _droppedFolders.ToList();
-                        _droppedFolders.Clear();
-                        
-                        _ = Task.Run(async () =>
-                        {
-                            // 【并发修复】持锁串行执行，避免与解压收尾流程并发移动同一目录树
-                            await _smartPathFinalizeLock.WaitAsync();
-                            try
-                            {
-                                foreach (var folder in folders)
-                                {
-                                    if (Directory.Exists(folder))
-                                    {
-                                        try
-                                        {
-                                            _logger.Log($"[智能路径] 处理拖入的文件夹: {folder}", ConsoleColor.Cyan);
-                                            await _smartPath.ProcessSmartPathBatchAsync(folder);
-                                            
-                                            // 更新最终路径显示
-                                            string? finalPath = _smartPath.FindFinalFlattenedPath(folder);
-                                            _ui.OnFinalPath(finalPath ?? folder);
-                                            _logger.Log($"[智能路径] 文件夹最终路径: {finalPath ?? folder}", ConsoleColor.Green);
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            _logger.Log($"[智能路径] 处理文件夹失败 {folder}: {ex.Message}", ConsoleColor.Red);
-                                        }
-                                    }
-                                }
-                                
-                                // 智能路径处理完成后，更新状态
-                                _ui.InvokeOnUi(() =>
-                                {
-                                    _logger.Log($"[智能路径] 所有拖入文件夹处理完成", ConsoleColor.Green);
-                                });
-                            }
-                            finally
-                            {
-                                _smartPathFinalizeLock.Release();
-                            }
-                        });
-                    }
+                    // 对拖入的文件夹做智能路径收尾（含没扫到压缩包的那些）。
+                    // 双队列已退出、状态栏已复位，这里不需要再等空闲；
+                    // 具体条件判断、快照、串行锁与异常隔离都在 DroppedFolderService 里（唯一实现）。
+                    _droppedFolders.ScheduleFinalize("处理流程完成", isBusy: false);
                 }
             }
             catch (Exception ex)
@@ -886,6 +843,8 @@ namespace AutoUnpackTool.Core.Services
 
         /// <summary>
         /// 【并发修复】在 UI 线程上获取顶级列表快照（不含子节点）。
+        /// 顶级项就存在 _fileList（RootNode.Children）里，子节点挂在各 FileItem.Children 下，
+        /// 所以这里直接快照 _fileList 即等于快照全部顶级项。
         /// 用于后台线程需要按顶级项过滤的场景。
         /// </summary>
         public List<FileItem> SnapshotTopLevelItems()
@@ -1085,7 +1044,7 @@ namespace AutoUnpackTool.Core.Services
             // 【并发修复】收尾流程全程持锁串行执行：多个顶级文件并发完成时，
             // 阶段1-4 涉及共享集合（_extractedDirectoryNodes/_processedFlattenDirs）与目录移动，
             // 并发执行会互相干扰：移动中断（图片没移动完成）、目录冲突生成 GUID 新目录。
-            await _smartPathFinalizeLock.WaitAsync();
+            await _smartPath.FinalizeLock.WaitAsync();
             _logger.Diag("[DIAG] Finalize 已获取收尾锁");
             try
             {
@@ -1093,7 +1052,7 @@ namespace AutoUnpackTool.Core.Services
             }
             finally
             {
-                _smartPathFinalizeLock.Release();
+                _smartPath.FinalizeLock.Release();
                 lock (_finalizingTopArchives)
                 {
                     _finalizingTopArchives.Remove(topArchivePath);
@@ -1102,7 +1061,7 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 顶级解压链收尾的核心实现（调用方已持有 _smartPathFinalizeLock 串行化锁，保证不会并发执行）
+        /// 顶级解压链收尾的核心实现（调用方已持有 SmartPathService.FinalizeLock 串行化锁，保证不会并发执行）
         /// </summary>
         public async Task FinalizeTopLevelExtractAndSmartPathCoreAsync(string topArchivePath)
         {
@@ -1219,11 +1178,8 @@ namespace AutoUnpackTool.Core.Services
                             }
                             
                             // 删除已清空的子目录
-                            if (Directory.Exists(soleSubDir))
-                            {
-                                Directory.Delete(soleSubDir);
+                            if (_fileOps.TryDeleteEmptyDirectory(soleSubDir))
                                 _logger.Log($"[阶段4]   已删除空子目录: {Path.GetFileName(soleSubDir)}", ConsoleColor.Gray);
-                            }
                         });
                         _logger.Log($"[阶段4] 归档父目录合并完成: {archiveParentDir}", ConsoleColor.Cyan);
                     }
@@ -1246,22 +1202,18 @@ namespace AutoUnpackTool.Core.Services
             try
             {
                 string outputDir = _detector.GetOutputDirectory(topArchivePath);
-                if (Directory.Exists(outputDir))
+                if (_fileOps.TryDeleteEmptyDirectory(outputDir))
                 {
-                    if (!Directory.EnumerateFileSystemEntries(outputDir).Any())
+                    _logger.Log($"  已清理空输出目录: {Path.GetFileName(outputDir)}", ConsoleColor.Gray);
+                }
+                else if (Directory.Exists(outputDir))
+                {
+                    _logger.Log($"[批量智能路径] [DEBUG] 输出目录非空，保留: {outputDir}", ConsoleColor.Gray);
+                    foreach (var entry in Directory.EnumerateFileSystemEntries(outputDir))
                     {
-                        Directory.Delete(outputDir);
-                        _logger.Log($"  已清理空输出目录: {Path.GetFileName(outputDir)}", ConsoleColor.Gray);
-                    }
-                    else
-                    {
-                        _logger.Log($"[批量智能路径] [DEBUG] 输出目录非空，保留: {outputDir}", ConsoleColor.Gray);
-                        foreach (var entry in Directory.EnumerateFileSystemEntries(outputDir))
-                        {
-                            string entryName = Path.GetFileName(entry);
-                            bool isDir = Directory.Exists(entry);
-                            _logger.Log($"[批量智能路径]   残留: {(isDir ? "[DIR]" : "[FILE]")} {entryName}", ConsoleColor.Gray);
-                        }
+                        string entryName = Path.GetFileName(entry);
+                        bool isDir = Directory.Exists(entry);
+                        _logger.Log($"[批量智能路径]   残留: {(isDir ? "[DIR]" : "[FILE]")} {entryName}", ConsoleColor.Gray);
                     }
                 }
             }
@@ -1289,7 +1241,7 @@ namespace AutoUnpackTool.Core.Services
             // 从密码映射表获取密码
             if (!_passwordMap.TryGetValue(fileItem.FilePath, out var password))
             {
-                _ui.InvokeOnUi(() => fileItem.Status = "跳过: 未找到密码");
+                _ui.SetStatusOnUiThread(fileItem, "跳过: 未找到密码");
                 
                 // 如果没有密码，检查父项是否可以完成（传入子节点）
                 if (fileItem.Parent != null)
@@ -1304,27 +1256,14 @@ namespace AutoUnpackTool.Core.Services
                 return;
             }
 
-            _ui.InvokeOnUi(() => fileItem.Status = "正在解压...");
+            _ui.SetStatusOnUiThread(fileItem, "正在解压...");
             
             string outputDir = _detector.GetOutputDirectory(fileItem.FilePath);
             
             // 在解压前记录输出目录中已存在的文件列表（用于过滤隐写文件解压时误添加已存在的压缩包）
-            HashSet<string> existingFilesBeforeExtract = new HashSet<string>();
-            if (Directory.Exists(outputDir))
-            {
-                try
-                {
-                    var allFiles = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories);
-                    foreach (var f in allFiles)
-                    {
-                        existingFilesBeforeExtract.Add(f);
-                    }
-                }
-                catch
-                {
-                    // 忽略访问权限等问题
-                }
-            }
+            HashSet<string> existingFilesBeforeExtract = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in _fileOps.EnumerateFilesSafe(outputDir, "*.*", allDirectories: true))
+                existingFilesBeforeExtract.Add(f);
             
             // 记录觧压目录用于调试
             bool isStego = _stego.IsStegoDetectionActiveForFile(fileItem.FilePath);
@@ -1345,10 +1284,12 @@ namespace AutoUnpackTool.Core.Services
 
             try
             {
-                (bool Success, string Message) result;
+                (bool Success, string Message, int ExitCode) result;
                 if (stegoCarveMode)
                 {
-                    result = await Task.Run(() => _stego.CarveStegoPayloads(fileItem.FilePath, outputDir, taskId, token), token);
+                    var carve = await Task.Run(() => _stego.CarveStegoPayloads(fileItem.FilePath, outputDir, taskId, token), token);
+                    // 裁剪模式无 7z 退出码：成功记 0、失败记 2（按完整成功/失败处理，不走部分成功分支）
+                    result = (carve.Success, carve.Message, carve.Success ? 0 : 2);
                 }
                 else
                 {
@@ -1368,6 +1309,10 @@ namespace AutoUnpackTool.Core.Services
 
                 if (result.Success)
                 {
+                    // 退出码 1 = 7z 警告（非致命）：视为部分成功，产物已落盘，记录告警后继续处理
+                    if (result.ExitCode == 1)
+                        _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 解压返回警告(退出码1)，按部分成功继续处理", ConsoleColor.Yellow, fileItem);
+
                     // 重置进度条
                     _ui.OnExtractProgress(0);
                     
@@ -1394,6 +1339,15 @@ namespace AutoUnpackTool.Core.Services
 
                     // 添加短暂延迟，让7z.exe进程完全释放文件句柄
                     await Task.Delay(500);
+
+                    // 空产物校验：成功但输出目录无新文件时告警（识别"解压成功但无内容"）
+                    if (Directory.Exists(outputDir))
+                    {
+                        int newFileCount = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories)
+                            .Count(f => !existingFilesBeforeExtract.Contains(f));
+                        if (newFileCount == 0)
+                            _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 解压成功但未产生任何新文件（空压缩包？）", ConsoleColor.Yellow, fileItem);
+                    }
 
                     // 先检查解压后的文件是否包含新的压缩文件
                     // 这会添加子项到 fileItem.Children，并将新文件加入待处理队列
@@ -1423,12 +1377,12 @@ namespace AutoUnpackTool.Core.Services
                                 foreach (var f in topFiles)
                                 {
                                     string fName = Path.GetFileName(f);
-                                    if (whitelist.Contains(fName))
+                                    if (StegoService.IsInWhitelist(whitelist, outputDir, f))
                                         continue;
-                                    if (!_detector.IsArchiveFile(f, false, isDroppedFile: false))
+                                    if (_detector.Classify(f, FileOrigin.ExtractedArtifact) == ArchiveDetector.ArchiveKind.NotArchive)
                                     {
                                         _logger.Log($"[线程 {taskId}] [残留清理] 删除非压缩包残留: {fName}", ConsoleColor.Yellow, fileItem);
-                                        try { File.Delete(f); } catch { }
+                                        _fileOps.TryDelete(f);
                                     }
                                 }
                             }
@@ -1460,7 +1414,7 @@ namespace AutoUnpackTool.Core.Services
                     // 重置进度条
                     _ui.OnExtractProgress(0);
                     
-                    _ui.InvokeOnUi(() => fileItem.Status = $"压失败: {result.Message}");
+                    _ui.SetStatusOnUiThread(fileItem, $"压失败: {result.Message}");
                     _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 觧压失败 - {result.Message}", ConsoleColor.Red, fileItem);
                     
                     // 标记自身解压失败
@@ -1479,7 +1433,7 @@ namespace AutoUnpackTool.Core.Services
             }
             catch (OperationCanceledException)
             {
-                _ui.InvokeOnUi(() => fileItem.Status = "已取消");
+                _ui.SetStatusOnUiThread(fileItem, "已取消");
                 _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 已取消", ConsoleColor.Yellow, fileItem);
                 
                 // 取消时也需要检查父项状态（传入子节点）
@@ -1495,7 +1449,7 @@ namespace AutoUnpackTool.Core.Services
             }
             catch (Exception ex)
             {
-                _ui.InvokeOnUi(() => fileItem.Status = $"异常: {ex.Message}");
+                _ui.SetStatusOnUiThread(fileItem, $"异常: {ex.Message}");
                 _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 异常 - {ex.Message}", ConsoleColor.Red, fileItem);
                 
                 // 异常时也需要检查父项状态（传入子节点）
@@ -1574,7 +1528,6 @@ namespace AutoUnpackTool.Core.Services
                 }
             
                 // 先收集输出目录中所有文件，过滤掉解压前已存在的文件，只对新解压的文件做压缩包检测
-                var archiveExtensions = _settings.GetArchiveExtensions();
                 var allArchiveFiles = new List<string>();
 
                 // 获取输出目录中所有文件
@@ -1596,20 +1549,12 @@ namespace AutoUnpackTool.Core.Services
                 // 【防和谐清理】解压发现的嵌套文件也可能带防和谐脏名，检测前先清理
                 filesToScan = _archiveNameCleaner.CleanDirtyArchiveFileNames(filesToScan);
 
-                // 只对新解压的文件进行压缩包检测
+                // 统一对新解压的文件走 Classify 判定
                 foreach (var file in filesToScan)
                 {
-                    // 1. 先检查扩展名（快速路径）
-                    string ext = Path.GetExtension(file).ToLowerInvariant();
-                    if (archiveExtensions.Contains(ext) || _volumeDetector.IsMultiVolumeArchive(file))
-                    {
-                        allArchiveFiles.Add(file);
-                        continue;
-                    }
-
-                    // 2. 使用魔术数检测（不依赖扩展名，仅在非扩展名匹配时使用）
-                    // 注意：解压后发现的文件不受强制模式影响，始终进行正常检测
-                    if (_detector.IsArchiveFile(file, false, isDroppedFile: false))
+                    // 解压产物即使扩展名命中也强制魔术数验证（修复伪装后缀），
+                    // 且不再作为隐写容器（递归发现的媒体文件是最终产物）
+                    if (_detector.Classify(file, FileOrigin.ExtractedArtifact) != ArchiveDetector.ArchiveKind.NotArchive)
                     {
                         allArchiveFiles.Add(file);
                     }
@@ -1631,16 +1576,20 @@ namespace AutoUnpackTool.Core.Services
                     bool canDeleteJunk = whitelist != null && whitelist.Count > 0;
 
                     var beforeCount = allArchiveFiles.Count;
-                    var verifiedFiles = new List<string>();
-                    foreach (var f in allArchiveFiles)
+                    var verifiedFiles = new ConcurrentBag<string>();
+                    // 逐个 VerifyIsRealArchive 会串行起 7z l（15s 超时），大目录时为性能瓶颈 → 受限并行
+                    int maxParallel = Math.Max(1, _settings.ThreadCount);
+                    Parallel.ForEach(allArchiveFiles,
+                        new ParallelOptions { MaxDegreeOfParallelism = maxParallel },
+                        f =>
                     {
                         string fName = Path.GetFileName(f);
                         _logger.Log($"[线程 {taskId}] [隐写验证] 验证文件: {fName}", ConsoleColor.Gray, parentFileItem);
-                        if (whitelist != null && whitelist.Count > 0 && whitelist.Contains(fName))
+                        if (StegoService.IsInWhitelist(whitelist, outputDir, f))
                         {
                             verifiedFiles.Add(f);
                             _logger.Log($"[线程 {taskId}] [隐写验证]   ✓ 白名单通过: {fName}", ConsoleColor.Green, parentFileItem);
-                            continue;
+                            return;
                         }
                         if (_detector.VerifyIsRealArchive(f))
                         {
@@ -1653,7 +1602,7 @@ namespace AutoUnpackTool.Core.Services
                             {
                                 // 标准 7z l 验证失败 → -t# 误匹配垃圾，从磁盘删除
                                 _logger.Log($"[线程 {taskId}] [隐写验证]   ✗ 垃圾文件，删除: {fName}", ConsoleColor.Yellow, parentFileItem);
-                                try { File.Delete(f); } catch { }
+                                _fileOps.TryDelete(f);
                             }
                             else
                             {
@@ -1661,8 +1610,8 @@ namespace AutoUnpackTool.Core.Services
                                 _logger.Log($"[线程 {taskId}] [隐写验证]   ⚠ 类型未确认，保留文件（不入队）: {fName}", ConsoleColor.Yellow, parentFileItem);
                             }
                         }
-                    }
-                    allArchiveFiles = verifiedFiles;
+                    });
+                    allArchiveFiles = verifiedFiles.ToList();
                     _logger.Log($"[线程 {taskId}] [隐写验证] 过滤前: {beforeCount} → 过滤后: {allArchiveFiles.Count}", ConsoleColor.Cyan, parentFileItem);
                 }
 
@@ -1681,41 +1630,10 @@ namespace AutoUnpackTool.Core.Services
                 int addedCount = 0;
                 foreach (var archiveFile in allArchiveFiles)
                 {
-                    // 检查黑名单 - 如果是黑名单文件则直接删除，不加入处理队列
+                    // 检查黑名单 - 命中则带重试删除，不加入处理队列（删除逻辑统一下沉至 BlacklistService）
                     if (_blacklistService.IsBlacklistedFile(archiveFile, out string matchedPattern))
                     {
-                        try
-                        {
-                            // 带重试的删除操作
-                            bool deleted = false;
-                            for (int retry = 0; retry < 3; retry++)
-                            {
-                                try
-                                {
-                                    File.Delete(archiveFile);
-                                    deleted = true;
-                                    break;
-                                }
-                                catch (IOException) when (retry < 2)
-                                {
-                                    // 文件被占用，等待后重试
-                                    System.Threading.Thread.Sleep(200);
-                                }
-                            }
-                            
-                            if (deleted)
-                            {
-                                _logger.Log($"[线程 {taskId}] [黑名单] 已删除: {Path.GetFileName(archiveFile)} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
-                            }
-                            else
-                            {
-                                _logger.Log($"[线程 {taskId}] [黑名单] 删除失败: {Path.GetFileName(archiveFile)} - 文件被占用", ConsoleColor.Red);
-                            }
-                        }
-                        catch (Exception delEx)
-                        {
-                            _logger.Log($"[线程 {taskId}] [黑名单] 删除失败: {Path.GetFileName(archiveFile)} - {delEx.Message}", ConsoleColor.Red);
-                        }
+                        _blacklistService.TryDeleteWithRetry(archiveFile, matchedPattern);
                         continue;  // 跳过后续处理，不添加到列表
                     }
                     
@@ -1751,6 +1669,7 @@ namespace AutoUnpackTool.Core.Services
                                 FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length),
                                 Parent = parentFileItem,
                                 VolumeInfo = volumeInfo,  // 设置分卷信息！
+                                Origin = FileOrigin.ExtractedArtifact,
                                 CurrentDepth = parentFileItem != null ? parentFileItem.CurrentDepth + 1 : 1  // 子压缩包层数+1
                             };
 
@@ -1782,6 +1701,7 @@ namespace AutoUnpackTool.Core.Services
                         FileSize = fileInfo.Length,
                         Parent = parentFileItem,
                         TaskId = taskId,
+                        Origin = FileOrigin.ExtractedArtifact,
                         CurrentDepth = parentFileItem != null ? parentFileItem.CurrentDepth + 1 : 1  // 子压缩包层数+1
                     };
 
@@ -1992,6 +1912,40 @@ namespace AutoUnpackTool.Core.Services
                 _logger.Log("正在取消解压操作...", ConsoleColor.Yellow);
                 _extractCancellationTokenSource.Cancel();
             }
+        }
+
+        /// <summary>
+        /// 丢弃本轮运行的全部状态，回到“没有任何任务”。
+        /// 这份是唯一的清账清单：各服务只暴露一个 ResetRunState()，以后新增本轮级状态
+        /// 只需要登记在两处之一（本类字段，或对应服务的 ResetRunState），
+        /// 不再需要往宿主窗口的 ForceReset 里散着加行。
+        /// 必须在 UI 线程调用（_fileList 是界面绑定的 ObservableCollection，
+        /// FlattenedFinalPathMap / ProcessedFlattenDirs 也是普通集合）。
+        /// 刻意不收 _finalizingTopArchives：它由收尾方法的 finally 自愈，
+        /// 在这里硬清反而会在 FinalizeLock 之外放行一次重复收尾。
+        /// </summary>
+        public void ResetRunState()
+        {
+            // 任务列表与双队列
+            _fileList.Clear();
+            _pendingQueue = new ConcurrentQueue<FileItem>();
+            _extractQueue = new ConcurrentQueue<FileItem>();
+            _passwordMap = new PasswordMap();
+
+            // 本轮级标志与同步原语
+            _isTesting = false;
+            _isExtracting = false;
+            _isPaused = false;
+            _pendingQueueSignal.Reset();
+            _extractQueueSignal.Reset();
+            _testCompletionSource = new TaskCompletionSource<bool>();
+            _extractCompletionSource = new TaskCompletionSource<bool>();
+
+            // 各服务自有的本轮工作集/缓存（具体清单由它们自己维护）
+            _smartPath.ResetRunState();
+            _droppedFolders.ResetRunState();
+            _stego.ResetRunState();
+            _detector.ResetRunState();
         }
 
     }

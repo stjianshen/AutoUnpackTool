@@ -23,6 +23,7 @@ namespace AutoUnpackTool.Core.Services
         private readonly AppSettings _settings;
         private readonly IAppLogger _logger;
         private readonly ArchiveDetector _detector;
+        private readonly SevenZipRunner _runner;
 
         private readonly ConcurrentDictionary<string, string?> _stegoArchiveTypeCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, HashSet<string>> _stegoArchiveValidFilesCache = new(StringComparer.OrdinalIgnoreCase);
@@ -32,21 +33,26 @@ namespace AutoUnpackTool.Core.Services
             ".mp4", ".mkv", ".webm", ".mov", ".m4v"
         };
 
-        public StegoService(AppSettings settings, IAppLogger logger, ArchiveDetector detector)
+        public StegoService(AppSettings settings, IAppLogger logger, ArchiveDetector detector, SevenZipRunner runner)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _detector = detector ?? throw new ArgumentNullException(nameof(detector));
+            _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         }
 
-        /// <summary>清空隐写容器类型缓存（清空任务时调用）</summary>
-        public void ClearStegoArchiveTypeCache() => _stegoArchiveTypeCache.Clear();
+        /// <summary>
+        /// 丢弃本轮积累的全部隐写缓存。
+        /// 三个缓存都是“文件内容”的推断结果，文件在两轮之间可能被改过或被删，
+        /// 强制中止后一律作废比留着更便宜。新增隐写缓存时必须同步登记到这里。
+        /// </summary>
+        public void ResetRunState()
+        {
+            _stegoArchiveTypeCache.Clear();
+            _stegoArchiveValidFilesCache.Clear();
+            _stegoSubStreamCache.Clear();
+        }
 
-        /// <summary>清空隐写白名单文件缓存（清空任务时调用）</summary>
-        public void ClearStegoArchiveValidFilesCache() => _stegoArchiveValidFilesCache.Clear();
-
-        /// <summary>清空隐写子数据段缓存（清空任务时调用）</summary>
-        public void ClearStegoSubStreamCache() => _stegoSubStreamCache.Clear();
         /// 流程：
         /// 1. 先检查扩展名是否在排除列表中，如果是则直接返回 false
         /// 2. 再检查扩展名是否在包含列表中，如果是则用魔术数验证
@@ -54,7 +60,7 @@ namespace AutoUnpackTool.Core.Services
         /// </summary>
         public bool IsStegoCarrierExtension(string filePath)
         {
-            string ext = Path.GetExtension(filePath).ToLowerInvariant();
+            string ext = PathUtil.LowerExtension(filePath);
             return StegoCarrierExtensions.Contains(ext);
         }
 
@@ -100,33 +106,17 @@ namespace AutoUnpackTool.Core.Services
             HashSet<string> validFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
+                if (!_runner.IsAvailable)
                     return null;
 
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = _settings.SevenZipPath,
-                    Arguments = $"l -t# -slt -sccUTF-8 \"{filePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8
-                };
-
-                using var process = new Process { StartInfo = startInfo };
-                process.Start();
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-                bool probeExited = process.WaitForExit(15000);
+                var (probeExitCode, output, error) = _runner.RunCapture($"l -t# -slt -sccUTF-8 \"{filePath}\"");
+                bool probeExited = probeExitCode != -1;
 
                 if (!probeExited)
                 {
-                    try { process.Kill(); } catch { }
                     _logger.Log($"  [隐写探测] {Path.GetFileName(filePath)}: 探测超时，跳过", ConsoleColor.Gray);
                 }
-                else if (process.ExitCode == 0)
+                else if (probeExitCode == 0)
                 {
                     string combined = output + Environment.NewLine + error;
                     string lower = combined.ToLowerInvariant();
@@ -199,33 +189,12 @@ namespace AutoUnpackTool.Core.Services
             var empty = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
+                if (!_runner.IsAvailable)
                     return (null, empty);
 
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = _settings.SevenZipPath,
-                    Arguments = $"l -slt -sccUTF-8 \"{filePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8
-                };
+                var (exitCode, output, error) = _runner.RunCapture($"l -slt -sccUTF-8 \"{filePath}\"");
 
-                using var process = new Process { StartInfo = startInfo };
-                process.Start();
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-
-                if (!process.WaitForExit(15000))
-                {
-                    try { process.Kill(); } catch { }
-                    return (null, empty);
-                }
-
-                if (process.ExitCode != 0)
+                if (exitCode != 0)
                     return (null, empty);
 
                 string combined = output + Environment.NewLine + error;
@@ -267,15 +236,42 @@ namespace AutoUnpackTool.Core.Services
                     continue;
                 }
                 
-                // 取纯文件名
-                string fileName = Path.GetFileName(pathValue);
-                if (!string.IsNullOrEmpty(fileName))
+                // 保留归档内相对路径（统一分隔符），避免不同子目录同名文件互相误判
+                string relPath = PathUtil.NormalizeRelativePath(pathValue);
+                if (!string.IsNullOrEmpty(relPath))
                 {
-                    fileNames.Add(fileName);
+                    fileNames.Add(relPath);
                 }
             }
             
             return fileNames;
+        }
+
+        /// <summary>
+        /// 判断解压落盘文件是否命中隐写白名单：
+        /// 优先按相对路径精确匹配（避免子目录同名碰撞），
+        /// 7z 报告路径与实际落盘路径不一致时回退到纯文件名匹配（倾向于保留真实内容）。
+        /// </summary>
+        public static bool IsInWhitelist(HashSet<string>? whitelist, string outputDir, string fullPath)
+        {
+            if (whitelist == null || whitelist.Count == 0)
+                return false;
+
+            try
+            {
+                string rel = PathUtil.NormalizeRelativePath(Path.GetRelativePath(outputDir, fullPath));
+                if (rel.Length > 0 && whitelist.Contains(rel))
+                    return true;
+            }
+            catch { /* 跨卷等情况 GetRelativePath 可能抛异常，降级到文件名回退 */ }
+
+            string fn = Path.GetFileName(fullPath);
+            foreach (var w in whitelist)
+            {
+                if (string.Equals(Path.GetFileName(w), fn, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>

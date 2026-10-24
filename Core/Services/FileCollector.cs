@@ -21,13 +21,14 @@ namespace AutoUnpackTool.Core.Services
         private readonly VolumeDetector _volumeDetector;
         private readonly ArchiveNameCleaner _archiveNameCleaner;
         private readonly BlacklistService _blacklistService;
+        private readonly FileOperationService _fileOps;
         private ObservableCollection<FileItem> _fileList = null!;
 
         /// <summary>鏍硅妭鐐规爣棰橀渶瑕佸埛鏂版椂鐨勫涓诲洖璋冿紙鏍囬鏄?UI 缁戝畾鏂囨湰锛夈€?/summary>
         public Action? OnTitleChanged { get; set; }
 
         public FileCollector(AppSettings settings, IAppLogger logger, ArchiveDetector detector,
-            VolumeDetector volumeDetector, ArchiveNameCleaner archiveNameCleaner, BlacklistService blacklistService)
+            VolumeDetector volumeDetector, ArchiveNameCleaner archiveNameCleaner, BlacklistService blacklistService, FileOperationService fileOps)
         {
             _settings = settings;
             _logger = logger;
@@ -35,6 +36,7 @@ namespace AutoUnpackTool.Core.Services
             _volumeDetector = volumeDetector;
             _archiveNameCleaner = archiveNameCleaner;
             _blacklistService = blacklistService;
+            _fileOps = fileOps;
         }
 
         /// <summary>绑定文件树集合（集合实例不做替换）</summary>
@@ -74,41 +76,20 @@ namespace AutoUnpackTool.Core.Services
         /// <summary>
         /// 是否可回收的历史节点：顶级 + 已进入终态 + 原文件已不存在 + 整棵子树没有在途任务。
         /// 四个条件缺一不可：解压失败的节点原文件还在（不回收）、正在处理的节点子树还活着（不回收）。
+        /// 终态词表与在途判定都来自 FileItem，与设置页旁的「清理已完成节点」共用同一套语义。
         /// </summary>
         private static bool IsStaleHistoryNode(FileItem node)
         {
-            if (node.Parent != null)
-                return false;
-            if (HasInFlightWork(node))
-                return false;
-            if (File.Exists(node.FilePath))
-                return false;
-
-            bool terminal = node.GetSelfExtractResult()
-                || node.Status.Contains("完成")
-                || node.Status.Contains("fail")
-                || node.Status.StartsWith("跳过")
-                || node.Status == "已取消";
-            return terminal;
-        }
-
-        /// <summary>“正在测试密码/正在解压”都算在途，子树里只要有一个就不能拆。</summary>
-        private static bool HasInFlightWork(FileItem node)
-        {
-            if (node.Status.Contains("正在"))
-                return true;
-            foreach (var child in node.Children)
-            {
-                if (HasInFlightWork(child))
-                    return true;
-            }
-            return false;
+            return node.Parent == null
+                && !node.HasInFlightInSubtree()
+                && node.IsFinished
+                && !File.Exists(node.FilePath);
         }
 
         /// <summary>
         /// 添加单个文件到列表
         /// </summary>
-        public void AddFileToList(string filePath, ref int addedCount, List<FileItem>? newFileItems = null, string? sourceFolderName = null)
+        public void AddFileToList(string filePath, ref int addedCount, List<FileItem>? newFileItems = null, string? sourceFolderName = null, FileOrigin origin = FileOrigin.DroppedFile)
         {
             // 检查是否已存在（含历史残留节点的回收）
             if (IsAlreadyTracked(filePath))
@@ -121,7 +102,8 @@ namespace AutoUnpackTool.Core.Services
                 FilePath = filePath,
                 Status = "等待处理",
                 FileSize = fileInfo.Length,
-                SourceFolderName = sourceFolderName
+                SourceFolderName = sourceFolderName,
+                Origin = origin
             };
             _fileList.Add(fileItem);
             addedCount++;
@@ -264,7 +246,7 @@ namespace AutoUnpackTool.Core.Services
                 string folderName = Path.GetFileName(directoryPath);
                 
                 // 获取文件夹中的所有文件（包括子文件夹）
-                string[] files = Directory.GetFiles(directoryPath, "*.*", SearchOption.AllDirectories);
+                string[] files = _fileOps.EnumerateFilesSafe(directoryPath, "*.*", allDirectories: true).ToArray();
                 
                 _logger.Log($"正在扫描文件夹: {directoryPath}", ConsoleColor.Gray);
                 
@@ -284,8 +266,8 @@ namespace AutoUnpackTool.Core.Services
                         continue;
                     }
 
-                    // 初步筛选：通过扩展名或分卷格式判断
-                    if (_detector.IsArchiveFileByExtension(file) || _volumeDetector.IsMultiVolumeArchive(file))
+                    // 初步筛选：统一走 Classify（文件夹来源应用排除列表，解压产物伪装后缀会被魔术数识破）
+                    if (_detector.Classify(file, FileOrigin.FolderScan) != ArchiveDetector.ArchiveKind.NotArchive)
                     {
                         potentialArchives.Add(file);
                     }
@@ -335,7 +317,8 @@ namespace AutoUnpackTool.Core.Services
                                         ? $"等待处理 (分卷: {volumeInfo.VolumeCount})"
                                         : $"等待处理 (分卷主文件)",
                                     FileSize = volumeInfo.AllVolumePaths.Sum(p => new FileInfo(p).Length),
-                                    SourceFolderName = folderName
+                                    SourceFolderName = folderName,
+                                    Origin = FileOrigin.FolderScan
                                 };
                                 
                                 // 存储分卷信息
@@ -360,7 +343,7 @@ namespace AutoUnpackTool.Core.Services
                                 // 不是真正的分卷，当作普通文件处理
                                 if (!processedVolumes.Contains(archiveFile))
                                 {
-                                    AddFileToList(archiveFile, ref addedCount, newFileItems, folderName);
+                                    AddFileToList(archiveFile, ref addedCount, newFileItems, folderName, FileOrigin.FolderScan);
                                     processedVolumes.Add(archiveFile);
                                 }
                             }
@@ -370,7 +353,7 @@ namespace AutoUnpackTool.Core.Services
                             // 普通压缩文件
                             if (!processedVolumes.Contains(archiveFile))
                             {
-                                AddFileToList(archiveFile, ref addedCount, newFileItems, folderName);
+                                AddFileToList(archiveFile, ref addedCount, newFileItems, folderName, FileOrigin.FolderScan);
                                 processedVolumes.Add(archiveFile);
                             }
                         }

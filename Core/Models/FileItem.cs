@@ -5,6 +5,19 @@ using AutoUnpackTool.Core.Configuration;
 
 namespace AutoUnpackTool.Core.Models
 {
+    /// <summary>
+    /// 文件来源：决定压缩包判定时的规则强度。
+    /// DroppedFile = 用户直接拖入的单个文件（视为确认压缩包，不受排除后缀列表拦截）；
+    /// FolderScan = 拖入文件夹内扫描发现的顶层文件（应用排除列表）；
+    /// ExtractedArtifact = 解压产物中递归发现的嵌套文件（应用排除列表，且不再作隐写容器）。
+    /// </summary>
+    public enum FileOrigin
+    {
+        DroppedFile,
+        FolderScan,
+        ExtractedArtifact
+    }
+
     public class FileItem : System.ComponentModel.INotifyPropertyChanged
     {
         private string _fileName = string.Empty;
@@ -96,6 +109,8 @@ namespace AutoUnpackTool.Core.Models
         // 新增：父子关系支持
         public ObservableCollection<FileItem> Children { get; set; } = new ObservableCollection<FileItem>();
         public FileItem? Parent { get; set; }
+        /// <summary>文件来源，用于统一压缩包判定（见 ArchiveDetector.Classify）</summary>
+        public FileOrigin Origin { get; set; } = FileOrigin.DroppedFile;
         public bool IsParent => Children.Count > 0;
 
         /// <summary>
@@ -146,6 +161,45 @@ namespace AutoUnpackTool.Core.Models
         public bool GetSelfExtractResult()
         {
             return _selfExtractSuccess;
+        }
+
+        /// <summary>
+        /// 状态是否已进入终态（后台流程不会再自行改写它，节点可以安全摘除）。
+        /// 词表与 ExtractionPipeline / MainViewModel 里赋值的状态字符串保持一致，
+        /// 集中在这里是为了避免“回收历史节点”与“清理已完成节点”两处各写一份判断。
+        /// </summary>
+        public static bool IsTerminalStatus(string? status)
+            => !string.IsNullOrEmpty(status) && (
+               status.Contains("解压成功") ||
+               status.Contains("完成") ||
+               status.Contains("跳过") ||
+               status.Contains("非压缩文件") ||
+               status.Contains("失败") ||
+               status.Contains("异常") ||
+               status.Contains("取消") ||
+               status.Contains("fail"));
+
+        /// <summary>自身解压成功过，或状态已进入终态。</summary>
+        public bool IsFinished => _selfExtractSuccess || IsTerminalStatus(Status);
+
+        /// <summary>状态是否表示仍在途（正在测试密码 / 正在解压）。</summary>
+        public bool IsInFlight => Status.Contains("正在");
+
+        /// <summary>
+        /// 整棵子树（含自身）是否存在在途节点。
+        /// 摘除带子树的节点前必须确认返回 false，否则子树会连同在途任务一起从树上掉下，
+        /// FindFileItemInTree 的防递归死循环护栏随之失效。
+        /// </summary>
+        public bool HasInFlightInSubtree()
+        {
+            if (IsInFlight)
+                return true;
+            foreach (var child in Children)
+            {
+                if (child.HasInFlightInSubtree())
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>

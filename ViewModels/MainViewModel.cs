@@ -39,42 +39,34 @@ namespace AutoUnpackTool.ViewModels
         private readonly StegoService _stego;
         private readonly FileCleanupService _cleanup;
         private readonly SmartPathService _smartPath;
+        private readonly DroppedFolderService _droppedFolders;
         private readonly ExtractionPipeline _pipeline;
         private readonly FileCollector _collector;
 
         private bool _suppressBlacklistToggleEvent = true; // 初始化期间不响应开关变化
 
-        // 以下状态由 ExtractionPipeline 持有，ViewModel 侧同名转发（保持既有代码不变）
+        // 以下状态由 ExtractionPipeline 持有，ViewModel 侧只转发真正需要在宿主读写的几项。
+        // 转发别名每一个都是“窗口能直接动管线内部”的缺口，所以只保留有使用处的；
+        // 复位路径已全部收敛到 ExtractionPipeline.ResetRunState()，不再从这里逐个改。
         private ConcurrentQueue<FileItem> _pendingQueue { get => _pipeline.PendingQueue; set => _pipeline.PendingQueue = value; }
         private ConcurrentQueue<FileItem> _extractQueue { get => _pipeline.ExtractQueue; set => _pipeline.ExtractQueue = value; }
         private ManualResetEventSlim _pendingQueueSignal => _pipeline.PendingQueueSignal;
         private ManualResetEventSlim _extractQueueSignal => _pipeline.ExtractQueueSignal;
-        private CancellationTokenSource? _testCancellationTokenSource { get => _pipeline.TestCancellationSource; set => _pipeline.TestCancellationSource = value; }
-        private CancellationTokenSource? _extractCancellationTokenSource { get => _pipeline.ExtractCancellationSource; set => _pipeline.ExtractCancellationSource = value; }
-        private CancellationTokenSource? _globalCancellationTokenSource { get => _pipeline.GlobalCancellationSource; set => _pipeline.GlobalCancellationSource = value; }
         private bool _isTesting { get => _pipeline.IsTesting; set => _pipeline.IsTesting = value; }
         private bool _isExtracting { get => _pipeline.IsExtracting; set => _pipeline.IsExtracting = value; }
         private bool _isPaused { get => _pipeline.IsPaused; set => _pipeline.IsPaused = value; }
-        private TaskCompletionSource<bool> _testCompletionSource { get => _pipeline.TestCompletionSource; set => _pipeline.TestCompletionSource = value; }
-        private TaskCompletionSource<bool> _extractCompletionSource { get => _pipeline.ExtractCompletionSource; set => _pipeline.ExtractCompletionSource = value; }
-        private List<FileItem> _topLevelItems => _pipeline.TopLevelItems;
         private PasswordMap _passwordMap { get => _pipeline.PasswordMap; set => _pipeline.PasswordMap = value; } // 密码映射表
-        private HashSet<string> _droppedFolders => _pipeline.DroppedFolders;
 
         // 【并发修复】ConcurrentDictionary 保证解压线程 Add 与收尾线程遍历/移除的线程安全
         // （值无意义，仅用作线程安全集合的占位）
         // 共享集合由 SmartPathService 持有，ViewModel 侧通过属性转发，避免大范围改名
+        // （清理已完成节点时要逐条注销登记；整片清空则走 SmartPathService.ResetRunState）
         private ConcurrentDictionary<string, byte> _extractedDirectoryNodes => _smartPath.ExtractedDirectoryNodes;
-
-        // 记录扁平化结果映射：被扁平化删除的解压目录 -> 内容最终所在路径（用于最终路径追踪）
-        private Dictionary<string, string> _flattenedFinalPathMap => _smartPath.FlattenedFinalPathMap;
-
-        // 记录已处理的扁平化目录（防止重复处理导致死循环）
-        private HashSet<string> _processedFlattenDirs => _smartPath.ProcessedFlattenDirs;
 
         // 【并发修复】收尾流程串行化锁：多个顶级文件并发完成时，收尾（清理+智能路径扁平化）必须串行执行，
         // 否则并发移动同一目录树会导致移动中断、目录冲突时生成 GUID 新目录、图片分散到多个文件夹。
-        private SemaphoreSlim _smartPathFinalizeLock => _pipeline.SmartPathFinalizeLock;
+        // 锁本体属于被保护的 SmartPathService，所有会移动目录树的流程共用同一把。
+        private SemaphoreSlim _smartPathFinalizeLock => _smartPath.FinalizeLock;
 
         // 【并发修复】防止同一顶级文件被重复触发收尾（完成回调可能从多条路径触发，如叶子收尾与父链上报）
         private HashSet<string> _finalizingTopArchives => _pipeline.FinalizingTopArchives;
@@ -110,6 +102,14 @@ namespace AutoUnpackTool.ViewModels
 
         [ObservableProperty]
         private bool _isBusy;
+
+        /// <summary>
+        /// 第二行清理按钮的文案：空闲时是「清理已完成」，运行中自动变成「强制中止」。
+        /// 强制中止只在真正需要它的时刻（有任务在跑、可能卡住）出现，空闲时把位置让给日常清理。
+        /// </summary>
+        public string ClearButtonLabel => IsBusy ? "强制中止" : "清理已完成";
+
+        partial void OnIsBusyChanged(bool value) => OnPropertyChanged(nameof(ClearButtonLabel));
 
         private bool _isPausedBinding;
         /// <summary>线程是否处于暂停态（供绑定/诊断使用）</summary>
@@ -173,7 +173,10 @@ namespace AutoUnpackTool.ViewModels
             StegoService stego,
             FileCleanupService cleanup,
             SmartPathService smartPath,
-            ConflictResolver conflicts)
+            ConflictResolver conflicts,
+            FileOperationService fileOps,
+            SevenZipExtractorFactory extractorFactory,
+            DroppedFolderService droppedFolders)
         {
             _settings = settings;
             _logger = logger;
@@ -187,19 +190,24 @@ namespace AutoUnpackTool.ViewModels
             _stego = stego;
             _cleanup = cleanup;
             _smartPath = smartPath;
+            _droppedFolders = droppedFolders;
 
             Roots.Add(_rootNode);
 
             // 智能路径（扁平化）处理；状态回调留在 ViewModel 内（需要 Dispatcher 封送）
             _smartPath.OnSmartPathCompleted = UpdateSmartPathCompletedStatus;
 
+            // 拖入文件夹的收尾：忙判断直接在调用点算（不再用属性注入的委托），
+            // 收尾结果回写到“最终路径”显示（ApplyFinalPath 内部已做 UI 封送）。
+            _droppedFolders.OnFinalPathResolved = ApplyFinalPath;
+
             // 解压管线：双队列 + 递归扫描 + 收尾；UI 交互通过 ITaskObserver 上报
             _pipeline = new ExtractionPipeline(_settings, _logger, new UiTaskObserver(this),
-                _detector, _stego, _archiveNameCleaner, _blacklistService, _cleanup, _smartPath, _volumeDetector, conflicts);
+                _detector, _stego, _archiveNameCleaner, _blacklistService, _cleanup, _smartPath, _volumeDetector, conflicts, fileOps, extractorFactory, _droppedFolders);
             _pipeline.AttachFileList(_fileList);
 
             // 文件收集（拖拽/目录扫描 → 文件树）
-            _collector = new FileCollector(_settings, _logger, _detector, _volumeDetector, _archiveNameCleaner, _blacklistService);
+            _collector = new FileCollector(_settings, _logger, _detector, _volumeDetector, _archiveNameCleaner, _blacklistService, fileOps);
             _collector.AttachFileList(_fileList);
             _collector.OnTitleChanged = UpdateRootNodeTitle;
             _smartPath.GetAllItemsSnapshot = _pipeline.SnapshotAllItems;
@@ -360,7 +368,7 @@ namespace AutoUnpackTool.ViewModels
                         _logger.Log($"检测到文件夹: {path}", ConsoleColor.Cyan);
 
                         // 记录拖入的文件夹，即使没有压缩包也会进行智能路径处理
-                        _droppedFolders.Add(path);
+                        _droppedFolders.Register(path);
 
                         _collector.ScanDirectoryForArchives(path, ref addedCount, newFileItems);
                     }
@@ -394,38 +402,11 @@ namespace AutoUnpackTool.ViewModels
                 {
                     _logger.Log("未检测到压缩文件", ConsoleColor.Yellow);
 
-                    // 即使没有压缩包，如果启用了智能路径处理，也应该对拖入的文件夹进行处理
-                    if (_settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder && _droppedFolders.Count > 0)
-                    {
-                        _logger.Log("虽然没有压缩文件，但将对拖入的文件夹进行智能路径处理", ConsoleColor.Cyan);
-                        var folders = _droppedFolders.ToList();
-                        _droppedFolders.Clear();
-
-                        _ = Task.Run(async () =>
-                        {
-                            // 【并发修复】持锁串行执行，避免与解压收尾流程并发移动同一目录树
-                            await _smartPathFinalizeLock.WaitAsync();
-                            try
-                            {
-                                foreach (var folder in folders)
-                                {
-                                    await _smartPath.ProcessSmartPathBatchAsync(folder);
-
-                                    // 更新最终路径显示
-                                    string? finalPath = _smartPath.FindFinalFlattenedPath(folder);
-                                    _dispatcher.Invoke(() =>
-                                    {
-                                        FinalPathText = finalPath ?? folder;
-                                        _logger.Log($"[智能路径] 文件夹最终路径: {FinalPathText}", ConsoleColor.Green);
-                                    });
-                                }
-                            }
-                            finally
-                            {
-                                _smartPathFinalizeLock.Release();
-                            }
-                        });
-                    }
+                    // 即使没有压缩包，也要对拖入的文件夹做智能路径处理。
+                    // 只在完全空闲时就地收尾（此时不会启动监控循环，没别人会接手）；
+                    // 若还有任务在跑，登记留在集合里由流程结束时的收尾处理，
+                    // 避免抢在解压完成前动目录，也避免把其他正在处理的文件夹一起提前扁平化。
+                    _droppedFolders.ScheduleFinalize("拖入时未扫到压缩包", isBusy: _isTesting || _isExtracting);
                 }
             }
         }
@@ -613,9 +594,88 @@ namespace AutoUnpackTool.ViewModels
             }
         }
 
-        /// <summary>清空内容并重置到初始状态</summary>
+        /// <summary>
+        /// 打开使用说明
+        /// </summary>
         [RelayCommand]
-        private void ClearAll()
+        private void OpenHelp()
+        {
+            _dialogs.ShowHelp();
+        }
+
+        /// <summary>清理按钮统一入口：运行中 = 强制中止并复位，空闲 = 只清理已完成节点。</summary>
+        [RelayCommand]
+        private void SmartClear()
+        {
+            if (IsBusy)
+                ForceReset();
+            else
+                CleanCompletedNodes();
+        }
+
+        /// <summary>
+        /// 清理已完成节点：只摘掉已进入终态且整棵子树无在途任务的顶级节点。
+        /// 不动 7z 进程、不清日志、不重置队列——那些是「强制中止」的职责。
+        ///
+        /// 顺带闭掉一个安全隐患：已完成任务留下的解压节点登记如果不清，日后用户在同一个路径
+        /// 建了同名目录，工具会认为“这是自己生成的目录”而允许递归删除它。
+        /// </summary>
+        private void CleanCompletedNodes()
+        {
+            var finishedDirs = new List<string>();
+            int removed = 0;
+
+            for (int i = _fileList.Count - 1; i >= 0; i--)
+            {
+                var node = _fileList[i];
+                if (node.HasInFlightInSubtree() || !node.IsFinished)
+                    continue;
+
+                CollectFinishedNodeDirs(node, finishedDirs);
+                _fileList.RemoveAt(i);
+                removed++;
+            }
+
+            if (removed == 0)
+            {
+                _logger.Log("没有已完成的节点可清理", ConsoleColor.Gray);
+                return;
+            }
+
+            // 只动 ConcurrentDictionary 的解压节点登记：空闲时虽然不应有后台任务，但
+            // FlattenedFinalPathMap / ProcessedFlattenDirs 是普通 Dictionary/HashSet，
+            // 在 UI 线程改它们会引入数据竞争，不如只清真正涉及安全的那一个。
+            // （整片清空由 SmartPathService.ResetRunState 在强制中止时负责）
+            foreach (var dir in finishedDirs)
+                _extractedDirectoryNodes.TryRemove(dir, out _);
+
+            UpdateRootNodeTitle();
+            _logger.Log($"已清理 {removed} 个已完成节点，列表剩余 {_fileList.Count} 项", ConsoleColor.Cyan);
+        }
+
+        /// <summary>递归收集节点及其子树的解压输出目录（即可能留在登记表里的键）。</summary>
+        private void CollectFinishedNodeDirs(FileItem node, List<string> sink)
+        {
+            try
+            {
+                string outputDir = _detector.GetOutputDirectory(node.FilePath);
+                if (!string.IsNullOrEmpty(outputDir))
+                    sink.Add(outputDir);
+            }
+            catch
+            {
+                // 路径已不存在等情况不影响清理，少清一个登记只会让工具更保守
+            }
+
+            if (!string.IsNullOrEmpty(node.FinalOutputPath))
+                sink.Add(node.FinalOutputPath!);
+
+            foreach (var child in node.Children)
+                CollectFinishedNodeDirs(child, sink);
+        }
+
+        /// <summary>强制中止并复位到初始状态（原「清空内容」，运行中卡住时的唯一逃生口）</summary>
+        private void ForceReset()
         {
             // 1. 取消所有正在运行的操作
             _pipeline.CancelAllOperations();
@@ -629,37 +689,15 @@ namespace AutoUnpackTool.ViewModels
             // 4. Kill掉所有NanaZip进程
             _cleanup.KillNanaZipProcesses();
 
-            // 5. 清空UI和数据
-            _fileList.Clear();
-            _passwordMap = new PasswordMap();
-            _pendingQueue = new ConcurrentQueue<FileItem>();
-            _extractQueue = new ConcurrentQueue<FileItem>();
-            _topLevelItems.Clear();
-            _extractedDirectoryNodes.Clear();  // 清空觧压目录标记
-            _flattenedFinalPathMap.Clear();    // 清空扁平化结果映射
-            _detector.ClearStegoProbeCache();
-            _stego.ClearStegoArchiveTypeCache();
-            _stego.ClearStegoArchiveValidFilesCache();
-            _stego.ClearStegoSubStreamCache();
+            // 5. 本轮状态一律交给管线复位（清单在 ExtractionPipeline.ResetRunState，只有一处），
+            //    日志面板与根节点标题是本类自己的东西
+            _pipeline.ResetRunState();
             _logHub.Clear();
             UpdateRootNodeTitle();
 
-            // 6. 重置状态
-            _isTesting = false;
-            _isExtracting = false;
-            _isPaused = false;
+            _logger.Log("已强制中止并复位到初始状态（列表、队列、缓存与日志已清空，7z/NanaZip 进程已结束）", ConsoleColor.Yellow);
 
-            // 7. 重置信号
-            _pendingQueueSignal.Reset();
-            _extractQueueSignal.Reset();
-
-            // 8. 重置完成信号
-            _testCompletionSource = new TaskCompletionSource<bool>();
-            _extractCompletionSource = new TaskCompletionSource<bool>();
-
-            _logger.Log("已清空内容，程序已重置到初始状态", ConsoleColor.Gray);
-
-            // 9. 更新UI状态
+            // 6. 把按钮/状态栏拉回空闲态
             UpdateUiState();
         }
 

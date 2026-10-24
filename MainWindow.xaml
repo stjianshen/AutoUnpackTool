@@ -60,12 +60,16 @@
             <!-- 统一操作按钮（根据状态自动切换功能） -->
             <ui:Button x:Name="BtnMainAction" Content="{Binding MainActionText}" Appearance="Primary" Width="100" Height="30"
                        Command="{Binding MainActionCommand}" IsEnabled="{Binding IsMainActionEnabled}" Margin="0,0,10,0"/>
-            <ui:Button x:Name="BtnClear" Content="清空内容" Width="100" Height="30" Command="{Binding ClearAllCommand}" Margin="0,0,10,0"/>
+            <!-- 清理入口：空闲时清掉已完成节点，运行中自动变成「强制中止」（全局唯一能掐掉挂死 7z 并复位的通路） -->
+            <ui:Button x:Name="BtnClear" Content="{Binding ClearButtonLabel}" Width="110" Height="30"
+                       Command="{Binding SmartClearCommand}" Margin="0,0,10,0"
+                       ToolTip="空闲：移除列表里已处理完的节点（不动在途与待处理项）；运行中：中止全部任务、结束 7z 进程并复位"/>
 
             <Separator Width="20" Visibility="Hidden"/>
 
             <ui:Button x:Name="BtnPasswordConfig" Content="编辑密码" Width="100" Height="30" Command="{Binding OpenPasswordsCommand}" Margin="0,0,10,0"/>
-            <ui:Button x:Name="BtnSettings" Content="软件设置" Width="100" Height="30" Command="{Binding OpenSettingsCommand}"/>
+            <ui:Button x:Name="BtnSettings" Content="软件设置" Width="100" Height="30" Command="{Binding OpenSettingsCommand}" Margin="0,0,10,0"/>
+            <ui:Button x:Name="BtnHelp" Content="使用说明" Width="100" Height="30" Command="{Binding OpenHelpCommand}"/>
         </StackPanel>
 
         <!-- 第三行：控制选项（输出产物重名策略已移到“软件设置 → 基础设置”） -->

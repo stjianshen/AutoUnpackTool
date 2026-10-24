@@ -10,6 +10,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using AutoUnpackTool.Core.Abstractions;
 using AutoUnpackTool.Core.Configuration;
+using AutoUnpackTool.Core.Infrastructure;
+using AutoUnpackTool.Core.Models;
 
 namespace AutoUnpackTool.Core.Services
 {
@@ -22,13 +24,15 @@ namespace AutoUnpackTool.Core.Services
         private readonly AppSettings _settings;
         private readonly IAppLogger _logger;
         private readonly VolumeDetector _volumeDetector;
+        private readonly SevenZipRunner _runner;
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
 
-        public ArchiveDetector(AppSettings settings, IAppLogger logger, VolumeDetector volumeDetector)
+        public ArchiveDetector(AppSettings settings, IAppLogger logger, VolumeDetector volumeDetector, SevenZipRunner runner)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _volumeDetector = volumeDetector ?? throw new ArgumentNullException(nameof(volumeDetector));
+            _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         }
 
         public StegoService Stego { get; set; } = null!;
@@ -68,8 +72,12 @@ namespace AutoUnpackTool.Core.Services
             return result;
         }
 
-        /// <summary>清空隐写探测结果缓存（清空任务时调用）</summary>
-        public void ClearStegoProbeCache() => _stegoProbeCache.Clear();
+        /// <summary>
+        /// 丢弃本轮积累的探测结果。本类唯一的可变状态就是 _stegoProbeCache；
+        /// 新增字段级状态时必须同步登记到这里。
+        /// </summary>
+        public void ResetRunState() => _stegoProbeCache.Clear();
+
         /// <summary>
         /// 用标准 7z l（不带 -t#）验证文件是否为真正的压缩包
         /// -t# 哈希扫描可能将媒体文件的二进制数据误识别为压缩包签名，
@@ -81,41 +89,13 @@ namespace AutoUnpackTool.Core.Services
             if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
                 return false;
 
-            try
-            {
-                if (string.IsNullOrWhiteSpace(_settings.SevenZipPath) || !File.Exists(_settings.SevenZipPath))
-                    return false;
-
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = _settings.SevenZipPath,
-                    Arguments = $"l -sccUTF-8 \"{filePath}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = System.Text.Encoding.UTF8,
-                    StandardErrorEncoding = System.Text.Encoding.UTF8
-                };
-
-                using var process = new Process { StartInfo = startInfo };
-                process.Start();
-                process.StandardOutput.ReadToEnd();
-                process.StandardError.ReadToEnd();
-
-                if (!process.WaitForExit(15000))
-                {
-                    try { process.Kill(); } catch { }
-                    return false;
-                }
-
-                // 退出码 0 表示成功列出内容 → 真正的压缩包
-                return process.ExitCode == 0;
-            }
-            catch
-            {
+            if (!_runner.IsAvailable)
                 return false;
-            }
+
+            // 标准 7z l 从文件头解析，退出码 0 表示可正常列出内容 → 真正的压缩包；
+            // 超时/不可用/异常统一由 RunCapture 归一为非 0（-1），此处判 false。
+            var (exitCode, _, _) = _runner.RunCapture($"l -sccUTF-8 \"{filePath}\"");
+            return exitCode == 0;
         }
 
         /// <summary>
@@ -171,6 +151,8 @@ namespace AutoUnpackTool.Core.Services
                 case "bz2":
                 case "xz":
                 case "lzma":
+                case "zstd":
+                case "zst":
                 case "cab":
                 case "arj":
                 case "z":
@@ -197,102 +179,88 @@ namespace AutoUnpackTool.Core.Services
             return detected;
         }
 
+        /// <summary>
+        /// 压缩包判定结果（统一判定入口 Classify 的返回值）。
+        /// </summary>
+        public enum ArchiveKind
+        {
+            /// <summary>不是压缩包</summary>
+            NotArchive,
+            /// <summary>已验证的真实压缩包（魔术数/分卷/强制模式命中）</summary>
+            VerifiedArchive,
+            /// <summary>隐写容器（魔术数失败但隐写探测命中）</summary>
+            StegoCarrier
+        }
+
         /// <param name="filePath">文件路径</param>
-        /// <param name="logVerification">是否输出魔术数验证日志，默认 false</param>
+        /// <param name="logVerification">是否输出验证日志，默认 false</param>
+        /// <param name="origin">文件来源，决定排除列表/强制模式/隐写探测的适用范围</param>
         /// <returns>是否为压缩文件</returns>
-        public bool IsArchiveFile(string filePath, bool logVerification = false, bool isDroppedFile = true)
+        public bool IsArchiveFile(string filePath, bool logVerification = false, FileOrigin origin = FileOrigin.DroppedFile)
+        {
+            return Classify(filePath, origin, logVerification) != ArchiveKind.NotArchive;
+        }
+
+        /// <summary>
+        /// 统一的压缩包判定入口：整合强制模式、排除列表、扩展名/分卷、魔术数、隐写探测的决策，
+        /// 供收集、密码测试、解压产物扫描、智能路径各阶段共用，消除多处重复且严格程度不一致的判定。
+        /// 决策矩阵：
+        /// - 强制模式：仅对 DroppedFile 生效，直接判为压缩包；
+        /// - 排除列表：仅对 FolderScan / ExtractedArtifact 生效；DroppedFile 完全跳过（拖入即确认）；
+        /// - 分卷：文件名即强信号，各卷无法可靠魔术数验证，直接判为压缩包；
+        /// - 其余：一律魔术数验证（修复伪装后缀）；魔术数失败时，隐写探测仅对 DroppedFile / FolderScan 启用。
+        /// </summary>
+        public ArchiveKind Classify(string filePath, FileOrigin origin, bool logVerification = false)
         {
             if (string.IsNullOrWhiteSpace(filePath))
-                return false;
+                return ArchiveKind.NotArchive;
 
             if (!File.Exists(filePath))
-                return false;
+                return ArchiveKind.NotArchive;
 
-            // 如果启用了强制压模式，跳过所有检测，直接返回 true
-            // 但只对最初拖入的文件生效，解压后发现的新文件仍进行正常检测
-            if (_settings.ForceExtractMode && isDroppedFile)
+            // 强制解压模式：仅对最初拖入的单个文件生效，解压产物与文件夹扫描仍正常检测
+            if (_settings.ForceExtractMode && origin == FileOrigin.DroppedFile)
             {
                 if (logVerification)
                     _logger.Log($"  [强制模式] {Path.GetFileName(filePath)}: 跳过检测，直接视为压缩文件", ConsoleColor.Yellow);
-                return true;
+                return ArchiveKind.VerifiedArchive;
             }
 
-            string extension = Path.GetExtension(filePath).ToLowerInvariant();
-            
-            // 步骤1：获取排除的扩展名列表
-            var excludedExtensions = _settings.GetExcludedExtensions();
-            
-            // 如果在排除列表中，直接返回 false，结束解压流程
-            if (excludedExtensions.Contains(extension))
-            {
-                // 【修复】只对最初拖入的文件进行隐写探测
-                // 解压过程中递归发现的新文件（如.mp4等媒体文件）是最终产物，不应作为隐写容器处理
-                if (isDroppedFile && Stego.IsStegoDetectionActiveForFile(filePath))
-                {
-                    if (logVerification)
-                        _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 命中隐写探测，按隐写容器处理", ConsoleColor.Green);
-                    return true;
-                }
+            string extension = PathUtil.LowerExtension(filePath);
 
-                return false;
+            // 排除列表：仅对文件夹扫描与解压产物生效；用户直接拖入的文件不受排除列表拦截
+            if (origin != FileOrigin.DroppedFile)
+            {
+                var excludedExtensions = _settings.GetExcludedExtensions();
+                if (excludedExtensions.Contains(extension))
+                    return ArchiveKind.NotArchive;
             }
 
-            // 步骤2：获取需要检测的压缩文件扩展名列表
-            var archiveExtensions = _settings.GetArchiveExtensions();
-            
-            // 如果扩展名在包含列表中，用魔术数验证是否真的是压缩文件
-            bool extensionMatched = false;
-            string fileName = Path.GetFileName(filePath).ToLowerInvariant();
-            foreach (var ext in archiveExtensions)
+            // 分卷压缩包：文件名即强信号，非主卷无法独立魔术数验证，直接判定（仅主卷会入队）
+            if (_volumeDetector.IsMultiVolumeArchive(filePath))
             {
-                if (fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase) || extension == ext)
-                {
-                    extensionMatched = true;
-                    break;
-                }
+                if (logVerification)
+                    _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 命中分卷格式，视为压缩文件", ConsoleColor.Green);
+                return ArchiveKind.VerifiedArchive;
             }
-            
-            // 检查分卷压缩包格式
-            if (!extensionMatched && _volumeDetector.IsMultiVolumeArchive(filePath))
-            {
-                extensionMatched = true;
-            }
-            
-            if (extensionMatched)
-            {
-                // 扩展名匹配，用魔术数验证
-                if (IsArchiveFileByMagicNumber(filePath, extension))
-                {
-                    if (logVerification)
-                        _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数验证通过，是压缩文件", ConsoleColor.Green);
-                    return true;
-                }
-                else
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                // 扩展名不匹配，直接用魔术数检测
-                if (IsArchiveFileByMagicNumber(filePath, extension))
-                {
-                    if (logVerification)
-                        _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数检测通过，是压缩文件", ConsoleColor.Green);
-                    return true;
-                }
-                else
-                {
-                    if (Stego.IsStegoDetectionActiveForFile(filePath))
-                    {
-                        if (logVerification)
-                            _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数失败但隐写探测命中", ConsoleColor.Green);
-                        return true;
-                    }
 
-                    return false;
-                }
+            // 统一：无论扩展名是否命中包含列表，都用魔术数验证（修复解压产物伪装后缀）
+            if (IsArchiveFileByMagicNumber(filePath, extension))
+            {
+                if (logVerification)
+                    _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数验证通过，是压缩文件", ConsoleColor.Green);
+                return ArchiveKind.VerifiedArchive;
             }
+
+            // 魔术数失败：隐写探测仅对 DroppedFile / FolderScan 启用（解压递归发现的媒体文件是最终产物，不再当容器）
+            if (origin != FileOrigin.ExtractedArtifact && Stego.IsStegoDetectionActiveForFile(filePath))
+            {
+                if (logVerification)
+                    _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数失败但隐写探测命中", ConsoleColor.Green);
+                return ArchiveKind.StegoCarrier;
+            }
+
+            return ArchiveKind.NotArchive;
         }
 
         /// <summary>
@@ -307,7 +275,7 @@ namespace AutoUnpackTool.Core.Services
                 return true;
             }
         
-            string extension = Path.GetExtension(filePath).ToLowerInvariant();
+            string extension = PathUtil.LowerExtension(filePath);
             
             // 获取排除的扩展名列表
             var excludedExtensions = _settings.GetExcludedExtensions();
@@ -407,8 +375,8 @@ namespace AutoUnpackTool.Core.Services
                                 header[3] == 0xAF && header[4] == 0x27 && header[5] == 0x1C)
                                 return true;
 
-                            // GZ: 1F 8B
-                            if (header.Length >= 2 && header[0] == 0x1F && header[1] == 0x8B)
+                            // GZ: 1F 8B，且第三字节 CM（压缩方法）必须为 08(deflate)，降低两字节误报
+                            if (header.Length >= 3 && header[0] == 0x1F && header[1] == 0x8B && header[2] == 0x08)
                                 return true;
 
                             // BZ2: 42 5A 68
@@ -437,18 +405,9 @@ namespace AutoUnpackTool.Core.Services
                             if (header.Length >= 2 && header[0] == 0x60 && header[1] == 0xEA)
                                 return true;
 
-                            // TAR: 在257字节偏移处有 "ustar"
-                            // 注意：很多 TAR 文件不是标准的 ustar 格式，所以扩展名匹配就放行
-                            if (extension == ".tar")
-                            {
-                                // TAR 格式检测比较复杂，不同工具生成的 TAR 格式可能不同
-                                // 如果扩展名是 .tar 且文件大小合理，直接放行
-                                if (fs.Length >= 16)
-                                {
-                                    return true;
-                                }
-                            }
-                            
+                            // TAR: 统一交由下方偏移 257 处的 "ustar" 签名判定（含 GNU/POSIX），
+                            // 不再仅凭扩展名+长度放行，降低非压缩包误判；非标准 tar 交由扩展名+强制模式兜底
+
                             if (fs.Length >= 263)
                             {
                                 fs.Position = 257;

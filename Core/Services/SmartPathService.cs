@@ -24,10 +24,20 @@ namespace AutoUnpackTool.Core.Services
         private readonly VolumeDetector _volumeDetector;
         private readonly BlacklistService _blacklistService;
         private readonly ConflictResolver _conflicts;
+        private readonly FileOperationService _fileOps;
 
         public ConcurrentDictionary<string, byte> ExtractedDirectoryNodes { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> FlattenedFinalPathMap { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> ProcessedFlattenDirs { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 智能路径移动操作的串行化锁。
+        /// 【并发修复】多个顶级文件并发完成时，收尾（清理+扁平化）必须串行执行，
+        /// 否则并发移动同一目录树会导致移动中断（图片没移完）、目录冲突时生成 GUID 新目录、
+        /// 图片分散到多个文件夹。凡是会调用本服务做目录移动的流程（解压收尾、拖入文件夹收尾、
+        /// 批量扁平化）都必须先持有这把锁，所以锁放在被保护的对象上而不是某个调用方里。
+        /// </summary>
+        public SemaphoreSlim FinalizeLock { get; } = new(1, 1);
 
         public Action<string>? OnSmartPathCompleted { get; set; }
 
@@ -36,7 +46,7 @@ namespace AutoUnpackTool.Core.Services
         /// </summary>
         public Func<List<FileItem>> GetAllItemsSnapshot { get; set; } = null!;
 
-        public SmartPathService(AppSettings settings, IAppLogger logger, ArchiveDetector detector, VolumeDetector volumeDetector, BlacklistService blacklistService, ConflictResolver conflicts)
+        public SmartPathService(AppSettings settings, IAppLogger logger, ArchiveDetector detector, VolumeDetector volumeDetector, BlacklistService blacklistService, ConflictResolver conflicts, FileOperationService fileOps)
         {
             _settings = settings;
             _logger = logger;
@@ -44,12 +54,29 @@ namespace AutoUnpackTool.Core.Services
             _volumeDetector = volumeDetector;
             _blacklistService = blacklistService;
             _conflicts = conflicts;
+            _fileOps = fileOps;
         }
 
         // 与 MainWindow 原字段同名转发，保证方法体逐行未变
         private ConcurrentDictionary<string, byte> _extractedDirectoryNodes => ExtractedDirectoryNodes;
         private Dictionary<string, string> _flattenedFinalPathMap => FlattenedFinalPathMap;
         private HashSet<string> _processedFlattenDirs => ProcessedFlattenDirs;
+
+        /// <summary>
+        /// 丢弃本轮运行的工作集。
+        /// 上面三个集合不是“缓存”而是“本轮任务状态”，却活在进程级单例里，
+        /// 所以它们的清理全靠调用方记得收 —— 新增任何本轮级状态都必须同步登记到这里。
+        /// 残留的实际危害：_extractedDirectoryNodes 里的旧登记会让 ConflictResolver
+        /// 把日后同路径的用户目录误判为“本工具生成的”，从而允许递归删除它。
+        /// FlattenedFinalPathMap / ProcessedFlattenDirs 是普通 Dictionary/HashSet，
+        /// 只能从 UI 线程调用（与调用方 ForceReset 的既有约定一致）。
+        /// </summary>
+        public void ResetRunState()
+        {
+            ExtractedDirectoryNodes.Clear();
+            FlattenedFinalPathMap.Clear();
+            ProcessedFlattenDirs.Clear();
+        }
 
         /// <summary>
         /// 批量智能路径处理：当整个任务的所有文件节点处理完成后执行
@@ -114,7 +141,7 @@ namespace AutoUnpackTool.Core.Services
             {
                 _logger.Log($"[批量智能路径] 扁平化前子压缩包清理: {rootDir}", ConsoleColor.Gray);
                 int cleanedCount = 0;
-                foreach (string file in Directory.GetFiles(rootDir, "*.*", SearchOption.AllDirectories))
+                foreach (string file in _fileOps.EnumerateFilesSafe(rootDir, "*.*", allDirectories: true))
                 {
                     if (!File.Exists(file))
                         continue;
@@ -122,16 +149,15 @@ namespace AutoUnpackTool.Core.Services
                     // 检查是否是压缩文件
                     if (_detector.IsArchiveFile(file, false) && !_volumeDetector.IsMultiVolumeArchive(file))
                     {
-                        try
+                        // 直接删除（不经过回收站），子压缩包不保留；统一走 FileOperationService 带重试
+                        if (_fileOps.TryDelete(file))
                         {
-                            // 直接删除（不经过回收站），子压缩包不保留
-                            await Task.Run(() => File.Delete(file));
                             _logger.Log($"[批量智能路径]   已清理子压缩包: {Path.GetFileName(file)}", ConsoleColor.Gray);
                             cleanedCount++;
                         }
-                        catch (Exception delEx)
+                        else
                         {
-                            _logger.Log($"[批量智能路径]   清理子压缩包失败 [{Path.GetFileName(file)}]: {delEx.Message}", ConsoleColor.Yellow);
+                            _logger.Log($"[批量智能路径]   清理子压缩包失败（被占用或不存在）: {Path.GetFileName(file)}", ConsoleColor.Yellow);
                         }
                     }
                 }
@@ -534,7 +560,7 @@ namespace AutoUnpackTool.Core.Services
                 foreach (var file in parentFiles)
                 {
                     string fileName = Path.GetFileNameWithoutExtension(file);
-                    string fileExt = Path.GetExtension(file).ToLowerInvariant();
+                    string fileExt = PathUtil.LowerExtension(file);
                     
                     // 检查是否是分卷压缩包（.001, .002, .part1.rar 等）
                     bool isVolumeArchive = _volumeDetector.IsMultiVolumeArchive(file);
@@ -734,11 +760,8 @@ namespace AutoUnpackTool.Core.Services
                 }
 
                 // 删除已清空的子目录
-                if (Directory.Exists(singleSubDir))
-                {
-                    Directory.Delete(singleSubDir);
+                if (_fileOps.TryDeleteEmptyDirectory(singleSubDir))
                     _logger.Log($"[批量智能路径]   已删除空子目录: {subDirName}", ConsoleColor.Gray);
-                }
 
                 // 子目录本身已删除，从解压节点标记中移除
                 if (_extractedDirectoryNodes.ContainsKey(singleSubDir))

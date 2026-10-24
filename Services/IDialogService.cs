@@ -26,6 +26,9 @@ namespace AutoUnpackTool.Services
         /// <summary>打开黑名单管理对话框；保存返回 true。</summary>
         bool ShowBlacklist(AppSettings current);
 
+        /// <summary>打开使用说明对话框（只读展示）。</summary>
+        void ShowHelp();
+
         /// <summary>警告提示框。</summary>
         void ShowWarning(string message, string title = "提示");
 

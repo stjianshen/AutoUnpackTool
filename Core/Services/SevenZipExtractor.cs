@@ -10,14 +10,16 @@ namespace AutoUnpackTool.Core.Services
     public class SevenZipExtractor
     {
         private readonly string _sevenZipPath;
+        private readonly SevenZipRunner? _runner;
 
-        public SevenZipExtractor(string sevenZipPath)
+        public SevenZipExtractor(string sevenZipPath, SevenZipRunner? runner = null)
         {
             if (string.IsNullOrWhiteSpace(sevenZipPath) || !File.Exists(sevenZipPath))
             {
                 throw new ArgumentException("7z.exe 路径无效", nameof(sevenZipPath));
             }
             _sevenZipPath = sevenZipPath;
+            _runner = runner;
         }
 
         /// <summary>
@@ -41,17 +43,21 @@ namespace AutoUnpackTool.Core.Services
                     // 'l' 命令只读取文件头，速度极快（秒级）
                     // 't' 命令会完整解压并验证所有文件，大文件极慢
                     string command = useFastMode ? "l" : "t";
-                    var startInfo = new ProcessStartInfo
-                    {
-                        FileName = _sevenZipPath,
-                        Arguments = $"{command} -p\"{password}\" -sccUTF-8 \"{archivePath}\"",
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        StandardOutputEncoding = System.Text.Encoding.UTF8,
-                        StandardErrorEncoding = System.Text.Encoding.UTF8
-                    };
+                    string args = $"{command} -p\"{password}\" -sccUTF-8 \"{archivePath}\"";
+                    // 有统一 runner 时复用其 ProcessStartInfo 样板；否则保持自建（兼容无 runner 的调用方）
+                    var startInfo = _runner != null
+                        ? _runner.BuildStartInfo(args)
+                        : new ProcessStartInfo
+                        {
+                            FileName = _sevenZipPath,
+                            Arguments = args,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            StandardOutputEncoding = System.Text.Encoding.UTF8,
+                            StandardErrorEncoding = System.Text.Encoding.UTF8
+                        };
 
                     using var process = new Process { StartInfo = startInfo };
                     
@@ -205,7 +211,7 @@ namespace AutoUnpackTool.Core.Services
         /// <param name="extractionTimeout">解压超时时间(秒)，默认3600秒(1小时)</param>
         /// <param name="onProgress">常规进度回调（文本消息）</param>
         /// <param name="onPercentChanged">百分比进度回调（0-100）</param>
-        public async Task<(bool Success, string Message)> ExtractAsync(
+        public async Task<(bool Success, string Message, int ExitCode)> ExtractAsync(
             string archivePath, 
             string outputDir, 
             string? password = null,
@@ -226,7 +232,7 @@ namespace AutoUnpackTool.Core.Services
                     // 检查输出目录是否与现有文件冲突
                     if (File.Exists(outputDir))
                     {
-                        return (false, $"输出路径已存在同名文件: {outputDir}，请更换输出模式");
+                        return (false, $"输出路径已存在同名文件: {outputDir}，请更换输出模式", -1);
                     }
                     
                     if (!Directory.Exists(outputDir))
@@ -371,7 +377,7 @@ namespace AutoUnpackTool.Core.Services
                         {
                             onProgress?.Invoke($"终止进程失败: {killEx.Message}");
                         }
-                        return (false, $"解压超时（{extractionTimeout}秒），已强制终止");
+                        return (false, $"解压超时（{extractionTimeout}秒），已强制终止", -1);
                     }
 
                     // 重要：等待异步输出读取完成，防止缓冲区阻塞导致问题
@@ -388,21 +394,28 @@ namespace AutoUnpackTool.Core.Services
                         catch { }
                     }
 
+                    // 7z 退出码：0=成功，1=警告(非致命，部分文件可能失败)，>=2=真失败
                     if (process.ExitCode == 0)
                     {
                         onProgress?.Invoke("解压成功");
-                        return (true, "解压成功");
+                        return (true, "解压成功", 0);
+                    }
+                    else if (process.ExitCode == 1)
+                    {
+                        // 警告级：视为部分成功，产物已落盘，交由上层继续扫描处理
+                        onProgress?.Invoke("解压完成（存在警告，部分条目可能失败）");
+                        return (true, "解压完成，但存在警告（部分文件可能失败）", 1);
                     }
                     else
                     {
                         string errorMsg = string.IsNullOrEmpty(error) ? output : error;
                         onProgress?.Invoke($"解压失败 (退出码: {process.ExitCode})");
-                        return (false, $"解压失败 (退出码: {process.ExitCode})\n{errorMsg}");
+                        return (false, $"解压失败 (退出码: {process.ExitCode})\n{errorMsg}", process.ExitCode);
                     }
                 }
                 catch (Exception ex)
                 {
-                    return (false, $"解压异常: {ex.Message}");
+                    return (false, $"解压异常: {ex.Message}", -1);
                 }
             });
         }

@@ -95,6 +95,11 @@ namespace AutoUnpackTool.Services
             return Prepare(new BlacklistManagerDialog(vm)).ShowDialog() == true;
         }
 
+        public void ShowHelp()
+        {
+            Prepare(new HelpDialog()).ShowDialog();
+        }
+
         public void ShowWarning(string message, string title = "提示")
             => Show(message, title, MessageBoxImage.Warning);
 

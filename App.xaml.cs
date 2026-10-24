@@ -68,6 +68,9 @@ namespace AutoUnpackTool
 
             // Core 服务（Singleton：保持缓存/状态在进程内共享）
             services.AddSingleton<ConflictResolver>();
+            services.AddSingleton<SevenZipRunner>();
+            services.AddSingleton<SevenZipExtractorFactory>();
+            services.AddSingleton<FileOperationService>();
             services.AddSingleton<BlacklistService>();
             services.AddSingleton<ArchiveNameCleaner>();
             services.AddSingleton<VolumeDetector>();
@@ -75,6 +78,7 @@ namespace AutoUnpackTool
             services.AddSingleton<StegoService>();
             services.AddSingleton<FileCleanupService>();
             services.AddSingleton<SmartPathService>();
+            services.AddSingleton<DroppedFolderService>();
 
             // 视图模型与窗口
             services.AddTransient<MainViewModel>();

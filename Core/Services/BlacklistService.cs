@@ -24,16 +24,18 @@ namespace AutoUnpackTool.Core.Services
 
         private readonly AppSettings _settings;
         private readonly IAppLogger _logger;
+        private readonly FileOperationService _fileOps;
 
         private List<CompiledBlacklistRule> _compiledBlacklistRules = new();
         private string _compiledBlacklistSignature = string.Empty;
         private readonly object _blacklistCompileLock = new();
         private readonly HashSet<string> _reportedInvalidBlacklistPatterns = new(StringComparer.OrdinalIgnoreCase);
 
-        public BlacklistService(AppSettings settings, IAppLogger logger)
+        public BlacklistService(AppSettings settings, IAppLogger logger, FileOperationService fileOps)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _fileOps = fileOps ?? throw new ArgumentNullException(nameof(fileOps));
         }
 
         /// <summary>
@@ -140,32 +142,34 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 永久删除黑名单文件
+        /// 永久删除黑名单文件（带占用重试）。收集阶段与解压产物阶段统一复用此入口。
+        /// </summary>
+        /// <param name="filePath">文件路径</param>
+        /// <param name="matchedPattern">匹配到的模式</param>
+        /// <param name="maxRetries">最大尝试次数（含首次）</param>
+        /// <returns>是否删除成功</returns>
+        public bool TryDeleteWithRetry(string filePath, string matchedPattern, int maxRetries = 3)
+        {
+            string fileName = Path.GetFileName(filePath);
+            _logger.Log($"[黑名单] 检测到黑名单文件: {fileName} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
+
+            // 统一走 FileOperationService 的同步带重试删除（占用时 200ms 退避）
+            bool ok = _fileOps.TryDelete(filePath, maxRetries, 200);
+            if (ok)
+                _logger.Log($"[黑名单] 已永久删除: {fileName}", ConsoleColor.Green);
+            else
+                _logger.Log($"[黑名单] 删除失败（不存在/权限不足/被占用）: {fileName}", ConsoleColor.Red);
+            return ok;
+        }
+
+        /// <summary>
+        /// 永久删除黑名单文件（兼容旧调用点，内部委托带重试删除）
         /// </summary>
         /// <param name="filePath">文件路径</param>
         /// <param name="matchedPattern">匹配到的模式</param>
         public void DeleteBlacklistedFile(string filePath, string matchedPattern)
         {
-            try
-            {
-                string fileName = Path.GetFileName(filePath);
-                _logger.Log($"[黑名单] 检测到黑名单文件: {fileName} (匹配模式: {matchedPattern})", ConsoleColor.Yellow);
-
-                File.Delete(filePath);
-                _logger.Log($"[黑名单] 已永久删除: {fileName}", ConsoleColor.Green);
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                _logger.Log($"[黑名单] 删除失败（权限不足）: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
-            }
-            catch (IOException ex)
-            {
-                _logger.Log($"[黑名单] 删除失败（文件被占用）: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
-            }
-            catch (Exception ex)
-            {
-                _logger.Log($"[黑名单] 删除失败: {Path.GetFileName(filePath)} - {ex.Message}", ConsoleColor.Red);
-            }
+            TryDeleteWithRetry(filePath, matchedPattern);
         }
 
         /// <summary>
@@ -190,7 +194,7 @@ namespace AutoUnpackTool.Core.Services
                 _logger.Log($"[批量智能路径] 扁平化前黑名单清理: {rootDir}", ConsoleColor.Gray);
 
                 // 先删除黑名单文件
-                foreach (string file in Directory.GetFiles(rootDir, "*.*", SearchOption.AllDirectories))
+                foreach (string file in _fileOps.EnumerateFilesSafe(rootDir, "*.*", allDirectories: true))
                 {
                     if (!File.Exists(file))
                         continue;
@@ -199,7 +203,7 @@ namespace AutoUnpackTool.Core.Services
                 }
 
                 // 再删除黑名单文件夹（从最深层次开始删除，避免父目录还有内容时无法删除）
-                var allDirs = Directory.GetDirectories(rootDir, "*", SearchOption.AllDirectories)
+                var allDirs = _fileOps.EnumerateDirectoriesSafe(rootDir, allDirectories: true)
                     .OrderByDescending(d => d.Length); // 从最深层次开始删除
 
                 foreach (string dir in allDirs)
