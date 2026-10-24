@@ -23,3 +23,12 @@ _ReSharper*/
 *.log
 .history/
 .claude/
+
+# build & publish artifacts
+publish/
+
+# tooling index cache
+.codegraph/
+
+# legacy manual backups
+AutoUnpackTool-26-*
