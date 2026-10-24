@@ -26,6 +26,137 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
+        /// 加密探测结果状态
+        /// </summary>
+        public enum ProbeStatus
+        {
+            /// <summary>表头可读且无任何加密条目（可直接解压，无需密码校验）</summary>
+            ReadableUnencrypted,
+            /// <summary>表头可读但含 Encrypted=+ 条目（需密码验证）</summary>
+            ReadableEncrypted,
+            /// <summary>表头加密/列表失败/超时（无法判定，回退传统全量测试）</summary>
+            HeaderEncryptedOrError
+        }
+
+        /// <summary>
+        /// 一次 7z l -slt 探测的产出：加密状态、条目数、最小条目名与总大小。
+        /// </summary>
+        public sealed class EncryptionProbeResult
+        {
+            public ProbeStatus Status = ProbeStatus.HeaderEncryptedOrError;
+            public int EntryCount;
+            public string? SmallestEntry;
+            public long TotalSize;
+        }
+
+        /// <summary>加密探测超时（探测本身是秒级列表头任务；超时归为 HeaderEncryptedOrError 回退全量测试）</summary>
+        private const int ProbeTimeoutMs = 10000;
+
+        /// <summary>
+        /// 条目名能否安全拼进 7z 的 -i! 参数：含引号/换行会破坏命令行，
+        /// # & ~ 是 7z 模式转义符，* ? 是通配符，均直接放弃定向测试回退全量 t。
+        /// </summary>
+        public static bool IsSafeEntryPattern(string? entry)
+        {
+            if (string.IsNullOrEmpty(entry))
+                return false;
+            foreach (char c in entry)
+            {
+                if (c == '"' || c == '\r' || c == '\n' || c == '#' || c == '&' || c == '~' || c == '*' || c == '?')
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 用一次 7z l -slt -sccUTF-8（不带密码）探测压缩包是否加密：
+        /// 逐行解析条目块（Path/Encrypted/Size），不读数据区，秒级完成。
+        /// 退出码非 0（表头加密/超时/异常）一律归为 HeaderEncryptedOrError，由调用方回退旧流程。
+        /// </summary>
+        public Task<EncryptionProbeResult> ProbeEncryptionAsync(string archivePath, CancellationToken cancellationToken = default)
+        {
+            return Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var result = new EncryptionProbeResult();
+
+                // 探测本身失败不能损失正确性：保持 HeaderEncryptedOrError 让调用方走全量测试。
+                // -p"" 显式传空密码：表头加密的包不会去读控制台（GUI 宿主下会无限重试弹提示），
+                // 而是直接错退 → 非 0 退出码 → HeaderEncryptedOrError → 回退传统全量测试；
+                // -y 避免任何“是否继续”类交互确认。
+                var (exitCode, output, _) = _runner.RunCapture(
+                    $"l -slt -y -p\"\" -sccUTF-8 \"{archivePath}\"", ProbeTimeoutMs, cancellationToken);
+                if (exitCode != 0)
+                    return result;
+
+                string archiveFullPath;
+                try { archiveFullPath = Path.GetFullPath(archivePath); }
+                catch { archiveFullPath = archivePath; }
+
+                string? curPath = null;
+                bool curEncrypted = false;
+                bool curIsHeaderBlock = false;
+                long curSize = -1;
+                long smallestSize = long.MaxValue;
+
+                // 逐行解析（沿用 -slt 输出禁止跨行正则的教训）：
+                // 每个条目块以 "Path = " 行开始；头部块（Path 等于压缩包本身）不是条目，仅用于取总体信息
+                void FlushEntry()
+                {
+                    if (curPath != null && !curIsHeaderBlock)
+                    {
+                        result.EntryCount++;
+                        if (curEncrypted)
+                            result.Status = ProbeStatus.ReadableEncrypted;
+                        if (curSize > 0)
+                            result.TotalSize += curSize;
+                        // 定向快测条目只从加密条目中选最小者：混合加密包里若选中未加密条目，
+                        // 任意密码都能测过 → 错密码被误判为正确，后续解压必失败
+                        if (curEncrypted && curSize > 0 && curSize < smallestSize)
+                        {
+                            smallestSize = curSize;
+                            result.SmallestEntry = curPath;
+                        }
+                    }
+                    curPath = null;
+                    curEncrypted = false;
+                    curIsHeaderBlock = false;
+                    curSize = -1;
+                }
+
+                result.Status = ProbeStatus.ReadableUnencrypted;
+                foreach (var raw in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string line = raw.Trim();
+                    if (line.StartsWith("Path = ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        FlushEntry();
+                        curPath = line.Substring("Path = ".Length).Trim();
+                        curIsHeaderBlock = string.Equals(curPath, archiveFullPath, StringComparison.OrdinalIgnoreCase)
+                                        || string.Equals(curPath, Path.GetFileName(archivePath), StringComparison.OrdinalIgnoreCase);
+                    }
+                    else if (curPath != null && line.StartsWith("Encrypted = ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (line.Substring("Encrypted = ".Length).Trim() == "+")
+                            curEncrypted = true;
+                    }
+                    else if (curPath != null && line.StartsWith("Size = ", StringComparison.OrdinalIgnoreCase)
+                             && long.TryParse(line.Substring("Size = ".Length).Trim(), out long size))
+                    {
+                        curSize = size;
+                    }
+                }
+                FlushEntry();
+
+                // 一个条目都没解析出来时不下结论，回退全量测试
+                if (result.EntryCount == 0)
+                    result.Status = ProbeStatus.HeaderEncryptedOrError;
+
+                return result;
+            }, cancellationToken);
+        }
+
+        /// <summary>
         /// 测试密码是否正确
         /// </summary>
         /// <param name="archivePath">压缩包路径</param>
@@ -33,8 +164,13 @@ namespace AutoUnpackTool.Core.Services
         /// <param name="onOutput">输出回调</param>
         /// <param name="cancellationToken">取消令牌</param>
         /// <param name="useFastMode">使用快速模式（仅验证文件头，适合大文件），默认false（因为很多压缩包只加密内容不加密表头）</param>
-        public async Task<bool> TestPasswordAsync(string archivePath, string password, Action<string>? onOutput = null, CancellationToken cancellationToken = default, bool useFastMode = false)
+        /// <param name="testEntryPattern">定向快测条目名（仅测该条目，调用方需保证 IsSafeEntryPattern）；null=全量 t</param>
+        public async Task<bool> TestPasswordAsync(string archivePath, string password, Action<string>? onOutput = null, CancellationToken cancellationToken = default, bool useFastMode = false, string? testEntryPattern = null)
         {
+            // 不安全模式串直接放弃定向，回退全量 t
+            if (!string.IsNullOrEmpty(testEntryPattern) && !IsSafeEntryPattern(testEntryPattern))
+                testEntryPattern = null;
+
             return await Task.Run(() =>
             {
                 // 检查是否已取消
@@ -47,6 +183,9 @@ namespace AutoUnpackTool.Core.Services
                     // 't' 命令会完整解压并验证所有文件，大文件极慢
                     string command = useFastMode ? "l" : "t";
                     string args = $"{command} -p\"{password}\" -sccUTF-8 \"{archivePath}\"";
+                    // 定向快测：仅验证加密内容中的单个条目，错密码时同样报 data error/CRC 失败
+                    if (!string.IsNullOrEmpty(testEntryPattern))
+                        args += $" -i!\"{testEntryPattern}\"";
                     var startInfo = _runner.BuildStartInfo(args);
 
                     using var process = new Process { StartInfo = startInfo };

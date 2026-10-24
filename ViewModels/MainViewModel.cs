@@ -128,6 +128,10 @@ namespace AutoUnpackTool.ViewModels
         [ObservableProperty]
         private bool _isInstallerExtractMode;
 
+        /// <summary>快速密码测试（主界面快速开关，对应 AppSettings.FastPasswordTest）</summary>
+        [ObservableProperty]
+        private bool _isFastPasswordTest;
+
         [ObservableProperty]
         private int _extractProgress;
 
@@ -250,6 +254,7 @@ namespace AutoUnpackTool.ViewModels
 
             // 初始化安装包解压模式 / 快速密码测试复选框状态
             IsInstallerExtractMode = _settings.InstallerExtractMode;
+            IsFastPasswordTest = _settings.FastPasswordTest;
 
             // 初始化黑名单启用开关（SkipBlacklist 取反）
             _suppressBlacklistToggleEvent = true;
@@ -338,6 +343,21 @@ namespace AutoUnpackTool.ViewModels
             else
             {
                 _logger.Log("已关闭安装包解压模式：产物恢复黑名单清理与智能路径处理", ConsoleColor.Cyan);
+            }
+        }
+
+        partial void OnIsFastPasswordTestChanged(bool value)
+        {
+            _settings.FastPasswordTest = value;
+            _settings.Save();
+
+            if (_settings.FastPasswordTest)
+            {
+                _logger.Log("已启用快速密码测试：先探测加密标志，未加密包免全量校验", ConsoleColor.Cyan);
+            }
+            else
+            {
+                _logger.Log("已关闭快速密码测试：恢复传统全量 7z t 密码校验", ConsoleColor.Cyan);
             }
         }
 

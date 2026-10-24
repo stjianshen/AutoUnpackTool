@@ -55,6 +55,11 @@ namespace AutoUnpackTool.ViewModels
         /// <summary>安装包解压模式：产物跳过黑名单与智能路径扁平化，仅识别分卷/隐写产物</summary>
         [ObservableProperty]
         private bool _installerExtractMode;
+
+        /// <summary>快速密码测试：先探测加密标志，未加密包免全量 t 校验</summary>
+        [ObservableProperty]
+        private bool _fastPasswordTest;
+
         /// <summary>最终产物文件数阈值（文本框绑定，0=禁用）</summary>
         [ObservableProperty]
         private string _artifactThreshold = "10";
@@ -158,6 +163,7 @@ namespace AutoUnpackTool.ViewModels
             StegoDetection = Settings.EnableStegoDetection;
             StegoMinSizeMB = Settings.StegoDetectionMinFileSizeMB.ToString();
             InstallerExtractMode = Settings.InstallerExtractMode;
+            FastPasswordTest = Settings.FastPasswordTest;
             ArtifactThreshold = Settings.FinalArtifactFileCountThreshold.ToString();
 
             // 加载智能路径处理模式
@@ -383,6 +389,7 @@ namespace AutoUnpackTool.ViewModels
 
                 // 保存安装包模式 / 快速密码测试 / 产物阈值
                 Settings.InstallerExtractMode = InstallerExtractMode;
+                Settings.FastPasswordTest = FastPasswordTest;
                 Settings.FinalArtifactFileCountThreshold = artifactThreshold;
 
                 // 保存智能路径处理模式

@@ -423,6 +423,52 @@ namespace AutoUnpackTool.Core.Services
                 return;
             }
 
+            // 【快速密码测试】先用一次 7z l -slt 探测加密标志（不读数据区）：
+            // 未加密包直接入解压队列，省掉全盘 t 校验；内容加密时用最小条目定向快测快速排除错密码；
+            // 表头加密/探测失败自动回退传统全量测试，不损失正确性
+            string? fastTestEntry = null;
+            if (_settings.FastPasswordTest)
+            {
+                // 探测前要出声：探测期间测试线程是串行阻塞的，不记这条面板就会看起来“死住”
+                _logger.Log($"[{fileItem.FileName}] [快速密码测试] 正在探测加密标志...", ConsoleColor.Gray, fileItem);
+
+                var probe = await extractor.ProbeEncryptionAsync(fileItem.FilePath, token);
+                if (probe.Status == SevenZipExtractor.ProbeStatus.ReadableUnencrypted)
+                {
+                    _logger.Log($"[{fileItem.FileName}] [快速密码测试] 探测未加密，跳过密码校验直接入解压队列", ConsoleColor.Green, fileItem);
+                    _passwordMap.Add(fileItem.FilePath, null);
+                    _ui.InvokeOnUi(() =>
+                    {
+                        fileItem.FoundPassword = null;
+                        _ui.OnCurrentPassword("测试中的密码: 无");
+                        // 这里只是「跳过密码校验」，真解压还没跑，所以必须用非终态文案：
+                        // 写成解压成功会让 IsFinished 提前为真，兜底扁平化会在解压前把目录搬走。
+                        fileItem.Status = "正在解压...";
+                        _extractQueue.Enqueue(fileItem);
+                        WakeupExtractThread();
+                    });
+                    await Task.Delay(10, token);
+                    return;
+                }
+                else if (probe.Status == SevenZipExtractor.ProbeStatus.ReadableEncrypted
+                         && probe.EntryCount >= 2
+                         && SevenZipExtractor.IsSafeEntryPattern(probe.SmallestEntry))
+                {
+                    // 条目≥2 才值得定向测单条目（单条目大压缩包定向测与全量 t 等价，不省时间）
+                    fastTestEntry = probe.SmallestEntry;
+                    _logger.Log($"[{fileItem.FileName}] [快速密码测试] 已加密（{probe.EntryCount} 个条目），定向快测最小条目: {fastTestEntry}", ConsoleColor.Gray, fileItem);
+                }
+                else if (probe.Status == SevenZipExtractor.ProbeStatus.ReadableEncrypted)
+                {
+                    _logger.Log($"[{fileItem.FileName}] [快速密码测试] 已加密（{probe.EntryCount} 个条目），条目太少或条目名含特殊字符，转全量校验", ConsoleColor.Gray, fileItem);
+                }
+                else
+                {
+                    // 表头加密/列表失败/探测超时：不能拿探测结果下结论，回退传统全量测试
+                    _logger.Log($"[{fileItem.FileName}] [快速密码测试] 表头加密或探测未成功，回退传统全量校验", ConsoleColor.Yellow, fileItem);
+                }
+            }
+
             // 步骤2：尝试无密码
             _ui.InvokeOnUi(() =>
             {
@@ -436,7 +482,8 @@ namespace AutoUnpackTool.Core.Services
                 fileItem.FilePath, 
                 "", 
                 onOutput: (msg) => { },
-                cancellationToken: token);
+                cancellationToken: token,
+                testEntryPattern: fastTestEntry);
 
             _logger.Log($"[DEBUG-测试] {fileItem.FileName} 无密码测试结果: {noPasswordSuccess}", ConsoleColor.Cyan, fileItem);
 
@@ -466,7 +513,8 @@ namespace AutoUnpackTool.Core.Services
                         fileItem.FilePath, 
                         password,
                         onOutput: (msg) => { },
-                        cancellationToken: token);
+                        cancellationToken: token,
+                        testEntryPattern: fastTestEntry);
 
                     if (isValid)
                     {
@@ -475,8 +523,7 @@ namespace AutoUnpackTool.Core.Services
                         _settings.RecordPasswordUsage(password);
                         break;
                     }
-
-                    await Task.Delay(50, token);
+                    // 错误密码的快测成本已降为单条目量级，不再需要人为限速
                 }
                 
                 if (foundPassword == null)
@@ -535,7 +582,7 @@ namespace AutoUnpackTool.Core.Services
                 }
             });
 
-            await Task.Delay(100, token);
+            await Task.Delay(10, token);
         }
 
         /// <summary>

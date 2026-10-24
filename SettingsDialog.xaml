@@ -219,6 +219,14 @@
                                        Text="适用于解压出大量杂乱文件的安装包：产物目录结构保持原样不移动，拖入文件/文件夹仍照常清理"/>
                         </StackPanel>
 
+                        <!-- 快速密码测试 -->
+                        <StackPanel Margin="0,0,0,12">
+                            <CheckBox x:Name="ChkFastPasswordTest" Content="快速密码测试（先探测加密标志，未加密包免全量校验）" VerticalAlignment="Center"
+                                      IsChecked="{Binding FastPasswordTest, Mode=TwoWay}"/>
+                            <TextBlock Style="{StaticResource HintText}" Margin="0,5,0,0"
+                                       Text="探测失败或表头加密时自动回退传统全量测试，不影响正确性"/>
+                        </StackPanel>
+
                         <!-- 最终产物文件数阈值 -->
                         <StackPanel Margin="0,0,0,12">
                             <TextBlock Text="最终产物文件数阈值:" FontSize="11" Margin="0,0,0,3"/>

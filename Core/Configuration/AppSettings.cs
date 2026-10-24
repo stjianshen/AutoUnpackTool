@@ -88,6 +88,14 @@ namespace AutoUnpackTool.Core.Configuration
         /// 跳过收尾阶段智能路径扁平化与原目录合并（安装包目录结构移动后可能无法运行）。默认关闭。
         /// </summary>
         public bool InstallerExtractMode { get; set; } = false;
+
+        /// <summary>
+        /// 快速密码测试：先用 7z l -slt 探测压缩包是否加密，
+        /// 未加密直接入解压队列（省掉全盘 t 校验）；已加密且条目≥2时只测最小条目快速排除错误密码。
+        /// 列表读取失败/表头加密时自动回退传统全量测试。
+        /// </summary>
+        public bool FastPasswordTest { get; set; } = true;
+
         /// <summary>
         /// 隐写探测文件大小下限（MB），低于该值不做隐写探测
         /// 默认 10MB（视频文件通常不会太小）

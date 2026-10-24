@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using AutoUnpackTool.Core.Abstractions;
 using AutoUnpackTool.Core.Configuration;
 
@@ -46,6 +47,7 @@ namespace AutoUnpackTool.Core.Services
 
             if (hidden)
             {
+                startInfo.RedirectStandardInput = true;
                 startInfo.RedirectStandardOutput = true;
                 startInfo.RedirectStandardError = true;
                 startInfo.StandardOutputEncoding = Encoding.UTF8;
@@ -56,33 +58,80 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 捕获式执行：启动进程、读全标准输出/错误、等待至超时则 Kill。
-        /// 返回 (ExitCode, Output, Error)。7z 真实退出码非负；-1 表示不可用/超时/异常。
+        /// 捕获式执行：启动进程、异步读标准输出/错误、等待至超时则 Kill。
+        /// 返回 (ExitCode, Output, Error)。7z 真实退出码非负；-1 表示不可用/超时/取消/异常。
         /// </summary>
         public (int ExitCode, string Output, string Error) RunCapture(string args, int timeoutMs = DefaultTimeoutMs)
+            => RunCapture(args, timeoutMs, CancellationToken.None);
+
+        /// <summary>
+        /// 捕获式执行（可取消）。两个关键约束：
+        /// 1. 必须异步读两个流。先 ReadToEnd() 再 WaitForExit(timeout) 的写法会让超时形同虚设
+        ///    （ReadToEnd 自己就无限期阻塞），且 stderr 填满管道缓冲区时双向互锁。
+        /// 2. 必须接管并关闭标准输入。7z 遇到表头加密的压缩包会打印 “Enter password :”
+        ///    并等控制台输入；GUI 宿主没有控制台时它无限重试（进程 CPU 0%、永不退出）。
+        ///    给一个已关闭的 stdin，提示读到 EOF 后 7z 直接以错误退出。
+        /// </summary>
+        public (int ExitCode, string Output, string Error) RunCapture(string args, int timeoutMs, CancellationToken cancellationToken)
         {
             if (!IsAvailable)
                 return (-1, string.Empty, string.Empty);
 
+            var outputBuilder = new StringBuilder();
+            var errorBuilder = new StringBuilder();
+
             try
             {
                 using var process = new Process { StartInfo = BuildStartInfo(args) };
-                process.Start();
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
+                process.OutputDataReceived += (_, e) => { if (e.Data != null) { lock (outputBuilder) outputBuilder.Append(e.Data).Append('\n'); } };
+                process.ErrorDataReceived += (_, e) => { if (e.Data != null) { lock (errorBuilder) errorBuilder.Append(e.Data).Append('\n'); } };
 
-                if (!process.WaitForExit(timeoutMs))
+                process.Start();
+
+                try { process.StandardInput.Close(); } catch { }
+
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+
+                if (!WaitForExitOrCancel(process, timeoutMs, cancellationToken))
                 {
                     try { process.Kill(); } catch { }
-                    return (-1, output, error);
+                    try { process.WaitForExit(1000); } catch { }
+                    return (-1, Snapshot(outputBuilder), Snapshot(errorBuilder));
                 }
 
-                return (process.ExitCode, output, error);
+                // 无参 WaitForExit 会等异步读取器把缓冲区里的最后一行送完，否则输出会被截断
+                process.WaitForExit();
+                return (process.ExitCode, Snapshot(outputBuilder), Snapshot(errorBuilder));
             }
             catch
             {
-                return (-1, string.Empty, string.Empty);
+                return (-1, Snapshot(outputBuilder), Snapshot(errorBuilder));
             }
+        }
+
+        /// <summary>分片等待退出：同时受超时与取消令牌约束，两者任一命中都返回 false。</summary>
+        private bool WaitForExitOrCancel(Process process, int timeoutMs, CancellationToken cancellationToken)
+        {
+            int waited = 0;
+            const int sliceMs = 100;
+
+            while (!process.WaitForExit(sliceMs))
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    return false;
+
+                waited += sliceMs;
+                if (waited >= timeoutMs)
+                    return false;
+            }
+
+            return !cancellationToken.IsCancellationRequested;
+        }
+
+        private static string Snapshot(StringBuilder builder)
+        {
+            lock (builder) return builder.ToString();
         }
     }
 }

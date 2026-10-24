@@ -87,6 +87,11 @@
                       IsChecked="{Binding IsInstallerExtractMode, Mode=TwoWay}"
                       ToolTip="产物跳过黑名单删除与智能路径扁平化，仅识别分卷/隐写产物；适用于游戏安装包"/>
 
+            <!-- 快速密码测试快速开关（与“软件设置”同一字段，对后续任务生效） -->
+            <CheckBox x:Name="ChkFastPasswordTest" Content="快速密码测试" VerticalAlignment="Center" Margin="10,0,0,0"
+                      IsChecked="{Binding IsFastPasswordTest, Mode=TwoWay}"
+                      ToolTip="先用 7z l -slt 探测加密标志，未加密包免全量 t 校验；探测失败自动回退传统流程"/>
+
             <Separator Width="20" Visibility="Hidden"/>
 
             <!-- 最大解压层数设置（下拉列表，对应 AppSettings.MaxExtractDepth，0=不限制） -->
