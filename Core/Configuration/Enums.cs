@@ -21,6 +21,14 @@ namespace AutoUnpackTool.Core.Configuration
         Auto                // 自动解压
     }
 
+    /// <summary>界面主题模式（阶段 7：Fluent 外观）。命名避开 WPF 自带的 System.Windows.ThemeMode。</summary>
+    public enum AppThemeMode
+    {
+        System,             // 跟随系统深浅色（默认）
+        Light,              // 强制浅色
+        Dark                // 强制深色
+    }
+
     /// <summary>
     /// 智能路径处理模式
     /// </summary>

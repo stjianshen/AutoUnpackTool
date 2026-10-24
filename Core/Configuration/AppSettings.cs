@@ -108,6 +108,9 @@ namespace AutoUnpackTool.Core.Configuration
         // 永久密码（按使用次数排序）
         public List<PasswordEntry> PermanentPasswords { get; set; } = new List<PasswordEntry>();
 
+        // 界面主题模式（阶段 7）：0=跟随系统 1=浅色 2=深色，旧配置文件无此字段时取默认值
+        public AppThemeMode Theme { get; set; } = AppThemeMode.System;
+
         // 向后兼容：保留私有字段的引用
         private List<PasswordEntry> _permanentPasswords
         {

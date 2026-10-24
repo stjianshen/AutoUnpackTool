@@ -2,10 +2,80 @@
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
     <!--
-        阶段 7 预留：主题资源字典。
-        视图已与 ViewModel 解耦，后续引入 Wpf.Ui 等 Fluent 样式库时，
-        按钮/输入框/DataGrid/菜单的样式集中在此文件内扩展或整体替换，
+        本项目语义化样式：只补 WPF-UI 没覆盖的部分（GroupBox 卡片化、说明卡片）。
+        颜色一律走 Fluent 主题键的 DynamicResource，深浅色切换时自动跟随，
         不需要改动任何 ViewModel 与业务代码。
     -->
+
+    <!--
+        覆盖 WPF-UI 的输入框内边距：默认值 10,8,10,7（上下共 15px）。
+        本项目的单行输入框统一 Height=30，减去边框 2px 后内容区只剩 13px，
+        而 14px 字号的一行文字约 19px，会被挤到框体下沿（且 8/7 不对称再偏下 0.5px）。
+        改成对称的 5,2,5,2 后内容区 24px，VerticalContentAlignment=Center 才能真正居中。
+        一个键同时管住 ui:TextBox 与原生 TextBox（两者的 Padding 都引用它）。
+    -->
+    <Thickness x:Key="TextControlThemePadding">5,2,5,2</Thickness>
+
+    <!--
+        实测的 WPF-UI 4.3.0 控件自然高度（FontSize=14，行高≈18px）：
+            ComboBox      36（Padding 10,8,10,8 硬编码在样式里，不吃上面的键）
+            CheckBox      32（MinHeight=32）      RadioButton 32（MinHeight=32）
+            ui:Button     31（Padding 走 ButtonPadding 11,5,11,6）
+            TextBox       24（吃 TextControlThemePadding）    TitleBar 48
+        所以写死 Height=30 的下拉框会被切掉 6px（底部边框+文字下沿）。
+        ComboBox 的 Padding 无法用主题键单点覆盖，必须逐控件写 Padding="5,2,5,2"
+        （属性优先级高于样式 Setter），内容区变 22px 才能容下 18px 行高。
+    -->
+
+    <!-- GroupBox → Fluent 卡片：标题在卡片内顶部，内容在下 -->
+    <Style TargetType="{x:Type GroupBox}">
+        <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Padding" Value="8"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type GroupBox}">
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="6"
+                            Padding="{TemplateBinding Padding}">
+                        <DockPanel>
+                            <TextBlock DockPanel.Dock="Top"
+                                       Text="{TemplateBinding Header}"
+                                       FontSize="13"
+                                       FontWeight="SemiBold"
+                                       Margin="0,0,0,6"
+                                       Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+                            <ContentPresenter/>
+                        </DockPanel>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 说明/结果卡片（主窗口「最终路径」、黑名单规则说明） -->
+    <Style x:Key="InfoCard" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="6"/>
+        <Setter Property="Padding" Value="10"/>
+    </Style>
+
+    <!-- 次要提示文字 -->
+    <Style x:Key="HintText" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+        <Setter Property="FontSize" Value="11"/>
+        <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+
+    <!-- 分隔条 -->
+    <Style TargetType="{x:Type GridSplitter}">
+        <Setter Property="Background" Value="{DynamicResource DividerStrokeColorDefaultBrush}"/>
+    </Style>
 
 </ResourceDictionary>

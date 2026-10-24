@@ -30,6 +30,10 @@ namespace AutoUnpackTool
 
             _services = BuildServiceProvider();
 
+            // 启动即应用主题（跟随系统/浅色/深色），在创建窗口之前完成，避免先闪一下默认配色
+            _services.GetRequiredService<IThemeService>()
+                     .Apply(_services.GetRequiredService<AppSettings>().Theme);
+
             // ArchiveDetector 与 StegoService 互相引用：构造完成后回填，避免循环依赖
             var detector = _services.GetRequiredService<ArchiveDetector>();
             detector.Stego = _services.GetRequiredService<StegoService>();
@@ -37,6 +41,7 @@ namespace AutoUnpackTool
             // 启动主窗口（原 App.xaml 的 StartupUri="MainWindow.xaml" 已移除）
             var window = _services.GetRequiredService<MainWindow>();
             MainWindow = window;
+
             window.Show();
         }
 
@@ -55,6 +60,7 @@ namespace AutoUnpackTool
                 sp.GetRequiredService<Dispatcher>(),
                 sp.GetRequiredService<LogHub>().Append));
             services.AddSingleton<IClipboardService, ClipboardService>();
+            services.AddSingleton<IThemeService, ThemeService>();
             services.AddSingleton<IDialogService, DialogService>();
 
             // 配置（配置文件路径与重构前一致：%AppData%\AutoUnpackTool\settings.json）

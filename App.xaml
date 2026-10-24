@@ -1,14 +1,19 @@
 <Application x:Class="AutoUnpackTool.App"
-             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"  
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:services="clr-namespace:AutoUnpackTool.Services">
+             xmlns:services="clr-namespace:AutoUnpackTool.Services"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
     <Application.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
-                <!-- 阶段7 预留：主题资源字典（后续扩展或替换为 Fluent 样式库资源） -->
+                <!-- Fluent 主题字典：默认浅色，实际深浅色由 ThemeService 在启动时按配置切换 -->
+                <ui:ThemesDictionary Theme="Light"/>
+                <!-- Fluent 控件样式（Button/TextBox/DataGrid/TreeView 等） -->
+                <ui:ControlsDictionary/>
+                <!-- 本项目自己的语义化样式：WPF-UI 未覆盖的 GroupBox 等 -->
                 <ResourceDictionary Source="Resources/Theme/Theme.xaml"/>
             </ResourceDictionary.MergedDictionaries>
-            <!-- 日志颜色：ConsoleColor -> 画刷 -->
+            <!-- 日志颜色：ConsoleColor -> 画刷（随主题重调） -->
             <services:ConsoleColorToBrushConverter x:Key="ConsoleColorToBrush"/>
             <!-- bool -> Visibility -->
             <BooleanToVisibilityConverter x:Key="BoolToVis"/>
