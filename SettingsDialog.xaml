@@ -98,6 +98,24 @@
                                            Text="{Binding ThreadCountText, Mode=OneWay}"/>
                             </StackPanel>
                         </StackPanel>
+
+                        <!-- 输出产物重名处理（原主窗口“重复文件”下拉，已接入 ConflictResolver） -->
+                        <StackPanel Margin="0,0,0,15">
+                            <TextBlock Text="输出产物有重名文件时:" FontWeight="Bold" Margin="0,0,0,5"/>
+                            <ComboBox x:Name="CmbDuplicateAction" Width="240" Height="30" HorizontalAlignment="Left"
+                                      Padding="5,2,5,2" VerticalContentAlignment="Center"
+                                      SelectedIndex="{Binding DuplicatePolicyIndex, Mode=TwoWay}">
+                                <ComboBoxItem Content="跳过（仅内容完全相同才丢弃）"/>
+                                <ComboBoxItem Content="覆盖（仅限本工具生成的产物）"/>
+                                <ComboBoxItem Content="重命名（总是保留两份）"/>
+                            </ComboBox>
+                            <TextBlock Style="{StaticResource HintText}" TextWrapping="Wrap" Margin="0,8,0,0"
+                                       Text="作用于工具自己的整理/移动/合并阶段（智能路径扁平化、子目录并入父目录、清理目录归集）；7z 解压写入本身始终覆盖，不受此项影响。"/>
+                            <TextBlock Style="{StaticResource HintText}" TextWrapping="Wrap" Margin="0,3,0,0"
+                                       Text="安全护栏：不是本工具生成的文件或目录（未登记为解压节点），任何选项下都不会被递归删除，会自动降级为保留两份。"/>
+                            <TextBlock Style="{StaticResource HintText}" TextWrapping="Wrap" Margin="0,3,0,0"
+                                       Text="默认「跳过」：只在名字相同且内容一致时丢弃新的那一份，内容不同仍会保留两份；判重采用长度+首中尾抽样摘要。"/>
+                        </StackPanel>
                     </StackPanel>
                 </Expander>
 

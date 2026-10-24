@@ -152,8 +152,8 @@ namespace AutoUnpackTool.ViewModels
         [ObservableProperty]
         private string _maxExtractDepthText = "不限制";
 
-        [ObservableProperty]
-        private int _duplicateActionIndex;
+        // 输出产物重名策略不再在这里暴露：已移到“软件设置 → 基础设置”，
+        // 由 SettingsViewModel.DuplicatePolicyIndex 写入 AppSettings.DuplicateFileAction，ConflictResolver 实时读取。
 
         /// <summary>Dispatcher（UiTaskObserver 需要它做 UI 线程转投）</summary>
         public Dispatcher Dispatcher => _dispatcher;

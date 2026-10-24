@@ -65,6 +65,10 @@ namespace AutoUnpackTool.ViewModels
         [ObservableProperty]
         private int _themeIndex;
 
+        /// <summary>输出产物重名策略索引：0=跳过 1=覆盖 2=重命名（与 DuplicateFilePolicy 的数值一致）</summary>
+        [ObservableProperty]
+        private int _duplicatePolicyIndex;
+
         // 解压后文件处理方式
         [ObservableProperty]
         private bool _keepOriginal;
@@ -203,6 +207,9 @@ namespace AutoUnpackTool.ViewModels
 
             // 加载界面主题
             ThemeIndex = (int)Settings.Theme;
+
+            // 加载输出产物重名策略
+            DuplicatePolicyIndex = (int)Settings.DuplicateFileAction;
 
             // 加载黑名单规则摘要
             UpdateBlacklistSummary();
@@ -370,6 +377,9 @@ namespace AutoUnpackTool.ViewModels
 
                 // 保存界面主题（生效由 DialogService 在对话框关闭后调用 IThemeService.Apply）
                 Settings.Theme = (AppThemeMode)Math.Clamp(ThemeIndex, 0, 2);
+
+                // 保存输出产物重名策略：ConflictResolver 实时读 Settings，保存后立即生效无需重启
+                Settings.DuplicateFileAction = (DuplicateFilePolicy)Math.Clamp(DuplicatePolicyIndex, 0, 2);
 
                 // 黑名单规则由 BlacklistManagerDialog 直接保存到 Settings.BlacklistRules
 

@@ -68,21 +68,10 @@
             <ui:Button x:Name="BtnSettings" Content="软件设置" Width="100" Height="30" Command="{Binding OpenSettingsCommand}"/>
         </StackPanel>
 
-        <!-- 第三行：控制选项 -->
+        <!-- 第三行：控制选项（输出产物重名策略已移到“软件设置 → 基础设置”） -->
         <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,10">
-            <TextBlock Text="重复文件:" VerticalAlignment="Center" Margin="0,0,5,0"/>
-            <!-- 重复文件处理策略：对应 MainViewModel.DuplicateActionIndex（0=跳过 1=覆盖 2=重命名） -->
-            <ComboBox x:Name="CmbDuplicateAction" Width="120" Height="30" Padding="5,2,5,2" VerticalContentAlignment="Center"
-                      SelectedIndex="{Binding DuplicateActionIndex, Mode=TwoWay}">
-                <ComboBoxItem Content="跳过"/>
-                <ComboBoxItem Content="覆盖"/>
-                <ComboBoxItem Content="重命名"/>
-            </ComboBox>
-
-            <Separator Width="20" Visibility="Hidden"/>
-
             <!-- 强制解压模式复选框 -->
-            <CheckBox x:Name="ChkForceExtractMode" Content="强制解压模式(跳过检测)" VerticalAlignment="Center" Margin="10,0,0,0"
+            <CheckBox x:Name="ChkForceExtractMode" Content="强制解压模式(跳过检测)" VerticalAlignment="Center"
                       IsChecked="{Binding IsForceExtractMode, Mode=TwoWay}"/>
 
             <!-- 黑名单总开关（规则在“软件设置”中管理） -->
