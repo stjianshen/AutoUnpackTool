@@ -111,6 +111,12 @@ namespace AutoUnpackTool.Core.Configuration
         // 界面主题模式（阶段 7）：0=跟随系统 1=浅色 2=深色，旧配置文件无此字段时取默认值
         public AppThemeMode Theme { get; set; } = AppThemeMode.System;
 
+        /// <summary>
+        /// 输出产物重名时的处理策略：0=跳过 1=覆盖 2=重命名。
+        /// 默认 Skip，等价于迁移前 SmartPathService 已有的“同名同大小跳过、否则保留两份”行为。
+        /// </summary>
+        public DuplicateFilePolicy DuplicateFileAction { get; set; } = DuplicateFilePolicy.Skip;
+
         // 向后兼容：保留私有字段的引用
         private List<PasswordEntry> _permanentPasswords
         {

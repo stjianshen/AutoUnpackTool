@@ -30,6 +30,17 @@ namespace AutoUnpackTool.Core.Configuration
     }
 
     /// <summary>
+    /// 输出产物重名冲突的处理策略（由 ConflictResolver 统一执行）。
+    /// 作用于工具自身的整理/移动/合并阶段；7z 解压写入本身始终覆盖（-y），不受本设置影响。
+    /// </summary>
+    public enum DuplicateFilePolicy
+    {
+        Skip,               // 跳过：同名且内容一致则丢弃新产物；内容不一致仍会保留两份（默认）
+        Overwrite,          // 覆盖：删掉已存在的目标再写入（仅限本工具生成的目标）
+        Rename              // 重命名：一律保留两份，给新产物加唯一后缀
+    }
+
+    /// <summary>
     /// 智能路径处理模式
     /// </summary>
     public enum SmartPathMode

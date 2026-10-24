@@ -23,6 +23,7 @@ namespace AutoUnpackTool.Core.Services
         private readonly ArchiveDetector _detector;
         private readonly VolumeDetector _volumeDetector;
         private readonly BlacklistService _blacklistService;
+        private readonly ConflictResolver _conflicts;
 
         public ConcurrentDictionary<string, byte> ExtractedDirectoryNodes { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> FlattenedFinalPathMap { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -35,13 +36,14 @@ namespace AutoUnpackTool.Core.Services
         /// </summary>
         public Func<List<FileItem>> GetAllItemsSnapshot { get; set; } = null!;
 
-        public SmartPathService(AppSettings settings, IAppLogger logger, ArchiveDetector detector, VolumeDetector volumeDetector, BlacklistService blacklistService)
+        public SmartPathService(AppSettings settings, IAppLogger logger, ArchiveDetector detector, VolumeDetector volumeDetector, BlacklistService blacklistService, ConflictResolver conflicts)
         {
             _settings = settings;
             _logger = logger;
             _detector = detector;
             _volumeDetector = volumeDetector;
             _blacklistService = blacklistService;
+            _conflicts = conflicts;
         }
 
         // 与 MainWindow 原字段同名转发，保证方法体逐行未变
@@ -700,23 +702,12 @@ namespace AutoUnpackTool.Core.Services
                             continue;
                         }
 
-                        if (Directory.Exists(destPath))
-                        {
-                            if (_extractedDirectoryNodes.ContainsKey(destPath))
-                            {
-                                // 目标是已标记的解压节点目录，安全删除后替换
-                                Directory.Delete(destPath, true);
-                                _logger.Log($"[批量智能路径]   已替换已存在的解压节点目录: {entryName}", ConsoleColor.Gray);
-                            }
-                            else
-                            {
-                                // 目标是非解压节点的目录，不能删除，使用GUID前缀避免冲突
-                                string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{entryName}";
-                                destPath = Path.Combine(dirPath, safeName);
-                                _logger.Log($"[批量智能路径] ⚠ 目标目录已存在且非解压节点，使用安全名称: {safeName}", ConsoleColor.Yellow);
-                            }
-                        }
-                        Directory.Move(entry, destPath);
+                        // 重名冲突交给 ConflictResolver 统一裁决（护栏：非解压节点目录禁止递归删除）
+                        string? movedDir = _conflicts.TryMove(entry, destPath, ConflictKind.Directory,
+                            _extractedDirectoryNodes.ContainsKey(destPath), NamingStyle.GuidPrefix);
+                        if (movedDir == null)
+                            continue;
+                        destPath = movedDir;
                         _logger.Log($"[批量智能路径]   已移动目录: {entryName}", ConsoleColor.Gray);
 
                         // 同步更新解压节点标记
@@ -729,30 +720,14 @@ namespace AutoUnpackTool.Core.Services
                     }
                     else
                     {
-                        // 【修复】同名文件不再直接删除覆盖（两个版本内容可能不同，直接删会丢图片）：
-                        // 大小相同视为重复文件，跳过移动保留 dirPath 版本；
-                        // 大小不同说明内容不同，子目录版本用安全名称保留两份。
-                        if (File.Exists(destPath))
-                        {
-                            bool isDuplicate = false;
-                            try
-                            {
-                                var destLen = new FileInfo(destPath).Length;
-                                var srcLen = new FileInfo(entry).Length;
-                                isDuplicate = destLen == srcLen;
-                            }
-                            catch { /* 信息读取失败按非重复处理，用安全名保留两份 */ }
-
-                            if (isDuplicate)
-                            {
-                                _logger.Log($"[批量智能路径]   跳过重复文件（同名同大小）: {entryName}", ConsoleColor.Gray);
-                                continue;
-                            }
-                            string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{entryName}";
-                            destPath = Path.Combine(dirPath, safeName);
-                            _logger.Log($"[批量智能路径] ⚠ 同名文件大小不同，使用安全名称保留: {entryName} -> {safeName}", ConsoleColor.Yellow);
-                        }
-                        File.Move(entry, destPath);
+                        // 文件类冲突同样交给 resolver：Skip 时“同名同内容→丢弃，内容不同→保留两份”。
+                        // 这里 targetOwnedByTool 传 true：7z 解压阶段本来就是 -y 覆盖语义，
+                        // 对单个文件开放“覆盖”策略与之一致；递归删除的护栏只加在目录上。
+                        string? movedFile = _conflicts.TryMove(entry, destPath, ConflictKind.File,
+                            true, NamingStyle.GuidPrefix);
+                        if (movedFile == null)
+                            continue;
+                        destPath = movedFile;
                         _logger.Log($"[批量智能路径]   已移动文件: {entryName}", ConsoleColor.Gray);
                     }
                     movedCount++;
@@ -889,14 +864,14 @@ namespace AutoUnpackTool.Core.Services
                     
                     try
                     {
-                        if (File.Exists(finalPath))
-                        {
-                            File.Delete(finalPath);
-                            _logger.Log($"[批量智能路径] [最外层扁平化] 已删除已存在的文件: {originalFileName}", ConsoleColor.Gray);
-                        }
-                        
-                        File.Move(currentPath, finalPath);
-                        _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 已重命名压缩包去掉临时前缀: {Path.GetFileName(currentPath)} -> {originalFileName}", ConsoleColor.Green);
+                        // 去前缀时撞名：迁移前这里无条件 File.Delete(finalPath)，会静默删掉父目录里
+                        // 原本就存在的同名压缩包。finalPath 未被工具登记过，按不变量传 targetOwnedByTool=false，
+                        // 于是「覆盖」策略会被降级为保留两份，内容一致时才丢弃临时件。
+                        string? renamed = _conflicts.TryMove(currentPath, finalPath, ConflictKind.File, false);
+                        if (renamed == null)
+                            _logger.Log($"[批量智能路径] [最外层扁平化] 与已有同名压缩包内容一致，丢弃临时件: {Path.GetFileName(currentPath)}", ConsoleColor.Gray);
+                        else
+                            _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 已重命名压缩包去掉临时前缀: {Path.GetFileName(currentPath)} -> {Path.GetFileName(renamed)}", ConsoleColor.Green);
                     }
                     catch (Exception renameEx)
                     {
@@ -910,26 +885,16 @@ namespace AutoUnpackTool.Core.Services
                     string finalPath = Path.Combine(parentDirFullPath, subDirName);
                     try
                     {
-                        if (Directory.Exists(finalPath))
+                        // 同样收拢到 ConflictResolver：只有登记的解压节点目录才允许被替换删除，
+                        // 用户原始目录一律改用安全名称保留两份。
+                        string? renamed = _conflicts.TryMove(newPath, finalPath, ConflictKind.Directory,
+                            _extractedDirectoryNodes.ContainsKey(finalPath), NamingStyle.GuidPrefix);
+                        if (renamed != null)
                         {
-                            // 【安全检查】只删除已知的解压节点目录，避免误删用户数据
-                            if (_extractedDirectoryNodes.ContainsKey(finalPath))
-                            {
-                                Directory.Delete(finalPath, true);
-                                _logger.Log($"[批量智能路径] [最外层扁平化] 已删除已存在的最终目录: {subDirName}", ConsoleColor.Gray);
-                            }
-                            else
-                            {
-                                // 目标目录非解压节点，使用GUID前缀避免冲突
-                                string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{subDirName}";
-                                finalPath = Path.Combine(parentDirFullPath, safeName);
-                                _logger.Log($"[批量智能路径] [最外层扁平化] ⚠ 目标目录已存在且非解压节点，使用安全名称: {safeName}", ConsoleColor.Yellow);
-                            }
+                            finalPath = renamed;
+                            newPath = finalPath; // 更新路径为最终路径
+                            _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 已重命名去掉临时前缀: {Path.GetFileName(finalPath)}", ConsoleColor.Green);
                         }
-                        
-                        Directory.Move(newPath, finalPath);
-                        _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 已重命名去掉临时前缀: {Path.GetFileName(newPath)} -> {subDirName}", ConsoleColor.Green);
-                        newPath = finalPath; // 更新路径为最终路径
                     }
                     catch (Exception renameEx)
                     {
@@ -1116,24 +1081,14 @@ namespace AutoUnpackTool.Core.Services
                 // 步骤3: 重命名为最终名称
                 string finalPath = Path.Combine(parentDirPath, finalName);
                 
-                // 【安全删除检查】目标目录已存在时，只删除已知的解压节点目录
-                // 避免静默覆盖非扁平化产生的用户原始目录
-                if (Directory.Exists(finalPath))
-                {
-                    if (_extractedDirectoryNodes.ContainsKey(finalPath))
-                    {
-                        // 目标是已知的解压节点，安全删除并替换
-                        Directory.Delete(finalPath, true);
-                        _logger.Log($"[批量智能路径]   已替换已存在的解压节点目录: {finalName}", ConsoleColor.Gray);
-                    }
-                    else
-                    {
-                        // 目标是非解压节点的目录，不能删除，使用GUID前缀避免冲突
-                        string safeName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{finalName}";
-                        finalPath = Path.Combine(parentDirPath, safeName);
-                        _logger.Log($"[批量智能路径] ⚠ 目标目录已存在且非解压节点，使用安全名称: {safeName}", ConsoleColor.Yellow);
-                    }
-                }
+                // 重名裁决统一交给 ConflictResolver：非解压节点的用户原始目录在任何策略下都不会被递归删除
+                var renameDecision = _conflicts.Resolve(tempPath, finalPath, ConflictKind.Directory,
+                    _extractedDirectoryNodes.ContainsKey(finalPath), NamingStyle.GuidPrefix);
+                if (renameDecision.Note != null)
+                    _logger.Log($"[批量智能路径] {renameDecision.Note}", renameDecision.NoteColor);
+                if (renameDecision.ShouldDeleteTarget)
+                    Directory.Delete(renameDecision.FinalPath, true);
+                finalPath = renameDecision.FinalPath;
 
                 // 添加重试机制，防止文件占用导致卡住
                 retryCount = 0;
@@ -1353,16 +1308,23 @@ namespace AutoUnpackTool.Core.Services
                 
                 try
                 {
-                    // 如果目标已存在，先删除
-                    if (Directory.Exists(finalPath))
+                    // 【止血】迁移前这里是对任意已存在目录做无护栏的 Directory.Delete(finalPath, true)，
+                    // 会静默吞掉用户原始目录。现统一走 ConflictResolver，只有登记的解压节点才可被替换。
+                    string? renamed = _conflicts.TryMove(tempPath, finalPath, ConflictKind.Directory,
+                        _extractedDirectoryNodes.ContainsKey(finalPath), NamingStyle.GuidPrefix);
+                    if (renamed == null)
                     {
-                        Directory.Delete(finalPath, true);
-                        _logger.Log($"[智能路径]   已删除已存在的: {finalFolderName}", ConsoleColor.Gray);
+                        _logger.Log($"[智能路径] ⚠ 重名裁决要求跳过，保留临时名称: {tempName}", ConsoleColor.Yellow);
+                        return false;
                     }
-                    
-                    Directory.Move(tempPath, finalPath);
-                    _logger.Log($"[智能路径]   已重命名: {tempName} -> {finalFolderName}", ConsoleColor.Green);
-                    
+
+                    finalPath = renamed;
+                    _logger.Log($"[智能路径]   已重命名: {tempName} -> {Path.GetFileName(finalPath)}", ConsoleColor.Green);
+
+                    // 同步解压节点标记：临时路径 -> 最终路径
+                    if (_extractedDirectoryNodes.TryRemove(tempPath, out _))
+                        _extractedDirectoryNodes.TryAdd(finalPath, 0);
+
                     // 更新 extractedFolder 指向新位置，以便循环继续处理
                     extractedFolder = finalPath;
                     return true;

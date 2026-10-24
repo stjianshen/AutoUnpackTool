@@ -172,7 +172,8 @@ namespace AutoUnpackTool.ViewModels
             ArchiveDetector detector,
             StegoService stego,
             FileCleanupService cleanup,
-            SmartPathService smartPath)
+            SmartPathService smartPath,
+            ConflictResolver conflicts)
         {
             _settings = settings;
             _logger = logger;
@@ -194,7 +195,7 @@ namespace AutoUnpackTool.ViewModels
 
             // 解压管线：双队列 + 递归扫描 + 收尾；UI 交互通过 ITaskObserver 上报
             _pipeline = new ExtractionPipeline(_settings, _logger, new UiTaskObserver(this),
-                _detector, _stego, _archiveNameCleaner, _blacklistService, _cleanup, _smartPath, _volumeDetector);
+                _detector, _stego, _archiveNameCleaner, _blacklistService, _cleanup, _smartPath, _volumeDetector, conflicts);
             _pipeline.AttachFileList(_fileList);
 
             // 文件收集（拖拽/目录扫描 → 文件树）

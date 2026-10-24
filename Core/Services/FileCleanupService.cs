@@ -19,11 +19,13 @@ namespace AutoUnpackTool.Core.Services
     {
         private readonly AppSettings _settings;
         private readonly IAppLogger _logger;
+        private readonly ConflictResolver _conflicts;
 
-        public FileCleanupService(AppSettings settings, IAppLogger logger)
+        public FileCleanupService(AppSettings settings, IAppLogger logger, ConflictResolver conflicts)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _conflicts = conflicts ?? throw new ArgumentNullException(nameof(conflicts));
         }
         
         /// <summary>
@@ -577,20 +579,13 @@ namespace AutoUnpackTool.Core.Services
                     if (File.Exists(volumePath))
                     {
                         string destPath = Path.Combine(_settings.ArchiveCleanupDir, Path.GetFileName(volumePath));
-                        
-                        // 如果目标文件已存在，添加序号
+
+                        // 清理目录是工具自建的收集箱，固定“保留两份”而不受重名策略影响；
+                        // 唯一名的造法统一走 ConflictResolver 的序号风格。
                         if (File.Exists(destPath))
-                        {
-                            string nameWithoutExt = Path.GetFileNameWithoutExtension(destPath);
-                            string ext = Path.GetExtension(destPath);
-                            int counter = 1;
-                            while (File.Exists(destPath))
-                            {
-                                destPath = Path.Combine(_settings.ArchiveCleanupDir, $"{nameWithoutExt}_{counter}{ext}");
-                                counter++;
-                            }
-                        }
-                        
+                            destPath = _conflicts.BuildUniquePath(_settings.ArchiveCleanupDir,
+                                Path.GetFileName(volumePath), NamingStyle.NumericSuffix);
+
                         await Task.Run(() => File.Move(volumePath, destPath));
                         _logger.Log($"  已移动分卷: {Path.GetFileName(volumePath)} -> {Path.GetFileName(destPath)}", ConsoleColor.Yellow);
                         movedCount++;
@@ -624,20 +619,12 @@ namespace AutoUnpackTool.Core.Services
             try
             {
                 string destPath = Path.Combine(_settings.ArchiveCleanupDir, Path.GetFileName(filePath));
-                
-                // 如果目标文件已存在，添加序号
+
+                // 同上：清理目录固定保留两份，序号命名由 ConflictResolver 统一生成
                 if (File.Exists(destPath))
-                {
-                    string nameWithoutExt = Path.GetFileNameWithoutExtension(destPath);
-                    string ext = Path.GetExtension(destPath);
-                    int counter = 1;
-                    while (File.Exists(destPath))
-                    {
-                        destPath = Path.Combine(_settings.ArchiveCleanupDir, $"{nameWithoutExt}_{counter}{ext}");
-                        counter++;
-                    }
-                }
-                
+                    destPath = _conflicts.BuildUniquePath(_settings.ArchiveCleanupDir,
+                        Path.GetFileName(filePath), NamingStyle.NumericSuffix);
+
                 await Task.Run(() => File.Move(filePath, destPath));
                 _logger.Log($"  原文件已移动: {Path.GetFileName(filePath)} -> {destPath}", ConsoleColor.Yellow);
             }

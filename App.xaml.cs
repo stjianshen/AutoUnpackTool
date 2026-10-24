@@ -67,6 +67,7 @@ namespace AutoUnpackTool
             services.AddSingleton(_ => AppSettings.Load());
 
             // Core 服务（Singleton：保持缓存/状态在进程内共享）
+            services.AddSingleton<ConflictResolver>();
             services.AddSingleton<BlacklistService>();
             services.AddSingleton<ArchiveNameCleaner>();
             services.AddSingleton<VolumeDetector>();

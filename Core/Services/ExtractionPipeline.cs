@@ -28,6 +28,7 @@ namespace AutoUnpackTool.Core.Services
         private readonly BlacklistService _blacklistService;
         private readonly FileCleanupService _cleanup;
         private readonly SmartPathService _smartPath;
+        private readonly ConflictResolver _conflicts;
         private readonly VolumeDetector _volumeDetector;
 
         // ---- 共享状态（原 MainWindow 字段，保持原名以让方法体逐行不变） ----
@@ -62,7 +63,8 @@ namespace AutoUnpackTool.Core.Services
             BlacklistService blacklistService,
             FileCleanupService cleanup,
             SmartPathService smartPath,
-            VolumeDetector volumeDetector)
+            VolumeDetector volumeDetector,
+            ConflictResolver conflicts)
         {
             _settings = settings;
             _logger = logger;
@@ -74,6 +76,7 @@ namespace AutoUnpackTool.Core.Services
             _cleanup = cleanup;
             _smartPath = smartPath;
             _volumeDetector = volumeDetector;
+            _conflicts = conflicts;
         }
 
         /// <summary>绑定文件树集合（必须在窗口构造时调用；集合实例不做替换）</summary>
@@ -1197,34 +1200,22 @@ namespace AutoUnpackTool.Core.Services
                                 string entryName = Path.GetFileName(entry);
                                 string destPath = Path.Combine(archiveParentDir, entryName);
                                 
-                                if (Directory.Exists(entry))
+                                // 子目录内容并入父目录时的重名冲突，统一交给 ConflictResolver：
+                                // 迁移前文件是无判据直接覆盖删除、目录在非解压节点上会因 Directory.Move 抛异常。
+                                bool entryIsDir = Directory.Exists(entry);
+                                string? movedEntry = _conflicts.TryMove(entry, destPath,
+                                    entryIsDir ? ConflictKind.Directory : ConflictKind.File,
+                                    entryIsDir && _extractedDirectoryNodes.ContainsKey(destPath),
+                                    NamingStyle.GuidPrefix);
+                                if (movedEntry == null)
+                                    continue;   // 同名同内容，丢弃子目录里的这一份
+
+                                if (entryIsDir && _extractedDirectoryNodes.ContainsKey(entry))
                                 {
-                                    // 如果目标已存在且是解压节点，先删除再移动
-                                    if (Directory.Exists(destPath) && _extractedDirectoryNodes.ContainsKey(destPath))
-                                    {
-                                        Directory.Delete(destPath, true);
-                                        _logger.Log($"[阶段4]   已删除已存在的解压节点目录: {entryName}", ConsoleColor.Gray);
-                                    }
-                                    Directory.Move(entry, destPath);
-                                    _logger.Log($"[阶段4]   已移动目录: {entryName} -> {archiveParentDir}", ConsoleColor.Gray);
-                                    
-                                    // 同步更新 _extractedDirectoryNodes
-                                    if (_extractedDirectoryNodes.ContainsKey(entry))
-                                    {
-                                        _extractedDirectoryNodes.TryRemove(entry, out _);
-                                        _extractedDirectoryNodes.TryAdd(destPath, 0);
-                                    }
+                                    _extractedDirectoryNodes.TryRemove(entry, out _);
+                                    _extractedDirectoryNodes.TryAdd(movedEntry, 0);
                                 }
-                                else
-                                {
-                                    // 如果目标文件已存在，覆盖
-                                    if (File.Exists(destPath))
-                                    {
-                                        File.Delete(destPath);
-                                    }
-                                    File.Move(entry, destPath);
-                                    _logger.Log($"[阶段4]   已移动文件: {entryName}", ConsoleColor.Gray);
-                                }
+                                _logger.Log($"[阶段4]   已移动{(entryIsDir ? "目录" : "文件")}: {entryName} -> {Path.GetFileName(movedEntry)}", ConsoleColor.Gray);
                             }
                             
                             // 删除已清空的子目录
