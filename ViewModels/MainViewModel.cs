@@ -124,6 +124,10 @@ namespace AutoUnpackTool.ViewModels
         [ObservableProperty]
         private bool _isBlacklistEnabled;
 
+        /// <summary>安装包解压模式（主界面快速开关，与设置对话框绑定同一 AppSettings 字段）</summary>
+        [ObservableProperty]
+        private bool _isInstallerExtractMode;
+
         [ObservableProperty]
         private int _extractProgress;
 
@@ -244,6 +248,9 @@ namespace AutoUnpackTool.ViewModels
             // 初始化强制解压模式复选框状态
             IsForceExtractMode = _settings.ForceExtractMode;
 
+            // 初始化安装包解压模式 / 快速密码测试复选框状态
+            IsInstallerExtractMode = _settings.InstallerExtractMode;
+
             // 初始化黑名单启用开关（SkipBlacklist 取反）
             _suppressBlacklistToggleEvent = true;
             IsBlacklistEnabled = !_settings.SkipBlacklist;
@@ -316,6 +323,21 @@ namespace AutoUnpackTool.ViewModels
             else
             {
                 _logger.Log($"已启用黑名单：匹配的文件将被永久删除（{GetEnabledBlacklistRuleCount()} 条规则）", ConsoleColor.Cyan);
+            }
+        }
+
+        partial void OnIsInstallerExtractModeChanged(bool value)
+        {
+            _settings.InstallerExtractMode = value;
+            _settings.Save();
+
+            if (_settings.InstallerExtractMode)
+            {
+                _logger.Log("已启用安装包解压模式：产物跳过黑名单与智能路径扁平化，仅识别分卷/隐写产物", ConsoleColor.Yellow);
+            }
+            else
+            {
+                _logger.Log("已关闭安装包解压模式：产物恢复黑名单清理与智能路径处理", ConsoleColor.Cyan);
             }
         }
 

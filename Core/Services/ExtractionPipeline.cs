@@ -1158,7 +1158,10 @@ namespace AutoUnpackTool.Core.Services
             // 【修复】不再调用 ProcessSmartPathBatchAsync（它会向上扁平化到祖目录），
             // 改为就地合并：将唯一子目录的内容提升到 archiveParentDir 内，不越过 root 节点。
             // 优化：仅当父目录恰好有1个子目录且无非压缩包文件时才处理，避免无意义的遍历。
-            string? archiveParentDir = Path.GetDirectoryName(topArchivePath);
+            // 安装包解压模式：产物目录结构不可移动，整块跳过（置空 archiveParentDir 使下方分支全部旁路）
+            if (_settings.InstallerExtractMode)
+                _logger.Log($"[阶段4] 安装包解压模式：跳过归档父目录合并", ConsoleColor.Cyan);
+            string? archiveParentDir = _settings.InstallerExtractMode ? null : Path.GetDirectoryName(topArchivePath);
             if (!string.IsNullOrEmpty(archiveParentDir) && Directory.Exists(archiveParentDir))
             {
                 var parentSubDirs = Directory.GetDirectories(archiveParentDir);
@@ -1373,21 +1376,14 @@ namespace AutoUnpackTool.Core.Services
                     _passwordMap.Remove(filePath);
                     _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 已从密码映射表清除", ConsoleColor.Gray, fileItem);
 
-                    // 添加短暂延迟，让7z.exe进程完全释放文件句柄
-                    await Task.Delay(500);
-
-                    // 空产物校验：成功但输出目录无新文件时告警（识别"解压成功但无内容"）
-                    if (Directory.Exists(outputDir))
-                    {
-                        int newFileCount = Directory.GetFiles(outputDir, "*.*", SearchOption.AllDirectories)
-                            .Count(f => !existingFilesBeforeExtract.Contains(f));
-                        if (newFileCount == 0)
-                            _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 解压成功但未产生任何新文件（空压缩包？）", ConsoleColor.Yellow, fileItem);
-                    }
+                    // 短暂延迟让7z.exe进程释放文件句柄（原 500ms 固定等待压缩为 100ms，
+                    // 文件占用重试依赖 EnumerateFilesSafe / TryDeleteWithRetry 既有机制）
+                    await Task.Delay(100);
 
                     // 先检查解压后的文件是否包含新的压缩文件
                     // 这会添加子项到 fileItem.Children，并将新文件加入待处理队列
                     // 传入 existingFilesBeforeExtract 过滤掉解压前已存在的文件
+                    // （空产物告警已合并到 ScanExtractedFilesForArchives 内部，不再在此单独递归枚举）
                     await ScanExtractedFilesForArchives(outputDir, taskId, fileItem, existingFilesBeforeExtract);
                     
                     // 【残留清理】隐写文件解压后，删除非压缩包的残留文件
@@ -1578,19 +1574,43 @@ namespace AutoUnpackTool.Core.Services
                     filesToScan = allFiles.ToList();
                 }
 
+                // 空产物校验（与扫描共用同一次枚举，不再单独递归）：
+                // 识别"解压成功但无内容"，沿用原 ProcessExtractFile 中的告警文案
+                if (filesToScan.Count == 0)
+                    _logger.Log($"[线程 {taskId}] {parentFileItem?.FileName}: 解压成功但未产生任何新文件（空压缩包？）", ConsoleColor.Yellow, parentFileItem);
+
                 // 【防和谐清理】解压发现的嵌套文件也可能带防和谐脏名，检测前先清理
                 filesToScan = _archiveNameCleaner.CleanDirtyArchiveFileNames(filesToScan);
 
-                // 统一对新解压的文件走 Classify 判定
-                foreach (var file in filesToScan)
+                // 产物数超阈值或安装包模式 → 降级为强信号扫描（不对每个杂文件开文件读魔术数）；
+                // 判定统一收拢在 ArchiveDetector.ShouldUseStrongSignalScan，不在此处复制规则
+                var scanLevel = _detector.ShouldUseStrongSignalScan(filesToScan.Count)
+                    ? ArchiveDetector.DetectionLevel.StrongSignalsOnly
+                    : ArchiveDetector.DetectionLevel.Full;
+                if (scanLevel == ArchiveDetector.DetectionLevel.StrongSignalsOnly)
                 {
-                    // 解压产物即使扩展名命中也强制魔术数验证（修复伪装后缀），
-                    // 且不再作为隐写容器（递归发现的媒体文件是最终产物）
-                    if (_detector.Classify(file, FileOrigin.ExtractedArtifact) != ArchiveDetector.ArchiveKind.NotArchive)
-                    {
-                        allArchiveFiles.Add(file);
-                    }
+                    string reason = _settings.InstallerExtractMode
+                        ? "安装包解压模式"
+                        : $"新文件数 {filesToScan.Count} > 阈值 {_settings.FinalArtifactFileCountThreshold}";
+                    _logger.Log($"[线程 {taskId}] [产物短路] {reason}，仅扫描分卷/压缩包后缀/隐写载体", ConsoleColor.Yellow, parentFileItem);
                 }
+
+                // 统一对新解压的文件走 Classify 判定：魔术数验证需逐个开文件，串行时为 IO 瓶颈 → 受限并行
+                // （与下方隐写验证同款并行范式，完成后按路径排序还原确定性顺序）
+                var detectedFiles = new ConcurrentBag<string>();
+                int classifyParallelism = Math.Max(1, _settings.ThreadCount);
+                Parallel.ForEach(filesToScan,
+                    new ParallelOptions { MaxDegreeOfParallelism = classifyParallelism },
+                    file =>
+                {
+                    // 解压产物即使扩展名命中也强制魔术数验证（修复伪装后缀）；
+                    // 递归发现的媒体文件默认不再当容器（安装包模式下由 Classify 内部放开隐写探测）
+                    if (_detector.Classify(file, FileOrigin.ExtractedArtifact, false, scanLevel) != ArchiveDetector.ArchiveKind.NotArchive)
+                    {
+                        detectedFiles.Add(file);
+                    }
+                });
+                allArchiveFiles = detectedFiles.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
 
                 // 【隐写垃圾过滤】-t# 哈希扫描产生的文件用标准 7z l（不带 -t#）逐文件验证
                 // 真正的压缩包通得过标准检测，-t# 误匹配的垃圾文件通不过
@@ -1662,8 +1682,9 @@ namespace AutoUnpackTool.Core.Services
                 int addedCount = 0;
                 foreach (var archiveFile in allArchiveFiles)
                 {
-                    // 检查黑名单 - 命中则带重试删除，不加入处理队列（删除逻辑统一下沉至 BlacklistService）
-                    if (_blacklistService.IsBlacklistedFile(archiveFile, out string matchedPattern))
+                    // 检查黑名单 - 命中则带重试删除，不加入处理队列（删除逻辑统一下沉至 BlacklistService）；
+                    // 走产物专用入口：安装包解压模式下解压产物豁免黑名单（拖入/文件夹扫描仍走 IsBlacklistedFile）
+                    if (_blacklistService.IsBlacklistedExtractedArtifact(archiveFile, out string matchedPattern))
                     {
                         _blacklistService.TryDeleteWithRetry(archiveFile, matchedPattern);
                         continue;  // 跳过后续处理，不添加到列表

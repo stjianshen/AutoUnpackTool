@@ -27,6 +27,9 @@ namespace AutoUnpackTool.Core.Services
         private readonly SevenZipRunner _runner;
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
 
+        private HashSet<string>? _archiveExtSetCache;
+        private string _archiveExtSetCacheKey = string.Empty;
+
         public ArchiveDetector(AppSettings settings, IAppLogger logger, VolumeDetector volumeDetector, SevenZipRunner runner)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -73,10 +76,15 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 丢弃本轮积累的探测结果。本类唯一的可变状态就是 _stegoProbeCache；
+        /// 丢弃本轮积累的探测结果。本类的可变状态只有 _stegoProbeCache 与扩展名集合缓存；
         /// 新增字段级状态时必须同步登记到这里。
         /// </summary>
-        public void ResetRunState() => _stegoProbeCache.Clear();
+        public void ResetRunState()
+        {
+            _stegoProbeCache.Clear();
+            _archiveExtSetCache = null;
+            _archiveExtSetCacheKey = string.Empty;
+        }
 
         /// <summary>
         /// 用标准 7z l（不带 -t#）验证文件是否为真正的压缩包
@@ -192,6 +200,19 @@ namespace AutoUnpackTool.Core.Services
             StegoCarrier
         }
 
+        /// <summary>
+        /// 检测强度等级（Classify 的 level 参数）：产物数量短路/安装包模式下降级扫描用，
+        /// 避免对成千上万个杂文件逐个打开读魔术数。
+        /// </summary>
+        public enum DetectionLevel
+        {
+            /// <summary>现状：逐文件魔术数验证（可发现伪装后缀的压缩包）</summary>
+            Full,
+            /// <summary>强信号：仅 分卷文件名模式 / 扩展名命中包含列表 的文件才做魔术数验证，
+            /// 其余不开文件（隐写载体分支不受降级影响）</summary>
+            StrongSignalsOnly
+        }
+
         /// <param name="filePath">文件路径</param>
         /// <param name="logVerification">是否输出验证日志，默认 false</param>
         /// <param name="origin">文件来源，决定排除列表/强制模式/隐写探测的适用范围</param>
@@ -202,15 +223,47 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
+        /// 是否将解压产物扫描降级为强信号模式：产物文件数超过阈值（阈值&gt;0时），
+        /// 或安装包解压模式开启。阈值短路与安装包模式共用一条降级路径，判定统一收拢在此。
+        /// </summary>
+        public bool ShouldUseStrongSignalScan(int newFileCount)
+        {
+            if (_settings.InstallerExtractMode)
+                return true;
+            int threshold = _settings.FinalArtifactFileCountThreshold;
+            return threshold > 0 && newFileCount > threshold;
+        }
+
+        /// <summary>
+        /// 缓存的压缩包扩展名包含集合：GetArchiveExtensions 每次调用都会新建 HashSet，
+        /// 强信号扫描逐文件调用时开销明显，配置字符串未变时复用同一实例。
+        /// </summary>
+        private HashSet<string> GetArchiveExtensionsCached()
+        {
+            string key = _settings.ArchiveExtensions ?? string.Empty;
+            var cache = _archiveExtSetCache;
+            if (cache != null && string.Equals(_archiveExtSetCacheKey, key, StringComparison.Ordinal))
+                return cache;
+            var fresh = _settings.GetArchiveExtensions();
+            _archiveExtSetCache = fresh;
+            _archiveExtSetCacheKey = key;
+            return fresh;
+        }
+
+        /// <summary>
         /// 统一的压缩包判定入口：整合强制模式、排除列表、扩展名/分卷、魔术数、隐写探测的决策，
         /// 供收集、密码测试、解压产物扫描、智能路径各阶段共用，消除多处重复且严格程度不一致的判定。
         /// 决策矩阵：
         /// - 强制模式：仅对 DroppedFile 生效，直接判为压缩包；
         /// - 排除列表：仅对 FolderScan / ExtractedArtifact 生效；DroppedFile 完全跳过（拖入即确认）；
+        ///   安装包模式下隐写载体后缀不受排除列表拦截（留给隐写探测分支）；
         /// - 分卷：文件名即强信号，各卷无法可靠魔术数验证，直接判为压缩包；
-        /// - 其余：一律魔术数验证（修复伪装后缀）；魔术数失败时，隐写探测仅对 DroppedFile / FolderScan 启用。
+        /// - 其余：一律魔术数验证（修复伪装后缀）；魔术数失败时，隐写探测默认仅对 DroppedFile / FolderScan 启用，
+        ///   安装包模式下对 ExtractedArtifact 也放开；
+        /// - level=StrongSignalsOnly：仅扩展名命中包含列表的文件才开文件做魔术数验证，杂文件直接不命中。
         /// </summary>
-        public ArchiveKind Classify(string filePath, FileOrigin origin, bool logVerification = false)
+        public ArchiveKind Classify(string filePath, FileOrigin origin, bool logVerification = false,
+                                    DetectionLevel level = DetectionLevel.Full)
         {
             if (string.IsNullOrWhiteSpace(filePath))
                 return ArchiveKind.NotArchive;
@@ -232,7 +285,10 @@ namespace AutoUnpackTool.Core.Services
             if (origin != FileOrigin.DroppedFile)
             {
                 var excludedExtensions = _settings.GetExcludedExtensions();
-                if (excludedExtensions.Contains(extension))
+                // 安装包解压模式下隐写载体后缀不被排除列表拦截：安装包产物常把压缩包藏在视频容器里，
+                // 必须放行到下方隐写探测分支（探测本身仍受开关/后缀/大小下限/缓存约束）
+                if (excludedExtensions.Contains(extension)
+                    && !(_settings.InstallerExtractMode && Stego.IsStegoCarrierExtension(filePath)))
                     return ArchiveKind.NotArchive;
             }
 
@@ -244,16 +300,21 @@ namespace AutoUnpackTool.Core.Services
                 return ArchiveKind.VerifiedArchive;
             }
 
-            // 统一：无论扩展名是否命中包含列表，都用魔术数验证（修复解压产物伪装后缀）
-            if (IsArchiveFileByMagicNumber(filePath, extension))
+            // 统一：无论扩展名是否命中包含列表，都用魔术数验证（修复解压产物伪装后缀）；
+            // 强信号等级下仅对扩展名命中包含列表的文件开文件验证，杂文件不验证也不判非压缩包（仍可走隐写分支）
+            bool magicEligible = level != DetectionLevel.StrongSignalsOnly
+                                 || GetArchiveExtensionsCached().Contains(extension);
+            if (magicEligible && IsArchiveFileByMagicNumber(filePath, extension))
             {
                 if (logVerification)
                     _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数验证通过，是压缩文件", ConsoleColor.Green);
                 return ArchiveKind.VerifiedArchive;
             }
 
-            // 魔术数失败：隐写探测仅对 DroppedFile / FolderScan 启用（解压递归发现的媒体文件是最终产物，不再当容器）
-            if (origin != FileOrigin.ExtractedArtifact && Stego.IsStegoDetectionActiveForFile(filePath))
+            // 魔术数失败：隐写探测默认仅对 DroppedFile / FolderScan 启用（递归发现的媒体文件是最终产物，不再当容器）；
+            // 安装包解压模式下对解压产物也放开（安装包产物中最多藏包的就是视频容器）
+            if ((origin != FileOrigin.ExtractedArtifact || _settings.InstallerExtractMode)
+                && Stego.IsStegoDetectionActiveForFile(filePath))
             {
                 if (logVerification)
                     _logger.Log($"  [确认] {Path.GetFileName(filePath)}: 魔术数失败但隐写探测命中", ConsoleColor.Green);

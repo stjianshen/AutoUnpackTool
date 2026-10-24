@@ -210,6 +210,25 @@
                                            Text="低于该大小的文件将跳过隐写探测"/>
                             </StackPanel>
                         </StackPanel>
+
+                        <!-- 安装包解压模式 -->
+                        <StackPanel Margin="0,0,0,12">
+                            <CheckBox x:Name="ChkInstallerMode" Content="安装包解压模式（产物跳过黑名单、不执行智能路径扁平化、仅识别分卷/隐写产物）" VerticalAlignment="Center"
+                                      IsChecked="{Binding InstallerExtractMode, Mode=TwoWay}"/>
+                            <TextBlock Style="{StaticResource HintText}" Margin="0,5,0,0"
+                                       Text="适用于解压出大量杂乱文件的安装包：产物目录结构保持原样不移动，拖入文件/文件夹仍照常清理"/>
+                        </StackPanel>
+
+                        <!-- 最终产物文件数阈值 -->
+                        <StackPanel Margin="0,0,0,12">
+                            <TextBlock Text="最终产物文件数阈值:" FontSize="11" Margin="0,0,0,3"/>
+                            <StackPanel Orientation="Horizontal">
+                                <ui:TextBox x:Name="TxtArtifactThreshold" Width="120" Height="26" VerticalContentAlignment="Center"
+                                           Text="{Binding ArtifactThreshold, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                <TextBlock Style="{StaticResource HintText}" VerticalAlignment="Center" Margin="10,0,0,0"
+                                           Text="解压产物超过该数时仅按文件名/后缀强信号扫描，0=禁用"/>
+                            </StackPanel>
+                        </StackPanel>
                         <TextBlock Text="压缩文件扩展名检测:" FontWeight="Bold" Margin="0,0,0,5"/>
                         <TextBlock Text="需要检测的扩展名（逗号分隔）:" FontSize="11" Margin="0,0,0,3"/>
                         <ui:TextBox x:Name="TxtArchiveExtensions" Height="50" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" Margin="0,0,0,10"

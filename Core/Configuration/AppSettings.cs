@@ -75,6 +75,20 @@ namespace AutoUnpackTool.Core.Configuration
         public int MaxExtractDepth { get; set; } = 0;
 
         /// <summary>
+        /// 最终产物文件数阈值：解压产物(新文件)数超过该值时，
+        /// 产物扫描降级为强信号模式（仅验证分卷文件名/压缩包后缀命中项+隐写载体），
+        /// 不再对每个文件做魔术数验证。0=禁用。
+        /// </summary>
+        public int FinalArtifactFileCountThreshold { get; set; } = 10;
+
+        /// <summary>
+        /// 安装包解压模式：产物视为杂乱的最终文件，
+        /// 仅解压产物链路跳过黑名单删除（防误删txt等；拖入文件与文件夹扫描的黑名单照常生效）；
+        /// 嵌套检测只认分卷压缩包与隐写载体，并对解压产物中的视频容器放开隐写探测；
+        /// 跳过收尾阶段智能路径扁平化与原目录合并（安装包目录结构移动后可能无法运行）。默认关闭。
+        /// </summary>
+        public bool InstallerExtractMode { get; set; } = false;
+        /// <summary>
         /// 隐写探测文件大小下限（MB），低于该值不做隐写探测
         /// 默认 10MB（视频文件通常不会太小）
         /// </summary>

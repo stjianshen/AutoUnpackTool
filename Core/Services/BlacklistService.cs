@@ -73,6 +73,19 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
+        /// 解压产物黑名单判定：安装包解压模式下直接豁免（产物内容杂、易误删 txt 等），
+        /// 其余场景等价 IsBlacklistedFile。删除动作仍统一下沉在本服务。
+        /// 注意：拖入文件/文件夹扫描阶段继续调 IsBlacklistedFile，不受安装包模式影响。
+        /// </summary>
+        public bool IsBlacklistedExtractedArtifact(string filePath, out string matchedPattern)
+        {
+            matchedPattern = string.Empty;
+            if (_settings.InstallerExtractMode)
+                return false;
+            return IsBlacklistedFile(filePath, out matchedPattern);
+        }
+
+        /// <summary>
         /// 获取黑名单规则的编译缓存。规则未变化时直接复用；
         /// 通配符预转正则、正则预编译，避免逐文件重复解析
         /// </summary>
@@ -181,8 +194,8 @@ namespace AutoUnpackTool.Core.Services
             if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
                 return;
 
-            // 黑名单已停用时无需扫描目录
-            if (_settings.SkipBlacklist)
+            // 黑名单已停用时无需扫描目录；安装包解压模式下产物树一律豁免（清理对象即解压产物）
+            if (_settings.SkipBlacklist || _settings.InstallerExtractMode)
                 return;
 
             var activeRules = _settings.GetBlacklistRules();

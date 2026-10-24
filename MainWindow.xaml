@@ -82,6 +82,11 @@
             <CheckBox x:Name="ChkEnableBlacklist" Content="启用黑名单" VerticalAlignment="Center" Margin="10,0,0,0"
                       IsChecked="{Binding IsBlacklistEnabled, Mode=TwoWay}"/>
 
+            <!-- 安装包解压模式快速开关（与“软件设置”同一字段，实时生效） -->
+            <CheckBox x:Name="ChkInstallerExtractMode" Content="安装包解压模式" VerticalAlignment="Center" Margin="10,0,0,0"
+                      IsChecked="{Binding IsInstallerExtractMode, Mode=TwoWay}"
+                      ToolTip="产物跳过黑名单删除与智能路径扁平化，仅识别分卷/隐写产物；适用于游戏安装包"/>
+
             <Separator Width="20" Visibility="Hidden"/>
 
             <!-- 最大解压层数设置（下拉列表，对应 AppSettings.MaxExtractDepth，0=不限制） -->

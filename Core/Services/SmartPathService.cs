@@ -361,6 +361,16 @@ namespace AutoUnpackTool.Core.Services
         public async Task ProcessSmartPathBatchAsync(string rootDir)
         {
             _logger.Log($"[批量智能路径] [DEBUG] 进入 ProcessSmartPathBatchAsync, rootDir={rootDir}", ConsoleColor.Gray);
+
+            // 安装包解压模式：产物目录结构不可移动（扁平化/合并会破坏安装包路径依赖），
+            // 直接视为处理完成，仅回调状态不执行任何文件操作；
+            // 必须触发 OnSmartPathCompleted 后再 return，避免 FileItem 停在"等待扁平化处理"死状态
+            if (_settings.InstallerExtractMode)
+            {
+                _logger.Log($"[智能路径] 安装包解压模式：跳过扁平化处理: {rootDir}", ConsoleColor.Yellow);
+                OnSmartPathCompleted?.Invoke(rootDir);
+                return;
+            }
                     
             if (!Directory.Exists(rootDir))
             {

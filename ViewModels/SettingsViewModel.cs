@@ -52,6 +52,13 @@ namespace AutoUnpackTool.ViewModels
         [ObservableProperty]
         private string _stegoMinSizeMB = "10";
 
+        /// <summary>安装包解压模式：产物跳过黑名单与智能路径扁平化，仅识别分卷/隐写产物</summary>
+        [ObservableProperty]
+        private bool _installerExtractMode;
+        /// <summary>最终产物文件数阈值（文本框绑定，0=禁用）</summary>
+        [ObservableProperty]
+        private string _artifactThreshold = "10";
+
         [ObservableProperty]
         private string _archiveExtensions = string.Empty;
 
@@ -150,6 +157,8 @@ namespace AutoUnpackTool.ViewModels
             AutoCleanNames = Settings.AutoCleanAntiCensorshipNames;
             StegoDetection = Settings.EnableStegoDetection;
             StegoMinSizeMB = Settings.StegoDetectionMinFileSizeMB.ToString();
+            InstallerExtractMode = Settings.InstallerExtractMode;
+            ArtifactThreshold = Settings.FinalArtifactFileCountThreshold.ToString();
 
             // 加载智能路径处理模式
             switch (Settings.SmartPathProcessingMode)
@@ -321,6 +330,13 @@ namespace AutoUnpackTool.ViewModels
                 return;
             }
 
+            // 验证最终产物文件数阈值（0=禁用降级扫描，回到逐文件魔术数验证）
+            if (!int.TryParse(ArtifactThreshold.Trim(), out int artifactThreshold) || artifactThreshold < 0)
+            {
+                _dialogs.ShowWarning("最终产物文件数阈值必须是大于等于 0 的整数（0=禁用）！");
+                return;
+            }
+
             try
             {
                 // 保存设置
@@ -364,6 +380,10 @@ namespace AutoUnpackTool.ViewModels
 
                 Settings.EnableStegoDetection = StegoDetection;
                 Settings.StegoDetectionMinFileSizeMB = stegoMinSizeMb;
+
+                // 保存安装包模式 / 快速密码测试 / 产物阈值
+                Settings.InstallerExtractMode = InstallerExtractMode;
+                Settings.FinalArtifactFileCountThreshold = artifactThreshold;
 
                 // 保存智能路径处理模式
                 if (SmartPathConcatenate)
