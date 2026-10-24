@@ -29,20 +29,30 @@ namespace AutoUnpackTool.Core.Services
         public bool IsAvailable
             => !string.IsNullOrWhiteSpace(_settings.SevenZipPath) && File.Exists(_settings.SevenZipPath);
 
-        /// <summary>构造统一的 7z 进程启动信息（重定向 + UTF-8 + 无窗口）。</summary>
+        /// <summary>
+        /// 构造统一的 7z 进程启动信息。hidden=true（默认）时重定向标准输出/错误并按 UTF-8
+        /// 解码，供捕获输出使用；hidden=false 时不重定向、允许窗口显示，用于「显示命令行窗口」
+        /// 的解压模式（此时不能设 Encoding，否则与不重定向冲突）。
+        /// </summary>
         public ProcessStartInfo BuildStartInfo(string args, bool hidden = true)
         {
-            return new ProcessStartInfo
+            var startInfo = new ProcessStartInfo
             {
                 FileName = _settings.SevenZipPath,
                 Arguments = args,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = hidden,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8
+                CreateNoWindow = hidden
             };
+
+            if (hidden)
+            {
+                startInfo.RedirectStandardOutput = true;
+                startInfo.RedirectStandardError = true;
+                startInfo.StandardOutputEncoding = Encoding.UTF8;
+                startInfo.StandardErrorEncoding = Encoding.UTF8;
+            }
+
+            return startInfo;
         }
 
         /// <summary>

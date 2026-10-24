@@ -164,6 +164,17 @@ namespace AutoUnpackTool.Core.Models
         }
 
         /// <summary>
+        /// 密码信息的展示后缀：命中密码为 " (密码: xxx)"，否则 " (无密码)"。
+        /// 这段文案原先在 MainViewModel 与 ExtractionPipeline 里各写了 5 遍，
+        /// 收到这里后改格式只需动一处。
+        /// </summary>
+        public static string FormatPasswordSuffix(string? password)
+            => password != null ? $" (密码: {password})" : " (无密码)";
+
+        /// <summary>按本节点已记录的密码生成展示后缀。</summary>
+        public string PasswordSuffix => FormatPasswordSuffix(FoundPassword);
+
+        /// <summary>
         /// 状态是否已进入终态（后台流程不会再自行改写它，节点可以安全摘除）。
         /// 词表与 ExtractionPipeline / MainViewModel 里赋值的状态字符串保持一致，
         /// 集中在这里是为了避免“回收历史节点”与“清理已完成节点”两处各写一份判断。

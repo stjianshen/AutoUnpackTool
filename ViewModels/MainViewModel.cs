@@ -50,8 +50,6 @@ namespace AutoUnpackTool.ViewModels
         // 复位路径已全部收敛到 ExtractionPipeline.ResetRunState()，不再从这里逐个改。
         private ConcurrentQueue<FileItem> _pendingQueue { get => _pipeline.PendingQueue; set => _pipeline.PendingQueue = value; }
         private ConcurrentQueue<FileItem> _extractQueue { get => _pipeline.ExtractQueue; set => _pipeline.ExtractQueue = value; }
-        private ManualResetEventSlim _pendingQueueSignal => _pipeline.PendingQueueSignal;
-        private ManualResetEventSlim _extractQueueSignal => _pipeline.ExtractQueueSignal;
         private bool _isTesting { get => _pipeline.IsTesting; set => _pipeline.IsTesting = value; }
         private bool _isExtracting { get => _pipeline.IsExtracting; set => _pipeline.IsExtracting = value; }
         private bool _isPaused { get => _pipeline.IsPaused; set => _pipeline.IsPaused = value; }
@@ -67,13 +65,6 @@ namespace AutoUnpackTool.ViewModels
         // 否则并发移动同一目录树会导致移动中断、目录冲突时生成 GUID 新目录、图片分散到多个文件夹。
         // 锁本体属于被保护的 SmartPathService，所有会移动目录树的流程共用同一把。
         private SemaphoreSlim _smartPathFinalizeLock => _smartPath.FinalizeLock;
-
-        // 【并发修复】防止同一顶级文件被重复触发收尾（完成回调可能从多条路径触发，如叶子收尾与父链上报）
-        private HashSet<string> _finalizingTopArchives => _pipeline.FinalizingTopArchives;
-
-        // 【并发修复】保护 _isTesting/_isExtracting 的 check-then-act：多个后台线程（解压线程唤醒、监控线程重启）
-        // 可能同时看到 false 而启动重复线程组，必须原子地检查并设置
-        private object _threadStateLock => _pipeline.ThreadStateLock;
 
         #region 绑定状态
 
@@ -387,16 +378,9 @@ namespace AutoUnpackTool.ViewModels
 
                     _logger.Log("自动开始处理流程...", ConsoleColor.Cyan);
 
-                    // 启动双队列处理流程（如果线程未运行）
-                    // StartDualQueueProcessing 内部已经包含了唤醒逻辑
-                    _pipeline.StartDualQueueProcessing();
-
-                    // 如果线程已经在运行，只需要唤醒测试线程即可
-                    // （解压线程会在测试完成后被自动唤醒）
-                    if (_isTesting || _isExtracting)
-                    {
-                        _pipeline.WakeupTestThread();
-                    }
+                    // 完全空闲则整体启动双队列，已有 worker 在跑就只叫醒测试侧
+                    // （解压侧会在测试完成后被自动唤醒）——这套判断由管线自己拥有
+                    _pipeline.KickoffAfterEnqueue();
                 }
                 else
                 {
@@ -437,9 +421,7 @@ namespace AutoUnpackTool.ViewModels
             {
                 // 暂停状态 → 继续
                 _logger.Log("\n继续处理...", ConsoleColor.Cyan);
-                _isPaused = false;
-                _pendingQueueSignal.Set();
-                _extractQueueSignal.Set();
+                _pipeline.ResumeProcessing();
                 UpdateUiState();
             }
             else if (_isTesting || _isExtracting)
@@ -467,11 +449,7 @@ namespace AutoUnpackTool.ViewModels
                 if (_isPaused)
                 {
                     _logger.Log("\n继续处理...", ConsoleColor.Cyan);
-                    _isPaused = false;
-
-                    // 唤醒线程继续处理
-                    _pendingQueueSignal.Set();
-                    _extractQueueSignal.Set();
+                    _pipeline.ResumeProcessing();
 
                     UpdateUiState();
                     return;
@@ -1045,9 +1023,7 @@ namespace AutoUnpackTool.ViewModels
                     return;
                 }
 
-                var passwordInfo = topLevelItem.FoundPassword != null
-                    ? $" (密码: {topLevelItem.FoundPassword})"
-                    : " (无密码)";
+                var passwordInfo = topLevelItem.PasswordSuffix;
 
                 // 获取最终扁平化后的路径
                 // 直接使用 FindFinalFlattenedPath，它内部已处理目录不存在/被扁平化重命名等所有情况
@@ -1110,9 +1086,7 @@ namespace AutoUnpackTool.ViewModels
                     // 只更新非顶级项中状态包含"解压成功"的子压缩包节点
                     if (item.Parent != null && item.Status.Contains("解压成功"))
                     {
-                        var passwordInfo = item.FoundPassword != null
-                            ? $" (密码: {item.FoundPassword})"
-                            : " (无密码)";
+                        var passwordInfo = item.PasswordSuffix;
 
                         _dispatcher.Invoke(() =>
                         {

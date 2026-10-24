@@ -97,16 +97,12 @@ namespace AutoUnpackTool.Core.Services
         public bool IsExtracting { get => _isExtracting; set => _isExtracting = value; }
         public ConcurrentQueue<FileItem> PendingQueue { get => _pendingQueue; set => _pendingQueue = value; }
         public ConcurrentQueue<FileItem> ExtractQueue { get => _extractQueue; set => _extractQueue = value; }
-        public ManualResetEventSlim PendingQueueSignal => _pendingQueueSignal;
-        public ManualResetEventSlim ExtractQueueSignal => _extractQueueSignal;
-        public CancellationTokenSource? TestCancellationSource { get => _testCancellationTokenSource; set => _testCancellationTokenSource = value; }
-        public CancellationTokenSource? ExtractCancellationSource { get => _extractCancellationTokenSource; set => _extractCancellationTokenSource = value; }
-        public CancellationTokenSource? GlobalCancellationSource { get => _globalCancellationTokenSource; set => _globalCancellationTokenSource = value; }
-        public TaskCompletionSource<bool> TestCompletionSource { get => _testCompletionSource; set => _testCompletionSource = value; }
-        public TaskCompletionSource<bool> ExtractCompletionSource { get => _extractCompletionSource; set => _extractCompletionSource = value; }
+        // 队列等待句柄与取消令牌源不再外露：零外部使用者，而且它们都是“宿主能直接
+        // 摆平管线并发/取消机制”的口子，需要操作请走 Wakeup*/ResumeProcessing/CancelAllOperations。
+        // 完成信号同理不再外露：它只由 MonitorProcessingComplete 与 ResetRunState 读写。
         public PasswordMap PasswordMap { get => _passwordMap; set => _passwordMap = value; }
-        public HashSet<string> FinalizingTopArchives => _finalizingTopArchives;
-        public object ThreadStateLock => _threadStateLock;
+        // 收尾去重集与线程状态锁也不外露：它们是“同一顶级文件不得重复收尾”与
+        // “check-then-act 不得启动重复线程组”的唯一屏障，外部只能透过字段所在类的流程访问。
 
         /// <summary>顶级项完成状态更新的宿主回调（需在 UI 线程改 FileItem / 控件）。</summary>
         public Action<string>? OnTopLevelCompleted { get; set; }
@@ -194,6 +190,30 @@ namespace AutoUnpackTool.Core.Services
             // 设置信号唤醒正在等待的解压线程（如果有的话）
             _extractQueueSignal.Set();
             _logger.Log("[系统] 已唤醒解压线程", ConsoleColor.Gray);
+        }
+
+        /// <summary>
+        /// 新文件入队后的统一启动入口：完全空闲时整体拉起双队列并挂上完成监控；
+        /// 已有 worker 在跑时只叫醒测试侧（解压侧由测试完成后自行唤醒，不必提前启动，
+        /// 否则会凭空多出一个“正在解压”的 UI 状态）。
+        /// </summary>
+        public void KickoffAfterEnqueue()
+        {
+            if (_isTesting || _isExtracting)
+                WakeupTestThread();
+            else
+                StartDualQueueProcessing();
+        }
+
+        /// <summary>
+        /// 解除暂停并叫醒两侧 worker。暂停只翻转 _isPaused，两个运行标志始终为 true，
+        /// 所以这里不会重启任何线程，只是把等待信号打开。
+        /// </summary>
+        public void ResumeProcessing()
+        {
+            _isPaused = false;
+            WakeupTestThread();
+            WakeupExtractThread();
         }
 
         /// <summary>
@@ -1398,9 +1418,7 @@ namespace AutoUnpackTool.Core.Services
                     if (fileItem.Children.Count > 0)
                     {
                         // 有子节点，显示等待状态
-                        var passwordInfo = password != null
-                            ? $" (密码: {password})"
-                            : " (无密码)";
+                        var passwordInfo = FileItem.FormatPasswordSuffix(password);
                         _ui.InvokeOnUi(() =>
                         {
                             fileItem.Status = $"等待子节点完成{passwordInfo} ({fileItem.GetProgressInfo()})";
@@ -1476,9 +1494,7 @@ namespace AutoUnpackTool.Core.Services
             string suffix = string.IsNullOrEmpty(debugSuffix) ? "" : " " + debugSuffix;
             _logger.Log($"[线程 {taskId}] [DEBUG] 无子压缩包，处理原文件并更新父项状态: {leafItem.FileName}{suffix}", ConsoleColor.Magenta, leafItem);
             
-            var passwordInfo = leafItem.FoundPassword != null
-                ? $" (密码: {leafItem.FoundPassword})"
-                : " (无密码)";
+            var passwordInfo = leafItem.PasswordSuffix;
             _ui.InvokeOnUi(() =>
             {
                 leafItem.Status = $"觧压成功{passwordInfo}";
@@ -1838,9 +1854,7 @@ namespace AutoUnpackTool.Core.Services
                 if (parentSelfSuccess)
                 {
                     // 父节点自身解压成功，更新状态为完成
-                    var passwordInfo = parentItem.FoundPassword != null 
-                        ? $" (密码: {parentItem.FoundPassword})" 
-                        : " (无密码)";
+                    var passwordInfo = parentItem.PasswordSuffix;
                     
                     _ui.InvokeOnUi(() =>
                     {

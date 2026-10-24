@@ -9,17 +9,20 @@ namespace AutoUnpackTool.Core.Services
 {
     public class SevenZipExtractor
     {
-        private readonly string _sevenZipPath;
-        private readonly SevenZipRunner? _runner;
+        private readonly SevenZipRunner _runner;
 
-        public SevenZipExtractor(string sevenZipPath, SevenZipRunner? runner = null)
+        /// <summary>
+        /// 由 <see cref="SevenZipExtractorFactory"/> 创建。sevenZipPath 只用于入口校验，
+        /// 实际可执行文件由 runner 从 AppSettings 读取（运行期改路径能立即生效），
+        /// 所以不要再假定“这里传的路径就是被调用的那个”。
+        /// </summary>
+        public SevenZipExtractor(string sevenZipPath, SevenZipRunner runner)
         {
             if (string.IsNullOrWhiteSpace(sevenZipPath) || !File.Exists(sevenZipPath))
             {
                 throw new ArgumentException("7z.exe 路径无效", nameof(sevenZipPath));
             }
-            _sevenZipPath = sevenZipPath;
-            _runner = runner;
+            _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         }
 
         /// <summary>
@@ -44,20 +47,7 @@ namespace AutoUnpackTool.Core.Services
                     // 't' 命令会完整解压并验证所有文件，大文件极慢
                     string command = useFastMode ? "l" : "t";
                     string args = $"{command} -p\"{password}\" -sccUTF-8 \"{archivePath}\"";
-                    // 有统一 runner 时复用其 ProcessStartInfo 样板；否则保持自建（兼容无 runner 的调用方）
-                    var startInfo = _runner != null
-                        ? _runner.BuildStartInfo(args)
-                        : new ProcessStartInfo
-                        {
-                            FileName = _sevenZipPath,
-                            Arguments = args,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            UseShellExecute = false,
-                            CreateNoWindow = true,
-                            StandardOutputEncoding = System.Text.Encoding.UTF8,
-                            StandardErrorEncoding = System.Text.Encoding.UTF8
-                        };
+                    var startInfo = _runner.BuildStartInfo(args);
 
                     using var process = new Process { StartInfo = startInfo };
                     
@@ -255,23 +245,8 @@ namespace AutoUnpackTool.Core.Services
                         arguments += $" -p\"{password}\"";
                     }
 
-                    var startInfo = new ProcessStartInfo
-                    {
-                        FileName = _sevenZipPath,
-                        Arguments = arguments,
-                        RedirectStandardOutput = !showCliWindow,
-                        RedirectStandardError = !showCliWindow,
-                        UseShellExecute = false,
-                        CreateNoWindow = !showCliWindow
-                    };
-
-                    // 只有在重定向输出时才能设置编码
-                    if (!showCliWindow)
-                    {
-                        // NanaZip/7z 使用 UTF-8 输出（通过 -sccUTF-8 参数）
-                        startInfo.StandardOutputEncoding = System.Text.Encoding.UTF8;
-                        startInfo.StandardErrorEncoding = System.Text.Encoding.UTF8;
-                    }
+                    // 统一交给 runner：showCliWindow 时不重定向、允许窗口显示
+                    var startInfo = _runner.BuildStartInfo(arguments, hidden: !showCliWindow);
 
                     using var process = new Process { StartInfo = startInfo };
                     
