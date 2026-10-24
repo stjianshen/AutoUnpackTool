@@ -21,9 +21,6 @@ namespace AutoUnpackTool.Core.Abstractions
         /// <summary>强制把状态栏置为“未开始”（全部流程结束时使用）。</summary>
         void OnIdleStatus();
 
-        /// <summary>批量智能路径检查的触发请求（需要在 UI 线程再次转入宿主）。</summary>
-        void RequestBatchSmartPathCheck();
-
         /// <summary>解压进度百分比。</summary>
         void OnExtractProgress(int percent);
 

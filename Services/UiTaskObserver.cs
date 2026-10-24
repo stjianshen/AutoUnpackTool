@@ -25,8 +25,6 @@ namespace AutoUnpackTool.Services
 
         public void OnIdleStatus() => _vm.ApplyIdleStatus();
 
-        public void RequestBatchSmartPathCheck() => _vm.RequestBatchSmartPathCheck();
-
         public void OnExtractProgress(int percent) => _vm.ApplyExtractProgress(percent);
 
         public void OnCurrentPassword(string text) => _vm.ApplyCurrentPassword(text);

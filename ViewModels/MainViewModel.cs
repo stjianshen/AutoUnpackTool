@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -61,10 +61,8 @@ namespace AutoUnpackTool.ViewModels
         // （清理已完成节点时要逐条注销登记；整片清空则走 SmartPathService.ResetRunState）
         private ConcurrentDictionary<string, byte> _extractedDirectoryNodes => _smartPath.ExtractedDirectoryNodes;
 
-        // 【并发修复】收尾流程串行化锁：多个顶级文件并发完成时，收尾（清理+智能路径扁平化）必须串行执行，
-        // 否则并发移动同一目录树会导致移动中断、目录冲突时生成 GUID 新目录、图片分散到多个文件夹。
-        // 锁本体属于被保护的 SmartPathService，所有会移动目录树的流程共用同一把。
-        private SemaphoreSlim _smartPathFinalizeLock => _smartPath.FinalizeLock;
+        // 收尾串行锁不再转发给宿主：唯一还在用它的批量兜底扁平化已下沉到
+        // SmartPathService，锁只在 Core 内部几个流程之间共用，窗口不需要碰它。
 
         #region 绑定状态
 
@@ -880,12 +878,6 @@ namespace AutoUnpackTool.ViewModels
         /// <summary>当前是否已在 UI 线程（等价于原 Dispatcher.CheckAccess）</summary>
         public bool CheckUiAccess() => _dispatcher.CheckAccess();
 
-        /// <summary>批量智能路径检查的触发请求（需要在 UI 线程再次转入宿主）</summary>
-        public void RequestBatchSmartPathCheck()
-        {
-            _ = _dispatcher.InvokeAsync(() => CheckAndTriggerBatchSmartPathProcessing());
-        }
-
         /// <summary>
         /// 检查是否有待解压的文件，并在自动模式下触发解压
         /// </summary>
@@ -906,108 +898,6 @@ namespace AutoUnpackTool.ViewModels
         #endregion
 
         #region 辅助方法
-
-        /// <summary>
-        /// 检查是否所有顶级文件项都已完成，如果是则触发批量智能路径处理
-        /// </summary>
-        public void CheckAndTriggerBatchSmartPathProcessing()
-        {
-            // 添加调试日志
-            _logger.Log($"[批量智能路径] 检查触发条件: EnableSmartPathProcessing={_settings.EnableSmartPathProcessing}, OutputMode={_settings.OutputMode}", ConsoleColor.Gray);
-
-            if (!_settings.EnableSmartPathProcessing)
-            {
-                _logger.Log($"[批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Gray);
-                return;
-            }
-
-            // 检查是否所有顶级文件项都已完成
-            var topLevelItems = _fileList.Where(f => f.Parent == null).ToList();
-            _logger.Log($"[批量智能路径] 顶级文件项数量: {topLevelItems.Count}", ConsoleColor.Gray);
-
-            if (topLevelItems.Count == 0)
-            {
-                _logger.Log($"[批量智能路径] 没有顶级文件项，跳过处理", ConsoleColor.Gray);
-                return;
-            }
-
-            // 打印每个顶级项的状态用于调试
-            foreach (var item in topLevelItems)
-            {
-                _logger.Log($"[批量智能路径] 顶级项: {item.FileName}, 状态: {item.Status}", ConsoleColor.Gray);
-            }
-
-            bool allCompleted = topLevelItems.All(item =>
-            {
-                // 检查状态是否表示完成（扩大匹配范围）
-                return item.Status.Contains("解压成功") ||
-                       item.Status.Contains("完成") ||
-                       item.Status.Contains("跳过") ||
-                       item.Status.Contains("非压缩文件") ||
-                       item.Status.Contains("失败") ||
-                       item.Status.Contains("异常") ||
-                       item.Status.Contains("取消");
-            });
-
-            _logger.Log($"[批量智能路径] 所有项是否完成: {allCompleted}", ConsoleColor.Gray);
-
-            if (allCompleted)
-            {
-                _logger.Log($"[批量智能路径] 所有顶级文件项已完成，开始批量处理...", ConsoleColor.Cyan);
-
-                // 收集所有解压生成的文件夹（而不是目标目录）
-                var extractedFolders = new HashSet<string>();
-                foreach (var item in topLevelItems)
-                {
-                    // 在 ArchiveFolder 模式下，输出目录是压缩包同名文件夹
-                    // 例如: ba366.7z.001 -> D:\tem\ba366
-                    string extractedFolder = _detector.GetOutputDirectory(item.FilePath);
-
-                    // 对于 ArchiveDir 模式（解压到当前目录），不进行扁平化处理
-                    // 因为输出目录就是压缩包所在目录，会误处理其他无关文件夹
-                    string archiveDir = Path.GetDirectoryName(item.FilePath) ?? string.Empty;
-                    if (extractedFolder.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _logger.Log($"[批量智能路径] 顶级项 {item.FileName} 使用 ArchiveDir 模式，跳过扁平化", ConsoleColor.Gray);
-                        continue;
-                    }
-
-                    // SpecificDir 模式（统一输出到指定目录），不进行扁平化处理
-                    if (_settings.OutputMode == OutputMode.SpecificDir)
-                    {
-                        _logger.Log($"[批量智能路径] 顶级项 {item.FileName} 使用 SpecificDir 模式，跳过扁平化", ConsoleColor.Gray);
-                        continue;
-                    }
-
-                    _logger.Log($"[批量智能路径] 顶级项 {item.FileName} 的解压文件夹: {extractedFolder}", ConsoleColor.Gray);
-
-                    if (!string.IsNullOrEmpty(extractedFolder) && Directory.Exists(extractedFolder))
-                    {
-                        extractedFolders.Add(extractedFolder);
-                    }
-                }
-
-                _logger.Log($"[批量智能路径] 找到 {extractedFolders.Count} 个解压文件夹待处理", ConsoleColor.Cyan);
-
-                // 对每个解压生成的文件夹执行批量扁平化（fire-and-forget）
-                // 【并发修复】持锁串行执行，避免与 FinalizeTopLevelExtractAndSmartPathAsync 的收尾并发移动同一目录树
-                _ = Task.Run(async () =>
-                {
-                    await _smartPathFinalizeLock.WaitAsync();
-                    try
-                    {
-                        foreach (var extractedFolder in extractedFolders)
-                        {
-                            await _smartPath.ProcessSmartPathBatchAsync(extractedFolder);
-                        }
-                    }
-                    finally
-                    {
-                        _smartPathFinalizeLock.Release();
-                    }
-                });
-            }
-        }
 
         /// <summary>
         /// 更新顶级FileItem的状态为"解压完成-扁平化处理完成"

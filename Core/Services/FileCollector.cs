@@ -117,55 +117,6 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 扫描目录中的压缩文件并添加到测试列表
-        /// </summary>
-        /// <param name="directoryPath">要扫描的目录路径</param>
-        public void ScanAndAddArchiveFiles(string directoryPath)
-        {
-            if (!Directory.Exists(directoryPath))
-            {
-                _logger.Log($"目录不存在: {directoryPath}", ConsoleColor.Red);
-                return;
-            }
-
-            try
-            {
-                var archiveFiles = Directory.GetFiles(directoryPath)
-                    .Where(f => _detector.IsArchiveFile(f, false))
-                    .ToList();
-
-                int addedCount = 0;
-                foreach (var file in archiveFiles)
-                {
-                    // 检查是否已在列表中
-                    if (IsAlreadyTracked(file))
-                        continue;
-
-                    var fileInfo = new FileInfo(file);
-                    var fileItem = new FileItem
-                    {
-                        FileName = fileInfo.Name,
-                        FilePath = file,
-                        Status = "等待处理",
-                        FileSize = fileInfo.Length
-                    };
-                    _fileList.Add(fileItem);
-                    addedCount++;
-                    OnTitleChanged?.Invoke();
-                }
-
-                if (addedCount > 0)
-                {
-                    _logger.Log($"从目录中发现 {addedCount} 个新的压缩文件", ConsoleColor.Cyan);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.Log($"扫描目录失败: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        /// <summary>
         /// 处理单个文件（包括黑名单检查和分卷检测）
         /// 注意：只处理当前文件及其分卷，不扫描同级目录的其他压缩文件
         /// </summary>

@@ -1154,7 +1154,11 @@ namespace AutoUnpackTool.Core.Services
             {
                 var parentSubDirs = Directory.GetDirectories(archiveParentDir);
                 var parentFiles = Directory.GetFiles(archiveParentDir);
-                var parentNonArchiveFiles = parentFiles.Where(f => !_detector.IsArchiveFile(f)).ToArray();
+                // 父目录里这些是拖入侧的兄弟文件（不是解压产物），按 FolderScan 判：
+                // 受排除列表约束，也不给强制模式豁免——否则强制模式下这里会把任意
+                // 文件都判为压缩包，非压缩包文件数永远为 0，不该合并的目录也会被合并。
+                var parentNonArchiveFiles = parentFiles.Where(f =>
+                    _detector.Classify(f, FileOrigin.FolderScan) == ArchiveDetector.ArchiveKind.NotArchive).ToArray();
                 
                 if (parentSubDirs.Length == 1 && parentNonArchiveFiles.Length == 0)
                 {
@@ -1887,8 +1891,9 @@ namespace AutoUnpackTool.Core.Services
                     if (parentSelfSuccess)
                         _ = FinalizeTopLevelExtractAndSmartPathAsync(parentItem.FilePath);
                     else
-                        // 异步触发，避免阻塞后台线程
-                        _ui.RequestBatchSmartPathCheck();
+                        // 父节点自身失败时走不到上面的正规收尾，直接请 Core 的兜底扁平化补收尾。
+                        // 不再绕道 UI 线程：顶级项快照自己会封送到 UI 线程读取。
+                        _ = _smartPath.FlattenCompletedTopLevelDirsAsync();
                 }
             }
             else

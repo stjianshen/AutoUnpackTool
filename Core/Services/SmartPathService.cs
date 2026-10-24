@@ -79,6 +79,33 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
+        /// 智能路径总开关。输出模式不参与这一层判断：ArchiveDir 模式下根目录不扁平化、
+        /// 但子压缩包的输出目录仍要处理（见 ProcessBatchSmartPathSynchronous），
+        /// SpecificDir 模式则由逐项跳过处理——模式只能在“某个目录该不该动”的地方判，
+        /// 不能当全局门槛。原先 4 处各写一份组合条件、其中两处省了 mode，
+        /// 就因为这个区别没讲清。
+        /// </summary>
+        public bool IsProcessingEnabled => _settings.EnableSmartPathProcessing;
+
+        /// <summary>
+        /// 用户直接拖入的纯文件夹要不要收尾扁平化：除总开关外还要求 ArchiveFolder 模式
+        /// （沿用改造前 MainViewModel 拖拽分支的原条件，其它输出模式下拖入文件夹不动）。
+        /// </summary>
+        public bool IsDroppedFolderFlattenEnabled
+            => IsProcessingEnabled && _settings.OutputMode == OutputMode.ArchiveFolder;
+
+        /// <summary>
+        /// 扁平化阶段的压缩包判定：这里扫到的一律是解压产物（或输入侧已按 FolderScan
+        /// 判定过的用户文件），所以固定用 ExtractedArtifact：受排除列表约束、
+        /// 不被强制模式误判为压缩包、也不再重复跑隐写探测（那会逐个文件起 7z 子进程）。
+        /// 这些点原先走 IsArchiveFile 的默认 origin=DroppedFile，等于把「用户亲手拖入
+        /// 即确认」的豁免套到了产物目录上：排除列表失效；开启强制模式时，
+        /// 「删除残留压缩包」会把目录里任意文件当成压缩包直接删掉。
+        /// </summary>
+        private bool IsArchiveArtifact(string filePath)
+            => _detector.Classify(filePath, FileOrigin.ExtractedArtifact) != ArchiveDetector.ArchiveKind.NotArchive;
+
+        /// <summary>
         /// 在智能路径扁平化之前，清理所有子压缩包文件。
         /// 子压缩包不受 FileAfterExtract 设置影响，一律直接删除。
         /// 这是阶段1清理的补充，确保扫描目录中所有子压缩包并清理，而不仅仅依赖文件树记录。
@@ -98,7 +125,7 @@ namespace AutoUnpackTool.Core.Services
                         continue;
                     
                     // 检查是否是压缩文件
-                    if (_detector.IsArchiveFile(file, false) && !_volumeDetector.IsMultiVolumeArchive(file))
+                    if (IsArchiveArtifact(file) && !_volumeDetector.IsMultiVolumeArchive(file))
                     {
                         // 直接删除（不经过回收站），子压缩包不保留；统一走 FileOperationService 带重试
                         if (_fileOps.TryDelete(file))
@@ -130,7 +157,7 @@ namespace AutoUnpackTool.Core.Services
             _logger.Log($"[同步批量智能路径] [DEBUG] 开始检查条件...", ConsoleColor.Gray);
             _logger.Log($"[同步批量智能路径] [DEBUG] topArchivePath={topArchivePath}", ConsoleColor.Gray);
                     
-            if (!_settings.EnableSmartPathProcessing)
+            if (!IsProcessingEnabled)
             {
                 _logger.Log($"[同步批量智能路径] 智能路径处理未启用，跳过处理", ConsoleColor.Yellow);
                 return;
@@ -148,7 +175,7 @@ namespace AutoUnpackTool.Core.Services
             // 【并发修复】排除正在解压/测试密码的文件对应的输出目录：收尾与解压线程之间没有锁，
             // ArchiveDir 模式下其他文件的中间层目录可能在快照范围内，移动正在被解压写入的目录会失败。
             var busyDirs = GetAllItemsSnapshot()
-                .Where(f => f.Status.Contains("正在解压") || f.Status.Contains("正在测试密码"))
+                .Where(f => f.IsInFlight)
                 .Select(f => _detector.GetOutputDirectory(f.FilePath))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             
@@ -240,6 +267,91 @@ namespace AutoUnpackTool.Core.Services
             }
         
             _logger.Log($"[同步批量智能路径] ✓ 共处理 {processedCount}/{topLevelDirs.Count} 个顶层目录", ConsoleColor.Green);
+        }
+
+        /// <summary>
+        /// 兜底批量扁平化：没有任何在途任务时，把「正规收尾没覆盖到」的顶级输出目录补做扁平化。
+        /// 典型场景是父压缩包自身解压失败、但子压缩包全部成功：顶级上报时走不到正规收尾
+        /// （见 ExtractionPipeline.UpdateParentStatusWhenChildrenComplete 的 parentSelfSuccess 分支），
+        /// 这批目录就只能在这里补。
+        /// 门槛用 FileItem 的状态语义而不是另写一份词表：既要求整棵树无在途（否则会动到
+        /// 正在被写入的目录），又要求每个顶级项已进入终态（「等待处理」不算，不然会把还没
+        /// 解压的目录提前搬走）。旧版手写的词表不含 "fail"，导致只要有一个
+        /// 「fail-未找到密码」的顶级项，这个兜底就永远不触发。
+        /// </summary>
+        public async Task FlattenCompletedTopLevelDirsAsync()
+        {
+            if (!IsProcessingEnabled)
+            {
+                _logger.Log($"[批量智能路径] [兜底] 智能路径处理未启用，跳过处理", ConsoleColor.Gray);
+                return;
+            }
+
+            // 顶级项就存在快照集合里 Parent == null 那一批（子项挂在 Children 下）
+            var topLevelItems = GetAllItemsSnapshot().Where(f => f.Parent == null).ToList();
+            _logger.Log($"[批量智能路径] [兜底] 顶级文件项数量: {topLevelItems.Count}", ConsoleColor.Gray);
+
+            if (topLevelItems.Count == 0)
+            {
+                _logger.Log($"[批量智能路径] [兜底] 没有顶级文件项，跳过处理", ConsoleColor.Gray);
+                return;
+            }
+
+            foreach (var item in topLevelItems)
+                _logger.Log($"[批量智能路径] [兜底] 顶级项: {item.FileName}, 状态: {item.Status}", ConsoleColor.Gray);
+
+            if (!topLevelItems.All(item => item.IsFinished && !item.HasInFlightInSubtree()))
+            {
+                _logger.Log($"[批量智能路径] [兜底] 仍有节点在途或未进入终态，本轮不补收尾", ConsoleColor.Gray);
+                return;
+            }
+
+            // 收集需要补收尾的输出目录（而不是目标目录）
+            var extractedFolders = new HashSet<string>();
+            foreach (var item in topLevelItems)
+            {
+                string extractedFolder = _detector.GetOutputDirectory(item.FilePath);
+                string archiveDir = Path.GetDirectoryName(item.FilePath) ?? string.Empty;
+
+                // ArchiveDir 模式：输出目录就是压缩包所在目录，扁平化它会把隔壁无关文件夹一起动了
+                if (extractedFolder.Equals(archiveDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.Log($"[批量智能路径] [兜底] 顶级项 {item.FileName} 使用 ArchiveDir 模式，跳过扁平化", ConsoleColor.Gray);
+                    continue;
+                }
+
+                // SpecificDir 模式：所有压缩包输出到同一目录，扁平化会误操作其他压缩包的内容
+                if (_settings.OutputMode == OutputMode.SpecificDir)
+                {
+                    _logger.Log($"[批量智能路径] [兜底] 顶级项 {item.FileName} 使用 SpecificDir 模式，跳过扁平化", ConsoleColor.Gray);
+                    continue;
+                }
+
+                _logger.Log($"[批量智能路径] [兜底] 顶级项 {item.FileName} 的解压文件夹: {extractedFolder}", ConsoleColor.Gray);
+
+                if (!string.IsNullOrEmpty(extractedFolder) && Directory.Exists(extractedFolder))
+                {
+                    extractedFolders.Add(extractedFolder);
+                }
+            }
+
+            _logger.Log($"[批量智能路径] [兜底] 找到 {extractedFolders.Count} 个解压文件夹待处理", ConsoleColor.Cyan);
+            if (extractedFolders.Count == 0)
+                return;
+
+            // 持同一把串行锁：避免与正规收尾、拖入文件夹收尾并发移动同一棵目录树
+            await FinalizeLock.WaitAsync();
+            try
+            {
+                foreach (var extractedFolder in extractedFolders)
+                {
+                    await Task.Run(() => ProcessSmartPathBatchAsync(extractedFolder));
+                }
+            }
+            finally
+            {
+                FinalizeLock.Release();
+            }
         }
 
 
@@ -545,7 +657,7 @@ namespace AutoUnpackTool.Core.Services
                 var files = Directory.GetFiles(dirPath);
                 foreach (var file in files)
                 {
-                    if (_detector.IsArchiveFile(file, false))
+                    if (IsArchiveArtifact(file))
                     {
                         return true;
                     }
@@ -581,14 +693,14 @@ namespace AutoUnpackTool.Core.Services
                 var subDirs = Directory.GetDirectories(dirPath);
                 var allFiles = Directory.GetFiles(dirPath);
                 // 忽略压缩包文件（含分卷），这些残留文件将在后续 HandleOriginalFile 中统一清理
-                var nonArchiveFiles = allFiles.Where(f => !_detector.IsArchiveFile(f)).ToArray();
+                var nonArchiveFiles = allFiles.Where(f => !IsArchiveArtifact(f)).ToArray();
 
                 _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {allFiles.Length} 个文件 (非压缩包: {nonArchiveFiles.Length})", ConsoleColor.Gray);
                 
                 // 【新增】详细列出所有文件及其类型，用于调试
                 foreach (var file in allFiles)
                 {
-                    bool isArchive = _detector.IsArchiveFile(file);
+                    bool isArchive = IsArchiveArtifact(file);
                     string fileName = Path.GetFileName(file);
                     _logger.Log($"[批量智能路径] [DEBUG-文件列表] {fileName}: {(isArchive ? "压缩包" : "非压缩包")}", ConsoleColor.Gray);
                 }
@@ -748,8 +860,8 @@ namespace AutoUnpackTool.Core.Services
                 // 检查最外层目录是否只有一个子目录
                 var subDirs = Directory.GetDirectories(rootDir);
                 var allFiles = Directory.GetFiles(rootDir);
-                var archiveFiles = allFiles.Where(f => _detector.IsArchiveFile(f)).ToArray();
-                var nonArchiveFiles = allFiles.Where(f => !_detector.IsArchiveFile(f)).ToArray();
+                var archiveFiles = allFiles.Where(f => IsArchiveArtifact(f)).ToArray();
+                var nonArchiveFiles = allFiles.Where(f => !IsArchiveArtifact(f)).ToArray();
 
                 _logger.Log($"[批量智能路径] [最外层检查] {Path.GetFileName(rootDir)}: {subDirs.Length} 个子目录, {archiveFiles.Length} 个压缩包, {nonArchiveFiles.Length} 个非压缩包文件", ConsoleColor.Gray);
 
@@ -984,7 +1096,7 @@ namespace AutoUnpackTool.Core.Services
                 {
                     try
                     {
-                        if (_detector.IsArchiveFile(file))
+                        if (IsArchiveArtifact(file))
                         {
                             File.Delete(file);
                             _logger.Log($"[批量智能路径]   删除残留压缩包: {Path.GetFileName(file)}", ConsoleColor.Gray);

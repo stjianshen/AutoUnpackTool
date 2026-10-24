@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using AutoUnpackTool.Core.Abstractions;
-using AutoUnpackTool.Core.Configuration;
 
 namespace AutoUnpackTool.Core.Services
 {
@@ -22,7 +21,6 @@ namespace AutoUnpackTool.Core.Services
     /// </summary>
     public sealed class DroppedFolderService
     {
-        private readonly AppSettings _settings;
         private readonly IAppLogger _logger;
         private readonly SmartPathService _smartPath;
         private readonly HashSet<string> _folders = new(StringComparer.OrdinalIgnoreCase);
@@ -30,16 +28,18 @@ namespace AutoUnpackTool.Core.Services
         /// <summary>收尾解析出的最终路径上报给界面（宿主注入，方法内部需自行封送到 UI 线程）。</summary>
         public Action<string>? OnFinalPathResolved { get; set; }
 
-        public DroppedFolderService(AppSettings settings, IAppLogger logger, SmartPathService smartPath)
+        public DroppedFolderService(IAppLogger logger, SmartPathService smartPath)
         {
-            _settings = settings;
             _logger = logger;
             _smartPath = smartPath;
         }
 
-        /// <summary>本功能是否生效：开启智能路径处理，且输出模式为「解压到压缩包同名文件夹」。</summary>
-        public bool IsEnabled
-            => _settings.EnableSmartPathProcessing && _settings.OutputMode == OutputMode.ArchiveFolder;
+        /// <summary>
+        /// 本功能是否生效：判据归 SmartPathService 拥有，这里只转发。
+        /// （上一版在这里又抄了一份 EnableSmartPathProcessing && ArchiveFolder，
+        /// 等于第 5 份开关条件复制品。）
+        /// </summary>
+        public bool IsEnabled => _smartPath.IsDroppedFolderFlattenEnabled;
 
         /// <summary>当前待收尾的文件夹数量。</summary>
         public int PendingCount
