@@ -1,50 +1,36 @@
 using System;
 using System.IO;
-using System.Windows.Threading;
 using AutoUnpackTool.Core.Abstractions;
 using AutoUnpackTool.Core.Models;
 
 namespace AutoUnpackTool.Services
 {
     /// <summary>
-    /// WPF 侧的日志实现：把 Core 层日志封送到界面线程后交给 sink 呈现。
-    /// 保持与原 AppendLog 一致的同步阻塞语义（Dispatcher.Invoke）。
+    /// WPF 侧的日志实现：把 Core 层日志交给 LogHub 汇聚。
+    /// 线程封送、视图过滤、批量刷新全部由 LogHub 负责，这里只做条目构造，
+    /// 因此调用方（后台工作线程）不会被 UI 阻塞。
     /// </summary>
     public sealed class UiAppLogger : IAppLogger
     {
-        private readonly Dispatcher _dispatcher;
-        private readonly Action<LogEntry> _sink;
+        private readonly LogHub _hub;
 
-        public UiAppLogger(Dispatcher dispatcher, Action<LogEntry> sink)
+        public UiAppLogger(LogHub hub)
         {
-            _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
-            _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+            _hub = hub ?? throw new ArgumentNullException(nameof(hub));
         }
 
         public void Log(string message, ConsoleColor color, FileItem? node = null)
         {
-            // 如果指定了目标节点,记录到该节点
-            if (node != null)
-            {
-                node.AddLog(message, color);
-            }
-
-            var entry = new LogEntry
+            _hub.Append(new LogEntry
             {
                 Timestamp = DateTime.Now,
                 Message = message,
-                Color = color
-            };
-
-            if (_dispatcher.CheckAccess())
-            {
-                _sink(entry);
-            }
-            else
-            {
-                _dispatcher.Invoke(() => _sink(entry));
-            }
+                Color = color,
+                Owner = node
+            });
         }
+
+        public void SetActivityNode(FileItem? node) => LogHub.SetActivity(node);
 
         public void Diag(string message)
         {

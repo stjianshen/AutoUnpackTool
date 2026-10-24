@@ -56,9 +56,7 @@ namespace AutoUnpackTool
             // 基础设施
             services.AddSingleton(Current.Dispatcher);
             services.AddSingleton<LogHub>();
-            services.AddSingleton<IAppLogger>(sp => new UiAppLogger(
-                sp.GetRequiredService<Dispatcher>(),
-                sp.GetRequiredService<LogHub>().Append));
+            services.AddSingleton<IAppLogger>(sp => new UiAppLogger(sp.GetRequiredService<LogHub>()));
             services.AddSingleton<IClipboardService, ClipboardService>();
             services.AddSingleton<IThemeService, ThemeService>();
             services.AddSingleton<IDialogService, DialogService>();

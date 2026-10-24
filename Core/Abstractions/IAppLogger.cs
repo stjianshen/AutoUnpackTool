@@ -11,9 +11,16 @@ namespace AutoUnpackTool.Core.Abstractions
     public interface IAppLogger
     {
         /// <summary>
-        /// 记录一条日志。node 不为空时同时写入该节点的日志集合。
+        /// 记录一条日志。node 不为空时该条日志归属到此节点（按节点过滤时可见）。
         /// </summary>
         void Log(string message, ConsoleColor color, FileItem? node = null);
+
+        /// <summary>
+        /// 声明“当前执行上下文正在处理哪个节点”：不带 node 的全局日志会自动归属到它，
+        /// 使按节点过滤能看到该任务从头到尾的完整流程（含线程调度、收尾阶段等系统日志）。
+        /// 基于异步上下文传递，多个 worker 并发时互不串台；处理结束传 null 撤销。
+        /// </summary>
+        void SetActivityNode(FileItem? node);
 
         /// <summary>
         /// 诊断日志：直接落盘，绕过 UI。

@@ -284,55 +284,7 @@ namespace AutoUnpackTool.Core.Models
             }
         }
 
-        // 日志存储
-        private List<LogEntry> _logs = new List<LogEntry>();
-        private readonly object _logLock = new object();
-
-        /// <summary>
-        /// 节点关联的日志列表
-        /// </summary>
-        public List<LogEntry> Logs
-        {
-            get { lock (_logLock) return new List<LogEntry>(_logs); }
-        }
-
-        /// <summary>
-        /// 添加日志到当前节点
-        /// </summary>
-        public void AddLog(string message, ConsoleColor color)
-        {
-            lock (_logLock)
-            {
-                _logs.Add(new LogEntry
-                {
-                    Timestamp = DateTime.Now,
-                    Message = message,
-                    Color = color
-                });
-            }
-        }
-
-        /// <summary>
-        /// 递归收集当前节点及所有子节点的日志
-        /// </summary>
-        public List<LogEntry> CollectAllLogs()
-        {
-            var allLogs = new List<LogEntry>();
-
-            lock (_logLock)
-            {
-                allLogs.AddRange(_logs);
-            }
-
-            // 递归收集子节点日志
-            foreach (var child in Children)
-            {
-                allLogs.AddRange(child.CollectAllLogs());
-            }
-
-            // 按时间排序
-            allLogs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
-            return allLogs;
-        }
+        // 日志不再在节点上存一份：全量日志唯一数据源在 LogHub（每条带 Owner 归属），
+        // 按节点过滤由 Owner 沿 Parent 链回溯完成，避免双份存储与“全局日志不属于任何节点”的裂缝。
     }
 }

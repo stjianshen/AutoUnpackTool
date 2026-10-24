@@ -364,6 +364,10 @@ namespace AutoUnpackTool.Core.Services
         /// </summary>
         public async Task ProcessPendingFile(FileItem fileItem, SevenZipExtractor extractor, List<string> passwords, CancellationToken token)
         {
+            // 本次处理期间不带 node 的全局日志归属到该节点（AsyncLocal 按异步上下文隔离，
+            // 多个 worker 并发时互不串台，也不需要显式清除）
+            _logger.SetActivityNode(fileItem);
+
             _logger.Log($"[DEBUG-测试] ProcessPendingFile 被调用: {fileItem.FileName}, 路径: {fileItem.FilePath}", ConsoleColor.Magenta, fileItem);
             
             // 检查层数限制（0表示不限制）
@@ -1061,6 +1065,11 @@ namespace AutoUnpackTool.Core.Services
                 }
             }
 
+            // 收尾链（阶段1-4）的日志不携带节点，这里按顶级压缩包定位节点并声明为活动节点，
+            // 否则“点某个文件看它的完整流程”会缺掉整段扁平化/合并日志（收尾已串行持锁，不存在串台）
+            var topItemForLog = FindFileItemInTreeThreadSafe(topArchivePath);
+            _logger.SetActivityNode(topItemForLog);
+
             // 【并发修复】收尾流程全程持锁串行执行：多个顶级文件并发完成时，
             // 阶段1-4 涉及共享集合（_extractedDirectoryNodes/_processedFlattenDirs）与目录移动，
             // 并发执行会互相干扰：移动中断（图片没移动完成）、目录冲突生成 GUID 新目录。
@@ -1262,6 +1271,9 @@ namespace AutoUnpackTool.Core.Services
         /// </summary>
         public async Task ProcessExtractFile(FileItem fileItem, SevenZipExtractor extractor, int taskId, CancellationToken token)
         {
+            // 解压侧同上：本文件解压期间产生的系统日志（重试/冲突处理/递归扫描等）归属到它
+            _logger.SetActivityNode(fileItem);
+
             // 从密码映射表获取密码
             if (!_passwordMap.TryGetValue(fileItem.FilePath, out var password))
             {

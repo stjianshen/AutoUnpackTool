@@ -51,18 +51,6 @@ namespace AutoUnpackTool.Core.Models
             Title = $"待解压任务(共{FileCount}个文件)";
         }
 
-        /// <summary>
-        /// 收集所有日志
-        /// </summary>
-        public List<LogEntry> CollectAllLogs()
-        {
-            var allLogs = new List<LogEntry>();
-            foreach (var child in Children)
-            {
-                allLogs.AddRange(child.CollectAllLogs());
-            }
-            allLogs.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
-            return allLogs;
-        }
+        // 日志收集已下沉 LogHub：根节点视图 = 不过滤的全量投影（含系统日志）。
     }
 }

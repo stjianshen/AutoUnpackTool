@@ -134,8 +134,9 @@
             <!-- 分隔条 -->
             <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch"/>
 
-            <!-- 右侧：信息输出 -->
-            <GroupBox Grid.Column="2" Header="信息输出" Margin="0,0,0,0">
+            <!-- 右侧：信息输出（标题跟随树选择切换日志视图） -->
+            <GroupBox Grid.Column="2" Header="{Binding LogScopeText}" Margin="0,0,0,0"
+                      ToolTip="点左侧文件节点：只看该任务及其解压产物的完整流程；点「待解压任务」根节点：看全部日志（含系统日志）">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>

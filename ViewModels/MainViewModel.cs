@@ -69,6 +69,10 @@ namespace AutoUnpackTool.ViewModels
         /// <summary>日志条目（替代原 TextBox 追加文本，虚拟化 ListBox 呈现）</summary>
         public ObservableCollection<LogEntry> Logs => _logHub.Entries;
 
+        /// <summary>日志面板当前视图范围（标题提示，避免不知道看的是谁的日志）</summary>
+        [ObservableProperty]
+        private string _logScopeText = "信息输出 · 全部日志";
+
         /// <summary>文件树根节点集合（绑定 TreeView）</summary>
         public ObservableCollection<RootNode> Roots { get; } = new ObservableCollection<RootNode>();
 
@@ -1002,52 +1006,45 @@ namespace AutoUnpackTool.ViewModels
         }
 
         /// <summary>
-        /// TreeView 选择改变（View 侧回调）：显示选中节点及其子节点的日志
+        /// TreeView 选择改变（View 侧回调）：切换日志视图。
+        /// 根节点/无选中 = 全部日志（含不属于任何节点的系统日志）；
+        /// 文件节点 = 该节点及其整棵子树的日志（包含自动归属到它的活动日志）。
         /// </summary>
         public void OnTreeSelectionChanged(object? selectedItem)
         {
             SelectedItem = selectedItem;
 
-            List<LogEntry> logsToShow = new List<LogEntry>();
-
-            if (selectedItem is RootNode rootNode)
+            if (selectedItem is FileItem fileItem)
             {
-                // 根节点:显示所有日志
-                logsToShow = rootNode.CollectAllLogs();
+                // 沿 Parent 链回溯判定归属：只读引用字段，不枚举 Children（Children 是 UI 绑定的集合，
+                // 而过滤谓词会在后台线程的 Append 里执行）
+                _logHub.SetViewFilter(entry => BelongsToNode(entry.Owner, fileItem));
+                LogScopeText = $"信息输出 · {fileItem.FileName} 及其子项";
 
-                // 调试：打印日志统计
-                System.Diagnostics.Debug.WriteLine($"[根节点日志统计] 共收集到 {logsToShow.Count} 条日志");
-                foreach (var child in rootNode.Children)
-                {
-                    var childLogs = child.CollectAllLogs();
-                    System.Diagnostics.Debug.WriteLine($"  - {child.FileName}: {childLogs.Count} 条日志");
-                }
-
-                // 清空最终路径显示
-                FinalPathText = "无";
-            }
-            else if (selectedItem is FileItem fileItem)
-            {
-                // 文件节点:显示该节点及所有子节点的日志
-                logsToShow = fileItem.CollectAllLogs();
-
-                // 调试：打印日志统计
-                System.Diagnostics.Debug.WriteLine($"[文件节点日志统计] {fileItem.FileName} 收集到 {logsToShow.Count} 条日志");
-
-                // 显示最终路径：优先使用节点的 FinalOutputPath，其次递归查找子节点中顶级项的路径
-                string? pathToShow = ResolveFinalPathForDisplay(fileItem);
-                FinalPathText = pathToShow ?? "无";
-
-                System.Diagnostics.Debug.WriteLine($"[文件节点路径] {fileItem.FileName}: FinalOutputPath={fileItem.FinalOutputPath}, 显示={FinalPathText}");
+                // 显示最终路径：优先使用节点的 FinalOutputPath，其次沿父链向上查找
+                FinalPathText = ResolveFinalPathForDisplay(fileItem) ?? "无";
             }
             else
             {
-                // 选中项为 null 或其他类型，清空显示
+                // 根节点或其他：显示全量日志，不再丢日志
+                _logHub.SetViewFilter(null);
+                LogScopeText = "信息输出 · 全部日志";
                 FinalPathText = "无";
             }
+        }
 
-            // 显示日志(不清空,直接重新渲染)
-            DisplayFilteredLogs(logsToShow, clearFirst: true);
+        /// <summary>
+        /// owner 是否为 node 自身或其子孙节点（沿 Parent 链上溯）。
+        /// owner 为 null 的纯系统日志不属于任何节点，只在全部视图可见。
+        /// </summary>
+        private static bool BelongsToNode(FileItem? owner, FileItem node)
+        {
+            for (var current = owner; current != null; current = current.Parent)
+            {
+                if (ReferenceEquals(current, node))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -1075,41 +1072,8 @@ namespace AutoUnpackTool.ViewModels
         }
 
         /// <summary>
-        /// 显示过滤后的日志（整体替换绑定集合，虚拟化 ListBox 自动刷新）
-        /// </summary>
-        /// <param name="logs">要显示的日志列表</param>
-        /// <param name="clearFirst">是否先清空日志窗口</param>
-        private void DisplayFilteredLogs(List<LogEntry> logs, bool clearFirst = false)
-        {
-            _dispatcher.Invoke(() =>
-            {
-                if (clearFirst)
-                {
-                    _logHub.Clear();
-                }
-
-                _logHub.Replace(logs);
-            });
-        }
-
-        /// <summary>
-        /// 检查 target 是否是 node 或其子孙节点
-        /// </summary>
-        private bool IsNodeOrDescendant(FileItem node, FileItem target)
-        {
-            if (node == target) return true;
-
-            foreach (var child in node.Children)
-            {
-                if (IsNodeOrDescendant(child, target)) return true;
-            }
-
-            return false;
-        }
-
-        /// <summary>
         /// [DIAG] 文件诊断日志：直接写文件，绕过 UI。
-        /// Dispatcher.Invoke 挂起时日志会静默阻塞，诊断轨迹必须落盘才能定位中断点。
+        /// UI 线程繁忙或卡死时界面日志可能延迟，诊断轨迹必须落盘才能定位中断点。
         /// </summary>
         private void DiagLog(string message)
         {
