@@ -27,6 +27,15 @@ namespace AutoUnpackTool.Core.Services
         private readonly SevenZipRunner _runner;
         private readonly ConcurrentDictionary<string, bool> _stegoProbeCache = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// 自指冲突（无扩展名压缩包）输出目录的本轮解析结果。
+        /// 这条分支的判据依赖源包是否存在，而收尾阶段2 会把源包移进回收站：
+        /// 之后再算就会退回「同名目录 = 源包路径」这个已经不存在的目录，
+        /// 阶段3 的过滤根对不上登记过的真实输出目录，扁平化整体空转（0 个解压目录节点）。
+        /// 所以首次解析（解压时，源包还在）的结果必须在整轮运行内保持不变。
+        /// </summary>
+        private readonly ConcurrentDictionary<string, string> _selfRefOutputDirs = new(StringComparer.OrdinalIgnoreCase);
+
         private HashSet<string>? _archiveExtSetCache;
         private string _archiveExtSetCacheKey = string.Empty;
 
@@ -528,7 +537,30 @@ namespace AutoUnpackTool.Core.Services
                 case OutputMode.ArchiveFolder:
                     // 输出到压缩文件同名文件夹（在压缩包目录下创建）
                     string targetFolder = Path.Combine(archiveDir, archiveNameWithoutExt);
-                    
+
+                    // 【自指冲突】无扩展名压缩包（被改名的 232/233 这类）去掉后缀后名字与自身相同，
+                    // targetFolder 就是压缩包自己的路径。NTFS 上文件与目录共享命名空间，不能建同名目录；
+                    // 但此处绝不能降级到 archiveDir：包内条目往往与包同名，产物会落回源包路径，
+                    // 而 7z 正持有源包的读取句柄（未共享 DELETE），于是报
+                    // “Cannot delete output file : 另一个程序正在使用此文件”（占用者就是它自己）。
+                    // 判据绝不能写成 File.Exists(targetFolder)：收尾阶段2 删掉源包后它会翻转，
+                    // 导致同一压缩包在「解压时」和「收尾时」算出两个不同的输出目录。
+                    // 用「不是目录」代替「是文件」：源包存在时和进回收站后都为真，解析结果稳定。
+                    if (!Directory.Exists(archivePath) && PathsReferToSameFile(targetFolder, archivePath))
+                    {
+                        string key;
+                        try { key = Path.GetFullPath(archivePath); }
+                        catch { key = archivePath; }
+
+                        if (!_selfRefOutputDirs.TryGetValue(key, out string? selfFolder) || selfFolder == null)
+                        {
+                            selfFolder = NextFreeSiblingPath(archiveDir, archiveNameWithoutExt + "_解压");
+                            _selfRefOutputDirs[key] = selfFolder;
+                            _logger.Log($"  同名输出目录即压缩包自身 '{archiveNameWithoutExt}'，改用独立目录 '{Path.GetFileName(selfFolder)}'（避免产物写回正在读取的源包）", ConsoleColor.Yellow);
+                        }
+                        return selfFolder;
+                    }
+
                     // 检查是否存在同名文件冲突
                     if (File.Exists(targetFolder))
                     {
@@ -541,6 +573,44 @@ namespace AutoUnpackTool.Core.Services
                 default:
                     return archiveDir;
             }
+        }
+
+        /// <summary>
+        /// 丢弃自指冲突输出目录的本轮解析结果。新一轮解压开始时必须调用，
+        /// 否则重新拖入的同名压缩包会被并进上一轮的产物目录里。
+        /// （与 SmartPathService.ResetRunState 同一层语义：本轮任务状态，不是缓存）
+        /// </summary>
+        public void ResetOutputDirectoryCache()
+        {
+            _selfRefOutputDirs.Clear();
+        }
+
+        /// <summary>两个路径是否指向同一个文件（归一化后忽略大小写比较）。</summary>
+        private static bool PathsReferToSameFile(string pathA, string pathB)
+        {
+            try
+            {
+                return string.Equals(Path.GetFullPath(pathA), Path.GetFullPath(pathB), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(pathA, pathB, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        /// <summary>在同一父目录下取一个既不等于现有文件、也不等于现有目录的自由路径名。</summary>
+        private static string NextFreeSiblingPath(string dir, string baseName)
+        {
+            string candidate = Path.Combine(dir, baseName);
+
+            for (int i = 1; Directory.Exists(candidate) || File.Exists(candidate); i++)
+            {
+                candidate = i < 1000
+                    ? Path.Combine(dir, $"{baseName}_{i}")
+                    : Path.Combine(dir, $"{baseName}_{Guid.NewGuid().ToString("N")[..8]}");
+            }
+
+            return candidate;
         }
 
         /// <summary>

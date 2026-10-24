@@ -47,11 +47,22 @@ namespace AutoUnpackTool.Core.Services
             get { lock (_folders) return _folders.Count; }
         }
 
-        /// <summary>登记一个拖入的文件夹（里面没有压缩包也要记，收尾要对它本身做扁平化）。</summary>
+        /// <summary>
+        /// 登记一个拖入的文件夹（里面没有压缩包也要记，收尾要对它本身做扁平化）。
+        /// 功能关时不登记：登记了也没人收（ScheduleFinalize 在 !IsEnabled 时直接 return），
+        /// 残留项会一直活在集合里，等用户以后改开智能路径 + 同名文件夹模式时，
+        /// 被一次无关的拖入顺带扁平化。
+        /// </summary>
         public void Register(string folderPath)
         {
             if (string.IsNullOrEmpty(folderPath))
                 return;
+
+            if (!IsEnabled)
+            {
+                _logger.Log($"[智能路径] 功能未启用（需开启智能路径处理且输出模式为「同名文件夹」），不登记拖入文件夹: {folderPath}", ConsoleColor.Gray);
+                return;
+            }
 
             lock (_folders)
                 _folders.Add(folderPath);
@@ -94,7 +105,14 @@ namespace AutoUnpackTool.Core.Services
         public bool ScheduleFinalize(string trigger, bool isBusy)
         {
             if (!IsEnabled)
+            {
+                // 不静默吞掉：正常路径下 Register 已拦住登记，走到这里只可能是
+                // 登记后、收尾前用户改了开关，得把“这批没被动过”说清楚
+                int pendingDisabled = PendingCount;
+                if (pendingDisabled > 0)
+                    _logger.Log($"[智能路径] {trigger}：智能路径未启用或输出模式不是「同名文件夹」，{pendingDisabled} 个拖入文件夹未处理", ConsoleColor.Yellow);
                 return false;
+            }
 
             if (isBusy)
             {

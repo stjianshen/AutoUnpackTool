@@ -124,6 +124,10 @@ namespace AutoUnpackTool.Core.Services
 
             // 重置暂停标志
             _isPaused = false;
+
+            // 新一轮 = 重新推导输出目录命名（无扩展名压缩包的自指冲突分支依赖磁盘状态，
+            // 沿用上一轮结果会把新拖入的同名包并进旧产物目录）
+            _detector.ResetOutputDirectoryCache();
             
             // 重置完成信号
             _testCompletionSource = new TaskCompletionSource<bool>();
@@ -1493,6 +1497,13 @@ namespace AutoUnpackTool.Core.Services
                     
                     _ui.SetStatusOnUiThread(fileItem, $"压失败: {result.Message}");
                     _logger.Log($"[线程 {taskId}] {fileItem.FileName}: 觧压失败 - {result.Message}", ConsoleColor.Red, fileItem);
+
+                    // 7z 报的“另一个程序正在使用此文件”极易被当成外部软件占用：
+                    // 产物路径正好等于源压缩包自身时，占用者就是 7z 自己（它对源包持有读句柄，不允许被覆盖删除）
+                    if (result.Message.Contains("Cannot delete output file", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.Log($"[{fileItem.FileName}] 产物路径与源压缩包同名，7z 无法覆盖自己正在读取的文件（并非外部程序占用）；建议改输出模式为「解压到同名文件夹」或给源包补上扩展名后重试", ConsoleColor.Yellow, fileItem);
+                    }
                     
                     // 标记自身解压失败
                     fileItem.SetSelfExtractResult(false);

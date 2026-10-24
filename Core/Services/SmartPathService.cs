@@ -26,6 +26,12 @@ namespace AutoUnpackTool.Core.Services
         private readonly ConflictResolver _conflicts;
         private readonly FileOperationService _fileOps;
 
+        /// <summary>
+        /// 拖入文件夹兜底扁平化的最大跟随跳数。每一跳深度严格递减，
+        /// 这个上限只防呆（防未来某条分支返回了不会收敛的路径），不是功能参数。
+        /// </summary>
+        private const int MaxFlattenHops = 32;
+
         public ConcurrentDictionary<string, byte> ExtractedDirectoryNodes { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> FlattenedFinalPathMap { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> ProcessedFlattenDirs { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -76,6 +82,9 @@ namespace AutoUnpackTool.Core.Services
             ExtractedDirectoryNodes.Clear();
             FlattenedFinalPathMap.Clear();
             ProcessedFlattenDirs.Clear();
+            // 无扩展名压缩包的输出目录解析结果也是本轮任务状态（ArchiveDetector 里的表），
+            // 不收会让下一轮重新拖入的同名包直接写进上一轮的产物目录
+            _detector.ResetOutputDirectoryCache();
         }
 
         /// <summary>
@@ -185,6 +194,15 @@ namespace AutoUnpackTool.Core.Services
                               && !busyDirs.Contains(dir))
                 .ToList();
             _logger.Log($"[同步批量智能路径] [DEBUG] 共 {allExtractedDirs.Count} 个解压目录节点（已过滤，仅当前批次）", ConsoleColor.Gray);
+            if (allExtractedDirs.Count == 0)
+            {
+                // 0 个节点 = 扁平化整段空转（产物停在双层目录里）。绝大多数原因是树根算错：
+                // GetOutputDirectory 依赖磁盘状态，而阶段2 已把源包移进回收站。
+                // 不打出树根和登记总数，光看“0 个”根本无从下手。
+                _logger.Log($"[同步批量智能路径] [警告] 树根 {ownOutputDir}（存在={Directory.Exists(ownOutputDir)}）下没有任何解压节点，"
+                            + $"全局登记 {_extractedDirectoryNodes.Count} 个：{string.Join(", ", _extractedDirectoryNodes.Keys.Take(8))}",
+                            ConsoleColor.Yellow);
+            }
             foreach (var dir in allExtractedDirs)
             {
                 _logger.Log($"[同步批量智能路径] [DEBUG]   - {dir}", ConsoleColor.Gray);
@@ -242,7 +260,8 @@ namespace AutoUnpackTool.Core.Services
                             if (Directory.Exists(childDir))
                             {
                                 _logger.Log($"[同步批量智能路径] 开始处理子目录: {childDir}", ConsoleColor.Cyan);
-                                await Task.Run(() => ProcessSmartPathBatchAsync(childDir));
+                                // 同一批内共用防重入标记（上方已统一清空），不得逐个重置
+                                await Task.Run(() => ProcessSmartPathBatchAsync(childDir, freshRequest: false));
                                 _processedFlattenDirs.Add(childDir);
                                 processedCount++;
                             }
@@ -261,7 +280,8 @@ namespace AutoUnpackTool.Core.Services
             
                 _logger.Log($"[同步批量智能路径] 开始处理: {outputDir}", ConsoleColor.Cyan);
             
-                await Task.Run(() => ProcessSmartPathBatchAsync(outputDir));
+                // 同一批内共用防重入标记（上方已统一清空），不得逐个重置
+                await Task.Run(() => ProcessSmartPathBatchAsync(outputDir, freshRequest: false));
                 _processedFlattenDirs.Add(outputDir);
                 processedCount++;
             }
@@ -358,7 +378,13 @@ namespace AutoUnpackTool.Core.Services
         /// <summary>
         /// 批量处理单个输出目录的智能路径扁平化（从叶子节点向上遍历）
         /// </summary>
-        public async Task ProcessSmartPathBatchAsync(string rootDir)
+        /// <param name="rootDir">本次请求的根目录</param>
+        /// <param name="freshRequest">
+        /// true = 这是一次独立的收尾请求（拖入文件夹、兜底批量），进来先清空防重入标记；
+        /// false = 由 ProcessBatchSmartPathSynchronous 的批内循环调用，标记已在批首清过，
+        /// 同一批的多个根目录共用一份（避免互相踩掉防回头记录）。
+        /// </param>
+        public async Task ProcessSmartPathBatchAsync(string rootDir, bool freshRequest = true)
         {
             _logger.Log($"[批量智能路径] [DEBUG] 进入 ProcessSmartPathBatchAsync, rootDir={rootDir}", ConsoleColor.Gray);
 
@@ -377,6 +403,14 @@ namespace AutoUnpackTool.Core.Services
                 _logger.Log($"[批量智能路径] [DEBUG] rootDir 不存在，直接返回", ConsoleColor.Gray);
                 return;
             }
+
+            // 【防重入标记只在单次请求内有效】_processedFlattenDirs 是给后序遍历“不回头、不死循环”
+            // 用的局部记号，却长在进程级单例上，而且以前只有阶段3 会清它。
+            // 后果：上一轮收尾时路过（并标记）过的目录，这一轮再单独拖进来时，
+            // 步骤2 打“目录已处理过，跳过”、步骤3 的 Contains 守卫也直接旁路，
+            // 表现就是“文件夹里只有一个子目录却怎么也不再扁平化”，而且日志看起来一切正常。
+            if (freshRequest)
+                _processedFlattenDirs.Clear();
         
             _logger.Log($"[批量智能路径] 开始处理: {rootDir}", ConsoleColor.Cyan);
         
@@ -391,13 +425,30 @@ namespace AutoUnpackTool.Core.Services
             ProcessDirectoryTreePostOrder(rootDir, isInExtractedTree: false);
         
             // 步骤3: 根目录兜底检查——拖入的文件夹本身不在 _extractedDirectoryNodes 中，
-            // 后序遍历会跳过它。但如果它恰好只有一个子目录且无其他非压缩包文件，仍需扁平化。
+            // 后序遍历会整棵跳过它（那是“不碰用户原始目录结构”的护栏，不能拆）。
+            // 于是拖入文件夹只有这一层会被判定；以前这里只跑一次，
+            // 表现就是“每拖一次只扁平一层”：提升后产物新位置又只剩一个子目录，却没人再去看它。
             string normalizedRoot = Path.GetFullPath(rootDir).TrimEnd(Path.DirectorySeparatorChar);
             if (Directory.Exists(rootDir) && !_processedFlattenDirs.Contains(normalizedRoot))
             {
                 _logger.Log($"[批量智能路径] [DEBUG] 步骤3: 检查根目录是否需要扁平化: {rootDir}", ConsoleColor.Gray);
-                ProcessSingleDirectoryIfNeeded(rootDir);
                 _processedFlattenDirs.Add(normalizedRoot);
+
+                // 跟随 ProcessSingleDirectoryIfNeeded 返回的新位置反复推平：
+                // 每一跳要么吃掉一层嵌套（提升）、要么上移一层内容（同名就地合并），
+                // 深度严格递减所以不会往复，上限只是防呆。
+                string? cursor = rootDir;
+                for (int hop = 0; hop < MaxFlattenHops && cursor != null; hop++)
+                {
+                    if (!Directory.Exists(cursor))
+                        break;
+                    cursor = ProcessSingleDirectoryIfNeeded(cursor);
+                }
+            }
+            else if (Directory.Exists(rootDir))
+            {
+                // 不记这条的话，“拖入一个文件夹甚至没尝试扁平化”在日志里就是完全静默的
+                _logger.Log($"[批量智能路径] [DEBUG] 步骤3: 根目录已在本次遍历中处理过，跳过兜底: {rootDir}", ConsoleColor.Gray);
             }
         
             _logger.Log($"[批量智能路径] ✓ 处理完成: {Path.GetFileName(rootDir)}", ConsoleColor.Green);
@@ -694,9 +745,13 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 检查并处理单个目录的扁平化（如果符合条件）
+        /// 检查并处理单个目录的扁平化（如果符合条件）。
+        /// 返回本次操作后“应当继续检查的目录”：
+        /// - 就地合并（同名嵌套）：内容上移但目录本身未动 → 返回 dirPath
+        /// - 提升成功：dirPath 已被删、内容升到其父目录并改名 → 返回新路径
+        /// - 不满足条件 / 失败：返回 null（调用方据此判定收敛）
         /// </summary>
-        public void ProcessSingleDirectoryIfNeeded(string dirPath)
+        public string? ProcessSingleDirectoryIfNeeded(string dirPath)
         {
             try
             {
@@ -729,7 +784,8 @@ namespace AutoUnpackTool.Core.Services
                     {
                         _logger.Log($"[批量智能路径] 检测到同名嵌套（{parentDirName} -> {subDirName}），执行就地合并消除嵌套", ConsoleColor.Cyan);
                         MergeSingleSubDirInPlace(dirPath, singleSubDir);
-                        return;
+                        // 就地合并只上移了一层内容，dirPath 可能又只剩一个子目录，让调用方接着推
+                        return dirPath;
                     }
                 }
 
@@ -740,7 +796,7 @@ namespace AutoUnpackTool.Core.Services
                         _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 子目录数量不为1 ({subDirs.Length})，跳过扁平化", ConsoleColor.Gray);
                     if (nonArchiveFiles.Length > 0)
                         _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 存在 {nonArchiveFiles.Length} 个非压缩包文件，跳过扁平化", ConsoleColor.Gray);
-                    return;
+                    return null;
                 }
 
                 string singleSubDir2 = subDirs[0];
@@ -759,12 +815,13 @@ namespace AutoUnpackTool.Core.Services
                 string finalFolderName = DetermineFolderName(parentDirName2, subDirName2);
                 _logger.Log($"[批量智能路径] [DEBUG] 最终文件夹名: {finalFolderName}", ConsoleColor.Gray);
 
-                // 执行扁平化：将子目录内容提升到父目录
-                FlattenDirectory(dirPath, singleSubDir2, finalFolderName);
+                // 执行扁平化：将子目录内容提升到父目录（新路径回给调用方，否则它不知道产物去了哪）
+                return FlattenDirectory(dirPath, singleSubDir2, finalFolderName);
             }
             catch (Exception ex)
             {
                 _logger.Log($"[批量智能路径] 处理目录失败 {dirPath}: {ex.Message}", ConsoleColor.Red);
+                return null;
             }
         }
 
@@ -1049,15 +1106,18 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 执行目录扁平化：将子目录内容提升到父目录并重命名
+        /// 执行目录扁平化：将子目录内容提升到父目录并重命名。
+        /// 返回内容的新路径（供调用方继续向上跟随）；任何一步没做成（移动失败、
+        /// 父目录非空回滚、重命名失败）都返回 null，表示结构未变化。
         /// </summary>
-        public void FlattenDirectory(string parentDir, string childDir, string finalName)
+        public string? FlattenDirectory(string parentDir, string childDir, string finalName)
         {
+            string? resultPath = null;
             try
             {
                 string? parentDirPath = Path.GetDirectoryName(parentDir);
                 if (string.IsNullOrEmpty(parentDirPath))
-                    return;
+                    return null;
 
                 // 步骤1: 移动子目录到临时位置（避免冲突）
                 string tempName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{finalName}";
@@ -1095,7 +1155,7 @@ namespace AutoUnpackTool.Core.Services
                 if (!moveSuccess)
                 {
                     _logger.Log($"[批量智能路径] ✗ 移动失败，跳过扁平化: {Path.GetFileName(childDir)}", ConsoleColor.Red);
-                    return;
+                    return null;
                 }
 
                 // 步骤1.5: 清理父目录中残留的压缩包文件，避免阻塞后续的目录删除
@@ -1170,7 +1230,7 @@ namespace AutoUnpackTool.Core.Services
                             _logger.Log($"[批量智能路径] ⚠ 恢复临时目录失败: {restoreEx.Message}", ConsoleColor.Red);
                         }
                         
-                        return;  // 跳过步骤3，不执行扁平化
+                        return null;  // 跳过步骤3，不执行扁平化
                     }
                 }
 
@@ -1225,6 +1285,7 @@ namespace AutoUnpackTool.Core.Services
                         }
                         _flattenedFinalPathMap[parentDir] = finalPath;
                         _logger.Log($"[批量智能路径] [DEBUG] 记录扁平化映射: {parentDir} -> {finalPath}", ConsoleColor.Gray);
+                        resultPath = finalPath;
                     }
                     catch (IOException ioEx) when (retryCount < maxRetries - 1)
                     {
@@ -1252,7 +1313,7 @@ namespace AutoUnpackTool.Core.Services
                         _logger.Log($"[批量智能路径]  恢复临时目录失败: {restoreEx.Message}", ConsoleColor.Yellow);
                     }
                     
-                    return;
+                    return null;
                 }
 
                 // 【已移除步骤4】后序遍历本身就会自然上溯处理父目录，无需额外递归重新处理
@@ -1261,6 +1322,7 @@ namespace AutoUnpackTool.Core.Services
             {
                 _logger.Log($"[批量智能路径] 扁平化失败: {ex.Message}", ConsoleColor.Red);
             }
+            return resultPath;
         }
 
     }
