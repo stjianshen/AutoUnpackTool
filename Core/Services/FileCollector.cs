@@ -44,12 +44,74 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
+        /// 输入侧去重的唯一入口：判据是「完整路径」，不比文件名、不比内容。
+        ///
+        /// 命中同名路径时先判断已存在节点是否为历史残留：终态 + 原文件已不在磁盘上
+        /// 且子树无在途任务 → 回收该节点（连同子树）并放行新文件。
+        /// 不这样处理的话，上一个同名压缩包解压完被删掉后，带子包的成功节点会永久留在树里
+        /// （CheckAndMarkParentComplete 只移除无子项的顶级节点），后续重新拖入同名文件会被静默跳过。
+        /// </summary>
+        private bool IsAlreadyTracked(string filePath)
+        {
+            for (int i = _fileList.Count - 1; i >= 0; i--)
+            {
+                var node = _fileList[i];
+                // Windows 路径大小写不敏感，用 OrdinalIgnoreCase（原来的 == 会漏判大小写不同的同一文件）
+                if (!string.Equals(node.FilePath, filePath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (IsStaleHistoryNode(node))
+                {
+                    _fileList.RemoveAt(i);
+                    _logger.Log($"[输入去重] 同名旧任务「{node.FileName}」已完成且原文件已不在磁盘上，回收历史节点以重新处理", ConsoleColor.Cyan);
+                    continue;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 是否可回收的历史节点：顶级 + 已进入终态 + 原文件已不存在 + 整棵子树没有在途任务。
+        /// 四个条件缺一不可：解压失败的节点原文件还在（不回收）、正在处理的节点子树还活着（不回收）。
+        /// </summary>
+        private static bool IsStaleHistoryNode(FileItem node)
+        {
+            if (node.Parent != null)
+                return false;
+            if (HasInFlightWork(node))
+                return false;
+            if (File.Exists(node.FilePath))
+                return false;
+
+            bool terminal = node.GetSelfExtractResult()
+                || node.Status.Contains("完成")
+                || node.Status.Contains("fail")
+                || node.Status.StartsWith("跳过")
+                || node.Status == "已取消";
+            return terminal;
+        }
+
+        /// <summary>“正在测试密码/正在解压”都算在途，子树里只要有一个就不能拆。</summary>
+        private static bool HasInFlightWork(FileItem node)
+        {
+            if (node.Status.Contains("正在"))
+                return true;
+            foreach (var child in node.Children)
+            {
+                if (HasInFlightWork(child))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// 添加单个文件到列表
         /// </summary>
         public void AddFileToList(string filePath, ref int addedCount, List<FileItem>? newFileItems = null, string? sourceFolderName = null)
         {
-            // 检查是否已存在
-            if (_fileList.Any(f => f.FilePath == filePath))
+            // 检查是否已存在（含历史残留节点的回收）
+            if (IsAlreadyTracked(filePath))
                 return;
 
             var fileInfo = new FileInfo(filePath);
@@ -94,7 +156,7 @@ namespace AutoUnpackTool.Core.Services
                 foreach (var file in archiveFiles)
                 {
                     // 检查是否已在列表中
-                    if (_fileList.Any(f => f.FilePath == file))
+                    if (IsAlreadyTracked(file))
                         continue;
 
                     var fileInfo = new FileInfo(file);
@@ -164,7 +226,7 @@ namespace AutoUnpackTool.Core.Services
                         // 存储分卷信息
                         fileItem.VolumeInfo = volumeInfo;
                         
-                        if (!_fileList.Any(f => f.FilePath == volumeInfo.MainVolumePath))
+                        if (!IsAlreadyTracked(volumeInfo.MainVolumePath))
                         {
                             _fileList.Add(fileItem);
                             addedCount++;
@@ -279,7 +341,7 @@ namespace AutoUnpackTool.Core.Services
                                 // 存储分卷信息
                                 fileItem.VolumeInfo = volumeInfo;
                                 
-                                if (!_fileList.Any(f => f.FilePath == volumeInfo.MainVolumePath))
+                                if (!IsAlreadyTracked(volumeInfo.MainVolumePath))
                                 {
                                     _fileList.Add(fileItem);
                                     addedCount++;
