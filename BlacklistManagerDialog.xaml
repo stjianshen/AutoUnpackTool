@@ -1,45 +1,53 @@
-<Window x:Class="AutoUnpackTool.BlacklistManagerDialog"
+<ui:FluentWindow x:Class="AutoUnpackTool.BlacklistManagerDialog"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         Title="黑名单管理" Height="640" Width="880"
         WindowStartupLocation="CenterOwner"
-        ResizeMode="CanResize">
-    <Grid Margin="15">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+        ResizeMode="CanResize"
+        ExtendsContentIntoTitleBar="True"
+        WindowBackdropType="Mica"
+        WindowCornerPreference="Round">
+    <DockPanel>
+        <ui:TitleBar DockPanel.Dock="Top" Title="黑名单管理" Height="36"/>
 
-        <!-- 规则说明 -->
-        <Border Grid.Row="0" Background="#F0F8FF" BorderBrush="#4682B4" BorderThickness="1" Padding="10" CornerRadius="3" Margin="0,0,0,10">
-            <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="#333333">
-                <Run Text="• 一行一条规则，按顺序匹配，命中任意一条即永久删除（不进回收站，不可恢复）"/>
-                <LineBreak/>
-                <Run Text="• 通配符模式：* 匹配任意字符，? 匹配单个字符，整名匹配。例：*只是个表情包*.jpg"/>
-                <LineBreak/>
-                <Run Text="• 正则模式（勾选“正则”列）：支持 Perl/.NET 语法，如 \d、\w、[abc]、(a|b)、(?i)、环视等，默认忽略大小写"/>
-                <LineBreak/>
-                <Run Text="• 模式包含 \ 或 / 时匹配完整路径，否则只匹配文件名/文件夹名"/>
-            </TextBlock>
-        </Border>
+        <Grid Margin="15,6,15,15">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
 
-        <!-- 工具栏 -->
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
-            <Button x:Name="BtnAddRule" Content="添加规则" Width="90" Height="30" Command="{Binding AddRuleCommand}" Margin="0,0,8,0"/>
-            <Button x:Name="BtnDeleteRule" Content="删除选中" Width="90" Height="30" Click="BtnDeleteRule_Click" Margin="0,0,8,0"/>
-            <Button x:Name="BtnMoveUp" Content="↑ 上移" Width="80" Height="30" Command="{Binding MoveUpCommand}" Margin="0,0,8,0"/>
-            <Button x:Name="BtnMoveDown" Content="↓ 下移" Width="80" Height="30" Command="{Binding MoveDownCommand}" Margin="0,0,8,0"/>
-            <Button x:Name="BtnInsertSamples" Content="插入示例规则" Width="110" Height="30" Command="{Binding InsertSamplesCommand}" Background="LightYellow" Margin="0,0,8,0"/>
-            <Button x:Name="BtnClearRules" Content="清空全部" Width="90" Height="30" Command="{Binding ClearRulesCommand}" Background="#FFCC99"/>
-            <TextBlock x:Name="TxtRuleSummary" Text="{Binding RuleSummary, Mode=OneWay}" VerticalAlignment="Center" Margin="12,0,0,0" Foreground="Gray" FontSize="11"/>
-        </StackPanel>
+            <!-- 规则说明 -->
+            <Border Grid.Row="0" Style="{StaticResource InfoCard}" Margin="0,0,0,10">
+                <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+                    <Run Text="• 一行一条规则，按顺序匹配，命中任意一条即永久删除（不进回收站，不可恢复）"/>
+                    <LineBreak/>
+                    <Run Text="• 通配符模式：* 匹配任意字符，? 匹配单个字符，整名匹配。例：*只是个表情包*.jpg"/>
+                    <LineBreak/>
+                    <Run Text="• 正则模式（勾选“正则”列）：支持 Perl/.NET 语法，如 \d、\w、[abc]、(a|b)、(?i)、环视等，默认忽略大小写"/>
+                    <LineBreak/>
+                    <Run Text="• 模式包含 \ 或 / 时匹配完整路径，否则只匹配文件名/文件夹名"/>
+                </TextBlock>
+            </Border>
 
-        <!-- 规则表格：一行一格 -->
-        <GroupBox Grid.Row="2" Header="黑名单规则（双击单元格编辑，行顺序即匹配优先级）" Margin="0,0,0,10">
-            <DataGrid x:Name="DgRules"
+            <!-- 工具栏 -->
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
+                <ui:Button x:Name="BtnAddRule" Content="添加规则" Width="90" Height="30" Command="{Binding AddRuleCommand}" Margin="0,0,8,0"/>
+                <ui:Button x:Name="BtnDeleteRule" Content="删除选中" Width="90" Height="30" Click="BtnDeleteRule_Click" Margin="0,0,8,0"/>
+                <ui:Button x:Name="BtnMoveUp" Content="↑ 上移" Width="80" Height="30" Command="{Binding MoveUpCommand}" Margin="0,0,8,0"/>
+                <ui:Button x:Name="BtnMoveDown" Content="↓ 下移" Width="80" Height="30" Command="{Binding MoveDownCommand}" Margin="0,0,8,0"/>
+                <ui:Button x:Name="BtnInsertSamples" Content="插入示例规则" Width="110" Height="30" Command="{Binding InsertSamplesCommand}" Appearance="Caution" Margin="0,0,8,0"/>
+                <ui:Button x:Name="BtnClearRules" Content="清空全部" Width="90" Height="30" Command="{Binding ClearRulesCommand}" Appearance="Danger"/>
+                <TextBlock x:Name="TxtRuleSummary" Text="{Binding RuleSummary, Mode=OneWay}" VerticalAlignment="Center" Margin="12,0,0,0"
+                           FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+            </StackPanel>
+
+            <!-- 规则表格：一行一格 -->
+            <GroupBox Grid.Row="2" Header="黑名单规则（双击单元格编辑，行顺序即匹配优先级）" Margin="0,0,0,10">
+                <DataGrid x:Name="DgRules"
                                   ItemsSource="{Binding Rules}"
                                   SelectedItem="{Binding SelectedRule, Mode=TwoWay}"
                       AutoGenerateColumns="False"
@@ -53,76 +61,77 @@
                       RowHeaderWidth="0"
                       GridLinesVisibility="All"
                       CellEditEnding="DgRules_CellEditEnding"
-                      Background="White"
+                      Background="Transparent"
                       Margin="5">
-                <DataGrid.Columns>
-                    <DataGridTemplateColumn Header="启用" Width="55" CanUserSort="False">
-                        <DataGridTemplateColumn.CellTemplate>
-                            <DataTemplate>
-                                <CheckBox IsChecked="{Binding Enabled, UpdateSourceTrigger=PropertyChanged}"
-                                          HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                    </DataGridTemplateColumn>
+                    <DataGrid.Columns>
+                        <DataGridTemplateColumn Header="启用" Width="55" CanUserSort="False">
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <CheckBox IsChecked="{Binding Enabled, UpdateSourceTrigger=PropertyChanged}"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
 
-                    <DataGridTemplateColumn Header="正则" Width="55" CanUserSort="False">
-                        <DataGridTemplateColumn.CellTemplate>
-                            <DataTemplate>
-                                <CheckBox IsChecked="{Binding IsRegex, UpdateSourceTrigger=PropertyChanged}"
-                                          HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                    </DataGridTemplateColumn>
+                        <DataGridTemplateColumn Header="正则" Width="55" CanUserSort="False">
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <CheckBox IsChecked="{Binding IsRegex, UpdateSourceTrigger=PropertyChanged}"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
 
-                    <DataGridTextColumn Header="匹配模式" Width="*" Binding="{Binding Pattern, UpdateSourceTrigger=LostFocus}"/>
+                        <DataGridTextColumn Header="匹配模式" Width="*" Binding="{Binding Pattern, UpdateSourceTrigger=LostFocus}"/>
 
-                    <DataGridTextColumn Header="说明" Width="200" Binding="{Binding Note, UpdateSourceTrigger=LostFocus}"/>
-                </DataGrid.Columns>
-            </DataGrid>
-        </GroupBox>
+                        <DataGridTextColumn Header="说明" Width="200" Binding="{Binding Note, UpdateSourceTrigger=LostFocus}"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+            </GroupBox>
 
-        <!-- 规则测试 -->
-        <GroupBox Grid.Row="3" Header="规则测试" Margin="0,0,0,10">
-            <Grid Margin="10">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                </Grid.ColumnDefinitions>
+            <!-- 规则测试 -->
+            <GroupBox Grid.Row="3" Header="规则测试" Margin="0,0,0,10">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
 
-                <TextBlock Grid.Row="0" Grid.Column="0" Text="测试文件名:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                <TextBox x:Name="TxtTestFileName" Grid.Row="0" Grid.Column="1" Height="28" VerticalContentAlignment="Center"
-                         Text="{Binding TestFileName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="测试文件名:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <ui:TextBox x:Name="TxtTestFileName" Grid.Row="0" Grid.Column="1" Height="28" VerticalContentAlignment="Center"
+                               Text="{Binding TestFileName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-                <TextBlock x:Name="TxtTestResult" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2"
-                           Text="{Binding TestResult, Mode=OneWay}" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap">
-                    <TextBlock.Style>
-                        <Style TargetType="TextBlock">
-                            <Setter Property="Foreground" Value="Gray"/>
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding TestResultColor}" Value="SeaGreen">
-                                    <Setter Property="Foreground" Value="SeaGreen"/>
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding TestResultColor}" Value="Red">
-                                    <Setter Property="Foreground" Value="Red"/>
-                                </DataTrigger>
-                                <DataTrigger Binding="{Binding TestResultColor}" Value="DarkOrange">
-                                    <Setter Property="Foreground" Value="DarkOrange"/>
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </TextBlock.Style>
-                </TextBlock>
-            </Grid>
-        </GroupBox>
+                    <TextBlock x:Name="TxtTestResult" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2"
+                               Text="{Binding TestResult, Mode=OneWay}" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding TestResultColor}" Value="SeaGreen">
+                                        <Setter Property="Foreground" Value="{DynamicResource SystemFillColorSuccessBrush}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding TestResultColor}" Value="Red">
+                                        <Setter Property="Foreground" Value="{DynamicResource SystemFillColorCriticalBrush}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding TestResultColor}" Value="DarkOrange">
+                                        <Setter Property="Foreground" Value="{DynamicResource SystemFillColorCautionBrush}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Grid>
+            </GroupBox>
 
-        <!-- 底部按钮 -->
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="BtnSave" Content="确定" Width="100" Height="30" Command="{Binding SaveCommand}" Margin="0,0,10,0"/>
-            <Button x:Name="BtnCancel" Content="取消" Width="100" Height="30" Command="{Binding CancelCommand}"/>
-        </StackPanel>
-    </Grid>
-</Window>
+            <!-- 底部按钮 -->
+            <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+                <ui:Button x:Name="BtnSave" Content="确定" Width="100" Height="30" Appearance="Primary" Command="{Binding SaveCommand}" Margin="0,0,10,0"/>
+                <ui:Button x:Name="BtnCancel" Content="取消" Width="100" Height="30" Command="{Binding CancelCommand}"/>
+            </StackPanel>
+        </Grid>
+    </DockPanel>
+</ui:FluentWindow>

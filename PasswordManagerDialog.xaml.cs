@@ -12,7 +12,7 @@ namespace AutoUnpackTool
     /// 密码本管理对话框：只保留视图专属能力（DataGrid 多选、Ctrl+A、反选、关闭）。
     /// 全部业务逻辑在 PasswordManagerViewModel。
     /// </summary>
-    public partial class PasswordManagerDialog : Window
+    public partial class PasswordManagerDialog : Wpf.Ui.Controls.FluentWindow
     {
         private readonly PasswordManagerViewModel _vm;
 

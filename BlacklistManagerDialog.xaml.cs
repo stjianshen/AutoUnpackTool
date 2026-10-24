@@ -12,7 +12,7 @@ namespace AutoUnpackTool
     /// 黑名单管理对话框：只保留表格相关的视图操作（编辑提交、行定位、多选删除转发），
     /// 规则增删移、示例插入、正则校验与测试预览都在 BlacklistViewModel。
     /// </summary>
-    public partial class BlacklistManagerDialog : Window
+    public partial class BlacklistManagerDialog : Wpf.Ui.Controls.FluentWindow
     {
         private readonly BlacklistViewModel _vm;
 

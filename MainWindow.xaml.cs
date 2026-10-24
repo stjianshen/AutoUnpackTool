@@ -1,6 +1,7 @@
 ﻿using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using AutoUnpackTool.Services;
 using AutoUnpackTool.ViewModels;
 
 namespace AutoUnpackTool
@@ -9,24 +10,32 @@ namespace AutoUnpackTool
     /// 主窗口：只保留视图层职责（XAML 加载、拖放/选中事件转投、日志自动滚动）。
     /// 全部业务逻辑位于 MainViewModel，窗口不再持有任何服务或流程状态。
     /// </summary>
-    public partial class MainWindow : Window
+    public partial class MainWindow : Wpf.Ui.Controls.FluentWindow
     {
         private readonly MainViewModel _vm;
+        private readonly IThemeService _theme;
 
-        public MainWindow(MainViewModel vm)
+        public MainWindow(MainViewModel vm, IThemeService theme)
         {
             InitializeComponent();
             _vm = vm;
+            _theme = theme;
             DataContext = vm;
 
             // 日志自动滚动由附加行为 LogListAutoScroll 负责（见 MainWindow.xaml）
+            // 窗口句柄就绪后才能挂系统深浅色监听
+            SourceInitialized += (_, _) => _theme.AttachWindow(this);
         }
 
         private void Window_DragOver(object sender, DragEventArgs e) => _vm.HandleDragOver(e);
 
         private void Window_Drop(object sender, DragEventArgs e) => _vm.HandleDrop(e.Data);
 
-        private void Window_Closing(object? sender, CancelEventArgs e) => _vm.Shutdown();
+        private void Window_Closing(object? sender, CancelEventArgs e)
+        {
+            _theme.DetachWindow(this);
+            _vm.Shutdown();
+        }
 
         private void TreeView_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e) => _vm.OnTreeSelectionChanged(e.NewValue);
 

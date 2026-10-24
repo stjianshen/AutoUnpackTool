@@ -61,6 +61,10 @@ namespace AutoUnpackTool.ViewModels
         [ObservableProperty]
         private string _blacklistSummary = string.Empty;
 
+        /// <summary>界面主题下拉索引：0=跟随系统 1=浅色 2=深色（与 AppThemeMode 的数值一致）</summary>
+        [ObservableProperty]
+        private int _themeIndex;
+
         // 解压后文件处理方式
         [ObservableProperty]
         private bool _keepOriginal;
@@ -196,6 +200,9 @@ namespace AutoUnpackTool.ViewModels
             // 加载扩展名设置
             ArchiveExtensions = Settings.ArchiveExtensions;
             ExcludedExtensions = Settings.ExcludedExtensions;
+
+            // 加载界面主题
+            ThemeIndex = (int)Settings.Theme;
 
             // 加载黑名单规则摘要
             UpdateBlacklistSummary();
@@ -360,6 +367,9 @@ namespace AutoUnpackTool.ViewModels
                 // 保存扩展名设置
                 Settings.ArchiveExtensions = ArchiveExtensions.Trim();
                 Settings.ExcludedExtensions = ExcludedExtensions.Trim();
+
+                // 保存界面主题（生效由 DialogService 在对话框关闭后调用 IThemeService.Apply）
+                Settings.Theme = (AppThemeMode)Math.Clamp(ThemeIndex, 0, 2);
 
                 // 黑名单规则由 BlacklistManagerDialog 直接保存到 Settings.BlacklistRules
 

@@ -13,14 +13,28 @@ namespace AutoUnpackTool.Services
     public sealed class DialogService : IDialogService
     {
         private readonly IClipboardService _clipboard;
+        private readonly IThemeService _theme;
 
-        public DialogService(IClipboardService clipboard)
+        public DialogService(IClipboardService clipboard, IThemeService theme)
         {
             _clipboard = clipboard;
+            _theme = theme;
         }
 
         private static Window? Owner => Application.Current?.Windows.OfType<Window>().FirstOrDefault(w => w.IsActive)
             ?? Application.Current?.MainWindow;
+
+        /// <summary>
+        /// 统一装配对话框：指定 Owner，并在句柄就绪后挂上系统深浅色监听（关闭时解除）。
+        /// 三个 Fluent 对话框共用这一套，避免在每个窗口的构造函数里重复。
+        /// </summary>
+        private T Prepare<T>(T dialog) where T : Window
+        {
+            dialog.Owner = Owner;
+            dialog.SourceInitialized += (_, _) => _theme.AttachWindow(dialog);
+            dialog.Closed += (_, _) => _theme.DetachWindow(dialog);
+            return dialog;
+        }
 
         public string? SelectFolder(string title)
         {
@@ -60,22 +74,25 @@ namespace AutoUnpackTool.Services
         public AppSettings? ShowSettings(AppSettings current)
         {
             var vm = new SettingsViewModel(current, this);
-            var dialog = new SettingsDialog(vm) { Owner = Owner };
-            return dialog.ShowDialog() == true ? vm.Settings : null;
+            var dialog = Prepare(new SettingsDialog(vm));
+            if (dialog.ShowDialog() != true)
+                return null;
+
+            // 主题在设置关闭时立即生效（无需重启），同时已随 Settings.Save() 落盘
+            _theme.Apply(vm.Settings.Theme);
+            return vm.Settings;
         }
 
         public bool ShowPasswords(AppSettings current)
         {
             var vm = new PasswordManagerViewModel(current, this, _clipboard);
-            var dialog = new PasswordManagerDialog(vm) { Owner = Owner };
-            return dialog.ShowDialog() == true;
+            return Prepare(new PasswordManagerDialog(vm)).ShowDialog() == true;
         }
 
         public bool ShowBlacklist(AppSettings current)
         {
             var vm = new BlacklistViewModel(current, this);
-            var dialog = new BlacklistManagerDialog(vm) { Owner = Owner };
-            return dialog.ShowDialog() == true;
+            return Prepare(new BlacklistManagerDialog(vm)).ShowDialog() == true;
         }
 
         public void ShowWarning(string message, string title = "提示")
