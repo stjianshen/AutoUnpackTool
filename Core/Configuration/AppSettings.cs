@@ -329,135 +329,6 @@ namespace AutoUnpackTool.Core.Configuration
         }
 
         /// <summary>
-        /// 从旧格式的密码本文件导入密码（支持TAB分隔格式）
-        /// </summary>
-        /// <returns>返回导入结果信息</returns>
-        public string ImportPasswordsFromOldFormat(string oldPasswordFilePath)
-        {
-            if (string.IsNullOrWhiteSpace(oldPasswordFilePath) || !File.Exists(oldPasswordFilePath))
-            {
-                throw new ArgumentException("密码本文件路径无效或文件不存在");
-            }
-
-            try
-            {
-                string[] lines = File.ReadAllLines(oldPasswordFilePath);
-                int importedCount = 0;
-                int skippedCount = 0;
-                int emptyCount = 0;
-
-                Console.WriteLine($"开始导入密码本: {oldPasswordFilePath}");
-                Console.WriteLine($"文件总行数: {lines.Length}");
-                Console.WriteLine($"配置文件中现有密码数: {PermanentPasswords.Count}");
-
-                foreach (string line in lines)
-                {
-                    string trimmed = line.Trim();
-                    if (string.IsNullOrEmpty(trimmed))
-                    {
-                        emptyCount++;
-                        continue;
-                    }
-
-                    // 解析密码（支持TAB分隔格式：密码\t\t使用次数\t\t时间）
-                    string password = trimmed;
-                    int usageCount = 0;
-                    DateTime lastUsedTime = DateTime.MinValue;
-
-                    // 尝试分割
-                    string[] parts = trimmed.Split(new[] { "\t\t" }, StringSplitOptions.None);
-                    if (parts.Length >= 1)
-                    {
-                        password = parts[0].Trim();
-
-                        if (parts.Length >= 2)
-                        {
-                            int.TryParse(parts[1].Trim(), out usageCount);
-                        }
-
-                        if (parts.Length >= 3 && long.TryParse(parts[2].Trim(), out long ticks))
-                        {
-                            lastUsedTime = new DateTime(ticks);
-                        }
-                    }
-
-                    // 验证密码不为空
-                    if (string.IsNullOrEmpty(password))
-                    {
-                        Console.WriteLine($"跳过空密码");
-                        continue;
-                    }
-
-                    // 如果密码不存在，添加它
-                    if (!PermanentPasswords.Any(p => p.Password == password))
-                    {
-                        PermanentPasswords.Add(new PasswordEntry
-                        {
-                            Password = password,
-                            UsageCount = usageCount,
-                            LastUsedTime = lastUsedTime
-                        });
-                        importedCount++;
-                        Console.WriteLine($"导入新密码: {password}");
-                    }
-                    else
-                    {
-                        skippedCount++;
-                        Console.WriteLine($"跳过重复密码: {password}");
-                    }
-                }
-
-                Console.WriteLine($"导入完成 - 新导入: {importedCount}, 跳过重复: {skippedCount}, 空行: {emptyCount}");
-                Console.WriteLine($"配置文件现有密码总数: {PermanentPasswords.Count}");
-
-                if (importedCount > 0)
-                {
-                    // 重新排序
-                    PermanentPasswords = PermanentPasswords.OrderByDescending(p => p.Score).ToList();
-
-                    // 自动保存到配置文件
-                    Console.WriteLine($"正在保存配置文件: {ConfigPath}");
-                    Save();
-                    Console.WriteLine($"配置文件保存成功");
-
-                    // 验证保存结果
-                    if (File.Exists(ConfigPath))
-                    {
-                        string savedJson = File.ReadAllText(ConfigPath);
-                        if (savedJson.Contains("\"PermanentPasswords\""))
-                        {
-                            Console.WriteLine("✓ 验证成功: PermanentPasswords 已写入配置文件");
-                        }
-                        else
-                        {
-                            Console.WriteLine("✗ 警告: PermanentPasswords 未找到在配置文件中");
-                        }
-                    }
-
-                    return $"导入成功！\n\n" +
-                           $"新增密码: {importedCount} 个\n" +
-                           $"跳过重复: {skippedCount} 个\n" +
-                           $"空行跳过: {emptyCount} 个\n" +
-                           $"总计密码: {PermanentPasswords.Count} 个\n\n" +
-                           $"密码已保存到配置文件:\n{ConfigPath}";
-                }
-                else
-                {
-                    return $"导入完成！\n\n" +
-                           $"新增密码: 0 个\n" +
-                           $"跳过重复: {skippedCount} 个\n" +
-                           $"所有密码都已存在于配置文件中。";
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"导入旧密码本失败: {ex.Message}");
-                Console.WriteLine($"异常堆栈: {ex.StackTrace}");
-                throw new Exception($"导入密码本失败：{ex.Message}", ex);
-            }
-        }
-
-        /// <summary>
         /// 获取所有密码（一次性密码 + 永久密码，按综合评分排序）
         /// </summary>
         public List<string> GetAllPasswords()
@@ -547,31 +418,6 @@ namespace AutoUnpackTool.Core.Configuration
         }
 
         /// <summary>
-        /// 保存密码到文件（使用两个Tab分隔符）
-        /// 格式：密码\t\t使用次数\t\t最后使用时间(Ticks)
-        /// </summary>
-        public void SavePasswordsToFile()
-        {
-            if (string.IsNullOrWhiteSpace(PasswordFilePath))
-            {
-                return;
-            }
-
-            try
-            {
-                // 按综合评分排序后保存
-                var sortedPasswords = PermanentPasswords.OrderByDescending(p => p.Score).ToList();
-                var lines = sortedPasswords.Select(p =>
-                    $"{p.Password}\t\t{p.UsageCount}\t\t{p.LastUsedTime.Ticks}").ToList();
-                File.WriteAllLines(PasswordFilePath, lines);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"保存密码本失败: {ex.Message}");
-            }
-        }
-
-        /// <summary>
         /// 获取需要检测的压缩文件扩展名列表
         /// </summary>
         public HashSet<string> GetArchiveExtensions()
@@ -623,14 +469,6 @@ namespace AutoUnpackTool.Core.Configuration
         }
 
         /// <summary>
-        /// 获取黑名单模式列表（兼容旧调用方，返回启用规则的匹配模式）
-        /// </summary>
-        public List<string> GetBlacklistPatterns()
-        {
-            return GetBlacklistRules().Select(r => r.Pattern.Trim()).ToList();
-        }
-
-        /// <summary>
         /// 将旧版 BlacklistFiles 字符串迁移为 BlacklistRules 表格规则
         /// </summary>
         private void MigrateLegacyBlacklist()
@@ -663,12 +501,6 @@ namespace AutoUnpackTool.Core.Configuration
 
             BlacklistFiles = string.Empty;
             Console.WriteLine($"✅ 已迁移旧版黑名单 {BlacklistRules.Count} 条规则");
-        }
-
-        [Obsolete("使用 LoadPasswordsFromFile 代替")]
-        public List<string> LoadPasswords()
-        {
-            return GetAllPasswords();
         }
     }
 }

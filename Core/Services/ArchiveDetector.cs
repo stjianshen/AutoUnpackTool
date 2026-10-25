@@ -334,53 +334,6 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 基于扩展名判断压缩文件
-        /// </summary>
-        public bool IsArchiveFileByExtension(string filePath, bool isDroppedFile = true)
-        {
-            // 如果启用了强制觧压模式，跳过所有检测，直接返回 true
-            // 但只对最初拖入的文件生效
-            if (_settings.ForceExtractMode && isDroppedFile)
-            {
-                return true;
-            }
-        
-            string extension = PathUtil.LowerExtension(filePath);
-            
-            // 获取排除的扩展名列表
-            var excludedExtensions = _settings.GetExcludedExtensions();
-            
-            // 先检查是否在排除列表中（优先级最高）
-            if (excludedExtensions.Contains(extension))
-            {
-                return false;
-            }
-            
-            // 获取需要检测的压缩文件扩展名列表
-            var archiveExtensions = _settings.GetArchiveExtensions();
-            
-            // 检查完整扩展名（处理 .tar.zst 这类复合扩展名）
-            string fileName = Path.GetFileName(filePath).ToLowerInvariant();
-            foreach (var ext in archiveExtensions)
-            {
-                if (fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-
-            // 再检查单层扩展名
-            if (archiveExtensions.Contains(extension))
-                return true;
-
-            // 检查分卷压缩包格式
-            if (_volumeDetector.IsMultiVolumeArchive(filePath))
-                return true;
-
-            return false;
-        }
-
-        /// <summary>
         /// 基于文件头特征（魔数）判断压缩文件
         /// 常见压缩文件的文件头魔数：
         /// - ZIP: 50 4B 03 04 或 50 4B 05 06 (空ZIP) 或 50 4B 07 08

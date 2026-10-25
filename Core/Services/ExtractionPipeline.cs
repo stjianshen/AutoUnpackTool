@@ -1915,14 +1915,6 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 检查文件是否已存在于树形结构中
-        /// </summary>
-        public bool CheckFileExistsInTree(string filePath)
-        {
-            return FindFileItemInTree(filePath) != null;
-        }
-
-        /// <summary>
         /// 当子项全部完成时，更新父项状态（反向传播机制）
         /// </summary>
         public void UpdateParentStatusWhenChildrenComplete(FileItem childItem)

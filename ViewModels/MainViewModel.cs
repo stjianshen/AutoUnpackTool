@@ -1114,15 +1114,6 @@ namespace AutoUnpackTool.ViewModels
         }
 
         /// <summary>
-        /// [DIAG] 文件诊断日志：直接写文件，绕过 UI。
-        /// UI 线程繁忙或卡死时界面日志可能延迟，诊断轨迹必须落盘才能定位中断点。
-        /// </summary>
-        private void DiagLog(string message)
-        {
-            _logger.Diag(message);
-        }
-
-        /// <summary>
         /// 更新根节点标题
         /// </summary>
         private void UpdateRootNodeTitle()

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -114,6 +114,7 @@ namespace AutoUnpackTool.Core.Services
         private bool IsArchiveArtifact(string filePath)
             => _detector.Classify(filePath, FileOrigin.ExtractedArtifact) != ArchiveDetector.ArchiveKind.NotArchive;
 
+
         /// <summary>
         /// 在智能路径扁平化之前，清理所有子压缩包文件。
         /// 子压缩包不受 FileAfterExtract 设置影响，一律直接删除。
@@ -142,20 +143,19 @@ namespace AutoUnpackTool.Core.Services
                             _logger.Log($"[批量智能路径]   已清理子压缩包: {Path.GetFileName(file)}", ConsoleColor.Gray);
                             cleanedCount++;
                         }
-                        else
-                        {
-                            _logger.Log($"[批量智能路径]   清理子压缩包失败（被占用或不存在）: {Path.GetFileName(file)}", ConsoleColor.Yellow);
-                        }
-                    }
-                }
-                if (cleanedCount > 0)
-                    _logger.Log($"[批量智能路径]   共清理 {cleanedCount} 个子压缩包", ConsoleColor.Gray);
-            }
-            catch (Exception ex)
-            {
-                _logger.Log($"[批量智能路径] 扁平化前子压缩包扫描失败: {ex.Message}", ConsoleColor.Yellow);
-            }
-        }
+
+        /// <summary>
+        /// 扁平化阶段的扫描等级：与解压产物扫描共用 ArchiveDetector.ShouldUseStrongSignalScan
+        /// 这一条规则（文件数超 FinalArtifactFileCountThreshold 或安装包模式 → 只认强信号）。
+        /// 图包目录动辄上百个 jpg，这里只是要判断“有没有残留压缩包会挡住合并/删除”，
+        /// 不该为每张图开一次文件读魔术数。
+        /// 降级只会少删、少合并（伪后缀压缩包会被当成普通文件→目录非空→不删不合并），
+        /// 不会误删用户文件，是保守方向。
+        /// </summary>
+        private ArchiveDetector.DetectionLevel ArtifactDetectionLevel(int fileCount)
+            => _detector.ShouldUseStrongSignalScan(fileCount)
+                ? ArchiveDetector.DetectionLevel.StrongSignalsOnly
+                : ArchiveDetector.DetectionLevel.Full;
 
         /// <summary>
         /// 同步处理批量智能路径扁平化（等待所有操作完成）
@@ -757,18 +757,29 @@ namespace AutoUnpackTool.Core.Services
             {
                 var subDirs = Directory.GetDirectories(dirPath);
                 var allFiles = Directory.GetFiles(dirPath);
-                // 忽略压缩包文件（含分卷），这些残留文件将在后续 HandleOriginalFile 中统一清理
-                var nonArchiveFiles = allFiles.Where(f => !IsArchiveArtifact(f)).ToArray();
-
-                _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {allFiles.Length} 个文件 (非压缩包: {nonArchiveFiles.Length})", ConsoleColor.Gray);
-                
-                // 【新增】详细列出所有文件及其类型，用于调试
+                // 忽略压缩包文件（含分卷），这些残留文件将在后续 HandleOriginalFile 中统一清理。
+                // 只过一遍：以前这里先 Where 分类一遍、下面的“调试文件列表”又分类一遍，
+                // 等于每个文件开两次文件读魔术数，还多打 N 行日志。
+                var fileLevel = ArtifactDetectionLevel(allFiles.Length);
+                var archiveFiles = new List<string>();
+                var nonArchiveFiles = new List<string>();
                 foreach (var file in allFiles)
                 {
-                    bool isArchive = IsArchiveArtifact(file);
-                    string fileName = Path.GetFileName(file);
-                    _logger.Log($"[批量智能路径] [DEBUG-文件列表] {fileName}: {(isArchive ? "压缩包" : "非压缩包")}", ConsoleColor.Gray);
+                    if (IsArchiveArtifact(file, fileLevel))
+                        archiveFiles.Add(file);
+                    else
+                        nonArchiveFiles.Add(file);
                 }
+
+                string scanTag = fileLevel == ArchiveDetector.DetectionLevel.StrongSignalsOnly
+                    ? $" [强信号扫描，阈值 {_settings.FinalArtifactFileCountThreshold}]" : string.Empty;
+                _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: {subDirs.Length} 个子目录, {allFiles.Length} 个文件 (非压缩包: {nonArchiveFiles.Count}){scanTag}", ConsoleColor.Gray);
+
+                // 只列真正影响决策的那几个：残留压缩包（会挡住目录删除/合并）；
+                // 一个图包里的 01.jpg…99.jpg 全部“非压缩包”，逐个输出没有信息量
+                if (archiveFiles.Count > 0)
+                    _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 残留压缩包 {archiveFiles.Count} 个: "
+                                + string.Join(", ", archiveFiles.Select(Path.GetFileName).Take(10)), ConsoleColor.Gray);
 
                 // 【修复：同名嵌套优先】压缩包内顶层文件夹与输出目录同名时（如 [GalACG]EX592878201 内
                 // 含同名顶层文件夹），即使父目录存在非压缩包文件也必须就地合并消除冗余嵌套。
@@ -790,12 +801,12 @@ namespace AutoUnpackTool.Core.Services
                 }
 
                 // 触发条件：恰好一个子目录且没有非压缩包文件
-                if (subDirs.Length != 1 || nonArchiveFiles.Length > 0)
+                if (subDirs.Length != 1 || nonArchiveFiles.Count > 0)
                 {
                     if (subDirs.Length != 1)
                         _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 子目录数量不为1 ({subDirs.Length})，跳过扁平化", ConsoleColor.Gray);
-                    if (nonArchiveFiles.Length > 0)
-                        _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 存在 {nonArchiveFiles.Length} 个非压缩包文件，跳过扁平化", ConsoleColor.Gray);
+                    if (nonArchiveFiles.Count > 0)
+                        _logger.Log($"[批量智能路径] [DEBUG] {Path.GetFileName(dirPath)}: 存在 {nonArchiveFiles.Count} 个非压缩包文件，跳过扁平化", ConsoleColor.Gray);
                     return null;
                 }
 
@@ -904,165 +915,6 @@ namespace AutoUnpackTool.Core.Services
             catch (Exception ex)
             {
                 _logger.Log($"[批量智能路径] 就地合并失败 {dirPath}: {ex.Message}", ConsoleColor.Red);
-            }
-        }
-
-        /// <summary>
-        /// 处理最外层目录：如果拖入的是文件夹，且解压后最外层目录只包含一个子目录，则扁平化
-        /// </summary>
-
-        public string? ProcessTopLevelFolderIfNeeded(string rootDir)
-        {
-            try
-            {
-                string? resultPath = null;
-                
-                // 再次检查目录是否存在（可能内层扁平化已经改变了结构）
-                if (!Directory.Exists(rootDir))
-                {
-                    _logger.Log($"[批量智能路径] [最外层检查] 目录已不存在，跳过: {rootDir}", ConsoleColor.Gray);
-                    return null;
-                }
-
-                // 检查最外层目录是否只有一个子目录
-                var subDirs = Directory.GetDirectories(rootDir);
-                var allFiles = Directory.GetFiles(rootDir);
-                var archiveFiles = allFiles.Where(f => IsArchiveArtifact(f)).ToArray();
-                var nonArchiveFiles = allFiles.Where(f => !IsArchiveArtifact(f)).ToArray();
-
-                _logger.Log($"[批量智能路径] [最外层检查] {Path.GetFileName(rootDir)}: {subDirs.Length} 个子目录, {archiveFiles.Length} 个压缩包, {nonArchiveFiles.Length} 个非压缩包文件", ConsoleColor.Gray);
-
-                // 只有当最外层目录恰好一个子目录且只有压缩包文件时才扁平化
-                if (subDirs.Length != 1 || nonArchiveFiles.Length > 0)
-                {
-                    if (subDirs.Length != 1)
-                        _logger.Log($"[批量智能路径] [最外层检查] 子目录数量不为1 ({subDirs.Length})，不处理最外层", ConsoleColor.Gray);
-                    if (nonArchiveFiles.Length > 0)
-                        _logger.Log($"[批量智能路径] [最外层检查] 存在 {nonArchiveFiles.Length} 个非压缩包文件，不处理最外层", ConsoleColor.Gray);
-                    return null;
-                }
-
-                // 此时应该只有 1 个子目录和若干压缩包文件
-                string singleSubDir = subDirs[0];
-                string subDirName = Path.GetFileName(singleSubDir);
-                string parentDirName = Path.GetFileName(rootDir);
-                string? parentDirFullPath = Path.GetDirectoryName(rootDir);
-                
-                // 如果无法获取父目录路径，则跳过处理
-                if (string.IsNullOrEmpty(parentDirFullPath))
-                {
-                    _logger.Log($"[批量智能路径] [最外层扁平化] 无法获取父目录路径，跳过处理", ConsoleColor.Yellow);
-                    return null;
-                }
-
-                _logger.Log($"[批量智能路径] [最外层扁平化] 检测到可扁平化: {parentDirName} -> {subDirName}", ConsoleColor.Cyan);
-
-                // 构建新的路径：在父目录中创建新的文件夹
-                string newPath = Path.Combine(parentDirFullPath, subDirName);
-
-                // 检查目标路径是否已存在
-                bool needRenameAfterMove = false;
-                if (Directory.Exists(newPath))
-                {
-                    _logger.Log($"[批量智能路径] [最外层扁平化] 目标目录已存在: {newPath}，添加临时前缀", ConsoleColor.Yellow);
-                    // 添加临时GUID前缀避免冲突（后续会去掉）
-                    string tempPrefix = Guid.NewGuid().ToString().Substring(0, 8);
-                    newPath = Path.Combine(parentDirFullPath, $"{tempPrefix}_{subDirName}");
-                    needRenameAfterMove = true; // 标记需要后续重命名
-                }
-
-                // 移动子目录到父目录的同级
-                Directory.Move(singleSubDir, newPath);
-                _logger.Log($"[批量智能路径] [最外层扁平化] 已移动: {subDirName} -> {Path.GetFileName(newPath)}", ConsoleColor.Gray);
-
-                // 【关键】同步更新 _extractedDirectoryNodes，确保后续后序遍历能找到新路径
-                if (_extractedDirectoryNodes.ContainsKey(singleSubDir))
-                {
-                    _extractedDirectoryNodes.TryRemove(singleSubDir, out _);
-                    _extractedDirectoryNodes.TryAdd(newPath, 0);
-                    _logger.Log($"[批量智能路径] [最外层扁平化] 已同步 _extractedDirectoryNodes: {singleSubDir} -> {newPath}", ConsoleColor.Gray);
-                }
-
-                // 删除最外层目录（压缩包会被保留，因为已经移动到 newPath 的父目录了）
-                // 注意：不能直接递归删除，因为压缩包还在里面
-                // 需要先移动压缩包，再删除目录
-                var archivesToRename = new Dictionary<string, string>(); // Key: 当前路径, Value: 原始文件名（需要去掉前缀的）
-                foreach (var archiveFile in archiveFiles)
-                {
-                    string archiveFileName = Path.GetFileName(archiveFile);
-                    string destPath = Path.Combine(parentDirFullPath, archiveFileName);
-                    
-                    // 如果目标文件已存在，添加临时前缀
-                    if (File.Exists(destPath))
-                    {
-                        string tempPrefix = Guid.NewGuid().ToString().Substring(0, 8);
-                        destPath = Path.Combine(parentDirFullPath, $"{tempPrefix}_{archiveFileName}");
-                        archivesToRename[destPath] = archiveFileName; // 记录需要重命名的文件
-                    }
-                    
-                    File.Move(archiveFile, destPath);
-                    _logger.Log($"[批量智能路径] [最外层扁平化] 已移动压缩包: {archiveFileName} -> {Path.GetFileName(destPath)}", ConsoleColor.Gray);
-                }
-                
-                // 现在目录应该只有空文件夹了，可以安全删除
-                Directory.Delete(rootDir);
-                _logger.Log($"[批量智能路径] [最外层扁平化] 已删除空目录: {parentDirName}", ConsoleColor.Gray);
-                
-                // 去掉压缩包的临时前缀
-                foreach (var kvp in archivesToRename)
-                {
-                    string currentPath = kvp.Key;
-                    string originalFileName = kvp.Value;
-                    string finalPath = Path.Combine(parentDirFullPath, originalFileName);
-                    
-                    try
-                    {
-                        // 去前缀时撞名：迁移前这里无条件 File.Delete(finalPath)，会静默删掉父目录里
-                        // 原本就存在的同名压缩包。finalPath 未被工具登记过，按不变量传 targetOwnedByTool=false，
-                        // 于是「覆盖」策略会被降级为保留两份，内容一致时才丢弃临时件。
-                        string? renamed = _conflicts.TryMove(currentPath, finalPath, ConflictKind.File, false);
-                        if (renamed == null)
-                            _logger.Log($"[批量智能路径] [最外层扁平化] 与已有同名压缩包内容一致，丢弃临时件: {Path.GetFileName(currentPath)}", ConsoleColor.Gray);
-                        else
-                            _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 已重命名压缩包去掉临时前缀: {Path.GetFileName(currentPath)} -> {Path.GetFileName(renamed)}", ConsoleColor.Green);
-                    }
-                    catch (Exception renameEx)
-                    {
-                        _logger.Log($"[批量智能路径] [最外层扁平化] ⚠ 重命名压缩包失败，保留临时名称: {renameEx.Message}", ConsoleColor.Yellow);
-                    }
-                }
-                
-                // 如果使用了临时前缀，现在去掉它
-                if (needRenameAfterMove)
-                {
-                    string finalPath = Path.Combine(parentDirFullPath, subDirName);
-                    try
-                    {
-                        // 同样收拢到 ConflictResolver：只有登记的解压节点目录才允许被替换删除，
-                        // 用户原始目录一律改用安全名称保留两份。
-                        string? renamed = _conflicts.TryMove(newPath, finalPath, ConflictKind.Directory,
-                            _extractedDirectoryNodes.ContainsKey(finalPath), NamingStyle.GuidPrefix);
-                        if (renamed != null)
-                        {
-                            finalPath = renamed;
-                            newPath = finalPath; // 更新路径为最终路径
-                            _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 已重命名去掉临时前缀: {Path.GetFileName(finalPath)}", ConsoleColor.Green);
-                        }
-                    }
-                    catch (Exception renameEx)
-                    {
-                        _logger.Log($"[批量智能路径] [最外层扁平化] ⚠ 重命名失败，保留临时名称: {renameEx.Message}", ConsoleColor.Yellow);
-                    }
-                }
-                
-                _logger.Log($"[批量智能路径] [最外层扁平化] ✓ 扁平化完成: {Path.GetFileName(newPath)}", ConsoleColor.Green);
-                resultPath = newPath;
-                return resultPath;
-            }
-            catch (Exception ex)
-            {
-                _logger.Log($"[批量智能路径] [最外层扁平化] 处理失败: {ex.Message}", ConsoleColor.Red);
-                return null;
             }
         }
 
