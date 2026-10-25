@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -111,38 +111,9 @@ namespace AutoUnpackTool.Core.Services
         /// 即确认」的豁免套到了产物目录上：排除列表失效；开启强制模式时，
         /// 「删除残留压缩包」会把目录里任意文件当成压缩包直接删掉。
         /// </summary>
-        private bool IsArchiveArtifact(string filePath)
-            => _detector.Classify(filePath, FileOrigin.ExtractedArtifact) != ArchiveDetector.ArchiveKind.NotArchive;
-
-
-        /// <summary>
-        /// 在智能路径扁平化之前，清理所有子压缩包文件。
-        /// 子压缩包不受 FileAfterExtract 设置影响，一律直接删除。
-        /// 这是阶段1清理的补充，确保扫描目录中所有子压缩包并清理，而不仅仅依赖文件树记录。
-        /// </summary>
-        public async Task DeleteChildArchivesUnderDirectoryAsync(string rootDir)
-        {
-            if (string.IsNullOrEmpty(rootDir) || !Directory.Exists(rootDir))
-                return;
-
-            try
-            {
-                _logger.Log($"[批量智能路径] 扁平化前子压缩包清理: {rootDir}", ConsoleColor.Gray);
-                int cleanedCount = 0;
-                foreach (string file in _fileOps.EnumerateFilesSafe(rootDir, "*.*", allDirectories: true))
-                {
-                    if (!File.Exists(file))
-                        continue;
-                    
-                    // 检查是否是压缩文件
-                    if (IsArchiveArtifact(file) && !_volumeDetector.IsMultiVolumeArchive(file))
-                    {
-                        // 直接删除（不经过回收站），子压缩包不保留；统一走 FileOperationService 带重试
-                        if (_fileOps.TryDelete(file))
-                        {
-                            _logger.Log($"[批量智能路径]   已清理子压缩包: {Path.GetFileName(file)}", ConsoleColor.Gray);
-                            cleanedCount++;
-                        }
+        private bool IsArchiveArtifact(string filePath,
+                ArchiveDetector.DetectionLevel level = ArchiveDetector.DetectionLevel.Full)
+            => _detector.Classify(filePath, FileOrigin.ExtractedArtifact, level: level) != ArchiveDetector.ArchiveKind.NotArchive;
 
         /// <summary>
         /// 扁平化阶段的扫描等级：与解压产物扫描共用 ArchiveDetector.ShouldUseStrongSignalScan
