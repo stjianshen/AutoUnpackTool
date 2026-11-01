@@ -28,6 +28,15 @@ namespace AutoUnpackTool.Core.Services
         private readonly ConcurrentDictionary<string, string?> _stegoArchiveTypeCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, HashSet<string>> _stegoArchiveValidFilesCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, List<(string Name, string Type, long Offset, long Size)>> _stegoSubStreamCache = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 载体区间越界时的补读次数与间隔。
+        /// 刚拖入的文件常常还在被复制工具写入，Offset/Size 是探测那一刻的快照，
+        /// 文件还在长的时候直接判失败会误杀，先小睡重读几次再决定。
+        /// </summary>
+        private const int CarrierGrowRetryCount = 3;
+        private const int CarrierGrowRetryDelayMs = 500;
+
         private static readonly HashSet<string> StegoCarrierExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".mp4", ".mkv", ".webm", ".mov", ".m4v"
@@ -285,6 +294,17 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
+        /// 作废某载体的 -t# 子流快照。
+        /// 缓存的 Offset/Size 是探测那一刻的文件状态，载体在探测后仍在增长时必须丢弃，
+        /// 否则同一次运行内反复裁到同一个过期区间。
+        /// </summary>
+        private void InvalidateSubStreamSnapshot(string carrierPath)
+        {
+            if (_stegoSubStreamCache.TryRemove(carrierPath, out _))
+                _stegoArchiveTypeCache.TryRemove(carrierPath, out _);
+        }
+
+        /// <summary>
         /// 隐写容器真实类型无法确认时的提取方式：按 -t# 扫描出的 Offset/Size 把
         /// 数据段中真正的压缩包按字节区间裁剪成独立文件，再交给子压缩包流程解压。
         /// 7z x -t# 会把载体自身的字节和误匹配碎片也写出来，命名成 "1"、"2" 这类序号文件；
@@ -312,13 +332,20 @@ namespace AutoUnpackTool.Core.Services
 
             string stagingDir = Path.Combine(Path.GetTempPath(), "AutoUnpackTool_stego", Guid.NewGuid().ToString("N"));
             var carved = new List<(string TempPath, string Ext, bool Verified)>();
+            // 失败原因归类：载体还在增长时给上层一句可执行的提示，而不是笼统的“读取失败”
+            bool carrierStillGrowing = false;
+            string? openFailure = null;
 
             try
             {
                 Directory.CreateDirectory(stagingDir);
 
-                using (var source = new FileStream(carrierPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var source = OpenCarrier(carrierPath))
                 {
+                    // 载体打不开时后面所有日志都不能再碰 source，先把长度取出来
+                    long carrierLength = source?.Length ?? -1;
+                    if (source == null)
+                        openFailure = $"无法打开载体文件（已移动、删除或无访问权限）: {carrierPath}";
                     int index = 0;
                     foreach (var candidate in candidates)
                     {
@@ -327,21 +354,38 @@ namespace AutoUnpackTool.Core.Services
 
                         string ext = FileSystemHelper.ArchiveTypeToExtension(candidate.Type);
                         string tempPath = Path.Combine(stagingDir, $"carve{index}.{ext}");
-                        if (!TryCopyByteRange(source, candidate.Offset, candidate.Size, tempPath, token))
+                        var (ok, reason, written, grew) = TryCopyByteRange(source, candidate.Offset, candidate.Size, tempPath, token);
+                        if (grew)
                         {
-                            _logger.Log($"[线程 {taskId}] [隐写裁剪]   数据段 #{index} 区间读取失败，跳过 (Offset={candidate.Offset}, Size={candidate.Size})", ConsoleColor.Yellow);
+                            carrierStillGrowing = true;
+                            InvalidateSubStreamSnapshot(carrierPath);
+                        }
+
+                        if (!ok)
+                        {
+                            _logger.Log($"[线程 {taskId}] [隐写裁剪]   数据段 #{index} 裁剪失败（{reason}），跳过 (Offset={candidate.Offset}, Size={candidate.Size}, 载体当前长度={carrierLength})", ConsoleColor.Yellow);
                             continue;
                         }
 
+                        if (written < candidate.Size)
+                            _logger.Log($"[线程 {taskId}] [隐写裁剪]   数据段 #{index} 区间超出载体当前长度，按尾部截断裁剪 (Offset={candidate.Offset}, 期望={candidate.Size}, 实裁={written})",
+                                ConsoleColor.Yellow);
+
                         bool verified = _detector.VerifyIsRealArchive(tempPath);
                         carved.Add((tempPath, ext, verified));
-                        _logger.Log($"[线程 {taskId}] [隐写裁剪]   数据段 #{index}: Type={candidate.Type} Offset={candidate.Offset} Size={candidate.Size} 标准验证={(verified ? "通过" : "未通过")}",
+                        _logger.Log($"[线程 {taskId}] [隐写裁剪]   数据段 #{index}: Type={candidate.Type} Offset={candidate.Offset} Size={candidate.Size} 实裁={written} 标准验证={(verified ? "通过" : "未通过")}",
                             verified ? ConsoleColor.Green : ConsoleColor.Yellow);
                     }
                 }
 
                 if (carved.Count == 0)
-                    return (false, "隐写容器内未能裁出压缩数据段");
+                {
+                    if (openFailure != null)
+                        return (false, $"隐写载体无法读取: {openFailure}");
+                    return (false, carrierStillGrowing
+                        ? "隐写容器内未能裁出压缩数据段：载体文件仍在写入（长度不足），请等待复制完成后重新拖入"
+                        : "隐写容器内未能裁出压缩数据段");
+                }
 
                 // 有通过标准验证的段时，其余未通过的都是 -t# 误匹配的固实流碎片，不写入输出目录；
                 // 全部未通过时退回魔术数判断（如表头加密的压缩包），避免丢失真实内容
@@ -372,6 +416,9 @@ namespace AutoUnpackTool.Core.Services
                 if (skipped > 0)
                     _logger.Log($"[线程 {taskId}] [隐写裁剪]   已丢弃 {skipped} 个无法验证的数据段（-t# 误匹配碎片）", ConsoleColor.Gray);
 
+                if (carrierStillGrowing)
+                    _logger.Log($"[线程 {taskId}] [隐写裁剪]   注意：载体在本次裁剪中仍在增长，已作废本轮 -t# 快照，建议复制完成后重跑", ConsoleColor.Yellow);
+
                 return (true, $"已裁出 {published} 个压缩数据段");
             }
             catch (OperationCanceledException)
@@ -389,32 +436,14 @@ namespace AutoUnpackTool.Core.Services
         }
 
         /// <summary>
-        /// 按字节区间从载体文件中复制出压缩数据段
+        /// 打开载体只读流。失败返回 null 并由调用方记录具体原因：
+        /// 不在此抛异常，是为了让“载体已不在原路径”与“区间越界”两类失败在日志里区分开。
         /// </summary>
-        public static bool TryCopyByteRange(FileStream source, long offset, long size, string destPath, CancellationToken token)
+        private static FileStream? OpenCarrier(string carrierPath)
         {
             try
             {
-                if (offset < 0 || size <= 0 || offset + size > source.Length)
-                    return false;
-
-                const int bufferSize = 1024 * 1024;
-                byte[] buffer = new byte[bufferSize];
-
-                source.Position = offset;
-                long remaining = size;
-                using var dest = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                while (remaining > 0)
-                {
-                    token.ThrowIfCancellationRequested();
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int read = source.Read(buffer, 0, toRead);
-                    if (read <= 0)
-                        return false;
-                    dest.Write(buffer, 0, read);
-                    remaining -= read;
-                }
-                return true;
+                return new FileStream(carrierPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             }
             catch (OperationCanceledException)
             {
@@ -422,7 +451,108 @@ namespace AutoUnpackTool.Core.Services
             }
             catch
             {
-                return false;
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 按字节区间从载体文件中复制出压缩数据段。
+        /// 返回 (是否成功, 失败原因, 实际写字节数, 是否观测到载体仍在增长)：
+        /// 区间越界不再直接判失败，而是小睡重读——刚复制完的文件探测与裁剪常隔着几秒，
+        /// 长度追平就按原区间继续，仍在长则截断到尾部（产物交给 VerifyIsRealArchive 把关），
+        /// 只有真读不出来才返回失败，并把原因带进日志而不是吞掉。
+        /// </summary>
+        public static (bool Success, string Reason, long Written, bool CarrierGrew) TryCopyByteRange(
+            FileStream? source, long offset, long size, string destPath, CancellationToken token)
+        {
+            const long invalid = -1;
+
+            if (source == null)
+                return (false, "载体文件无法打开（已移动、删除或仍被写入工具占用）", invalid, false);
+            if (offset < 0)
+                return (false, $"起始偏移非法 (Offset={offset})", invalid, false);
+            if (size <= 0)
+                return (false, $"数据段长度非法 (Size={size})", invalid, false);
+
+            long length = source.Length;
+            bool grew = false;
+
+            // 区间超出当前长度：探测后文件又被写入了，或探测时压根没写完。给它几次补读机会
+            for (int attempt = 0; offset + size > length && attempt < CarrierGrowRetryCount; attempt++)
+            {
+                try
+                {
+                    token.ThrowIfCancellationRequested();
+                    Thread.Sleep(CarrierGrowRetryDelayMs);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+
+                long next = GetLengthQuiet(source);
+                if (next < 0)
+                    break; // 流已失效，无法再判增长
+                if (next > length)
+                {
+                    grew = true;
+                    length = next;
+                }
+                else
+                {
+                    break; // 长度不再变，等的窗口已过，按实际长度处理
+                }
+            }
+
+            if (offset >= length)
+                return (false, $"区间完全超出载体当前长度（文件仍在写入或已不完整）, 载体长度={length}", invalid, grew);
+
+            long toCopy = Math.Min(size, length - offset);
+
+            try
+            {
+                const int bufferSize = 1024 * 1024;
+                byte[] buffer = new byte[bufferSize];
+
+                source.Position = offset;
+                long remaining = toCopy;
+                using var dest = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                while (remaining > 0)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int toRead = (int)Math.Min(buffer.Length, remaining);
+                    int read = source.Read(buffer, 0, toRead);
+                    if (read <= 0)
+                        return (false, $"读到文件末尾仍未满区间（读至 {toCopy - remaining}/{toCopy} 字节，载体可能正被截断）", toCopy - remaining, grew);
+                    dest.Write(buffer, 0, read);
+                    remaining -= read;
+                }
+                return (true, string.Empty, toCopy - remaining, grew);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 以前这里只留一句“区间读取失败”，异常信息全丢；现在把原因带出去
+                return (false, $"I/O 异常: {ex.GetType().Name}: {ex.Message}", invalid, grew);
+            }
+        }
+
+        /// <summary>重读载体当前长度：流已失效或路径不可达时返回 -1，不参与增长判定。</summary>
+        private static long GetLengthQuiet(FileStream source)
+        {
+            try
+            {
+                if (source.SafeFileHandle == null || source.SafeFileHandle.IsInvalid || source.SafeFileHandle.IsClosed)
+                    return -1;
+                // FileStream.Name 可能是构造时传入的相对路径，重读长度前先绝对化
+                return new FileInfo(Path.GetFullPath(source.Name)).Length;
+            }
+            catch
+            {
+                return -1;
             }
         }
 
