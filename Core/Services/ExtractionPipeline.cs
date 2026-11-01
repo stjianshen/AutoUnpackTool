@@ -1378,8 +1378,34 @@ namespace AutoUnpackTool.Core.Services
                 if (stegoCarveMode)
                 {
                     var carve = await Task.Run(() => _stego.CarveStegoPayloads(fileItem.FilePath, outputDir, taskId, token), token);
-                    // 裁剪模式无 7z 退出码：成功记 0、失败记 2（按完整成功/失败处理，不走部分成功分支）
-                    result = (carve.Success, carve.Message, carve.Success ? 0 : 2);
+                    if (carve.Success)
+                    {
+                        // 裁剪模式无 7z 退出码：成功按完整成功处理，不走部分成功分支
+                        result = (true, carve.Message, 0);
+                    }
+                    else
+                    {
+                        // 裁剪失败不再直接判死：回退 7z x -t# 哈希扫描提取。
+                        // 代价是可能产出 "1"、"2" 这类序号碎片（后续残留清理会保留，
+                        // 因为类型未确认时产物无法与真实内容区分），比整包丢失便宜。
+                        _logger.Log($"[线程 {taskId}] [隐写裁剪] {carve.Message}，回退 7z -t# 哈希扫描提取", ConsoleColor.Yellow, fileItem);
+
+                        result = await extractor.ExtractAsync(
+                            fileItem.FilePath,
+                            outputDir,
+                            password,
+                            onProgress: (msg) => _logger.Log($"  {msg}", ConsoleColor.Gray),
+                            onPercentChanged: (percent) =>
+                            {
+                                _ui.OnExtractProgress(percent);
+                            },
+                            showCliWindow: _settings.ShowCliWindow,
+                            cancellationToken: token,
+                            stegoArchiveType: "#");
+
+                        if (!result.Success)
+                            _logger.Log($"[线程 {taskId}] {fileItem.FileName}: -t# 回退提取同样失败（{carve.Message}）", ConsoleColor.Red, fileItem);
+                    }
                 }
                 else
                 {
