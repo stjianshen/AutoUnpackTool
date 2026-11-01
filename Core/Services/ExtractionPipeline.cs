@@ -1351,9 +1351,13 @@ namespace AutoUnpackTool.Core.Services
             string outputDir = _detector.GetOutputDirectory(fileItem.FilePath);
             
             // 在解压前记录输出目录中已存在的文件列表（用于过滤隐写文件解压时误添加已存在的压缩包）
+            // 目录不存在时无需枚举：直接空快照，避免 EnumerateFilesSafe 报一条“路径不存在”的红字误导排查
             HashSet<string> existingFilesBeforeExtract = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var f in _fileOps.EnumerateFilesSafe(outputDir, "*.*", allDirectories: true))
-                existingFilesBeforeExtract.Add(f);
+            if (Directory.Exists(outputDir))
+            {
+                foreach (var f in _fileOps.EnumerateFilesSafe(outputDir, "*.*", allDirectories: true))
+                    existingFilesBeforeExtract.Add(f);
+            }
             
             // 记录觧压目录用于调试
             bool isStego = _stego.IsStegoDetectionActiveForFile(fileItem.FilePath);
